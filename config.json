@@ -1,0 +1,109 @@
+{
+  "default_root_path": "C:\\Users\\ACE\\GREEN GOLD ENERGY Dropbox\\Projects\\Project (EPC)",
+  "additional_projects": [
+    {
+      "path": "C:\\Users\\ACE\\GREEN GOLD ENERGY Dropbox\\Projects\\Project (EPC)\\7.New Zealand\\Tatua Solar Farm",
+      "region": "New Zealand",
+      "drawings_root": "1. Drawings"
+    }
+  ],
+  "recent_projects": [
+    "C:\\Users\\ACE\\GREEN GOLD ENERGY Dropbox\\Projects\\Project (EPC)\\2.SA\\GG-31 Warnertown BESS"
+  ],
+  "auto_backup": true,
+  "skip_existing_files": true,
+  "show_progress_bar": true,
+  "log_level": "INFO",
+  "color_output": true,
+  "max_recent_projects": 10,
+  "last_operation": null,
+  "last_run_time": null,
+  "project_filters": {
+    "whitelist": [],
+    "blacklist": [],
+    "auto_process_only_validated": true,
+    "require_confirmation_for_legacy": true
+  },
+  "drawing_sources": [
+    {
+      "path": "Design/Engineering/1. Drawings/2. IFR_internal",
+      "enabled": true,
+      "priority": 1,
+      "description": "Internal drawings directory (primary source)"
+    },
+    {
+      "path": "Design/Engineering/2. Calcs & Reports/Reports/Civil & Structure",
+      "enabled": true,
+      "priority": 2,
+      "description": "Civil reports directory (some drawings here)"
+    }
+  ],
+  "validation_rules": {
+    "require_ifr_internal": false,
+    "require_at_least_one_source": true,
+    "min_source_dirs": 1,
+    "max_days_since_modified": 180
+  },
+  "ifc_client_path": "Design/Engineering/1. Drawings/4. IFC(Client)",
+
+  "deliverable": {
+    "source_folders": [
+      "Design/Engineering/1. Drawings/2. IFR_internal",
+      "Design/Engineering/2. Calcs & Reports/Reports/Electrical",
+      "Design/Engineering/2. Calcs & Reports/Reports/Civil & Structure",
+      "Design/Engineering/2. Calcs & Reports/Schedule"
+    ],
+    "deliverable_path": "Design/Engineering/1. Drawings/3. IFR(Client)/3.Deliverables",
+    "primary_sync": "Design/Engineering/1. Drawings/3. IFR(Client)/3.Deliverables",
+    "secondary_sync": "Design/Engineering/13. Client Sharepoint/1.IFR/3.Deliverables",
+    "highlight_color": "FFFF99",
+    "auto_detect_layout": true
+  },
+
+  "ifc": {
+    "auto_update_deliverables": true,
+    "title_block_name": "ACE-Wanertown_Siyuan",
+    "ifc_output_path": "Design/Engineering/1. Drawings/4. IFC(Client)",
+    "native_root": "Design/Engineering/1. Drawings/1. Native"
+  },
+
+  "ifc_transmittal": {
+    "enabled": true,
+    "transmittal_header": {
+      "company": "Green Gold Energy Pty Ltd",
+      "company_details": "ABN 55 631 822 261\n268 Glen Osmond Road\nFullarton SA 5063\nTelephone:(08) 8212 0459",
+      "to": "",
+      "to_address": "",
+      "attention": "",
+      "project": "",
+      "subject": "FOR CONSTRUCTION DRAWINGS"
+    },
+    "project_overrides": {
+      "GG-31 Warnertown BESS": {
+        "transmittal_header": {
+          "company": "Green Gold Energy Pty Ltd",
+          "company_details": "ABN 55 631 822 261\n268 Glen Osmond Road\nFullarton SA 5063\nTelephone:(08) 8212 0459",
+          "to": "Siyuan",
+          "to_address": "",
+          "attention": "",
+          "project": "GG-31 Warnertown BESS, SA",
+          "subject": "FOR CONSTRUCTION DRAWINGS"
+        }
+      }
+    },
+    "transmittal_path": "Design/Engineering/8. Deliverables/Transmittal",
+    "sync_targets": [
+      "Design/Engineering/13. Client Sharepoint/2.IFC"
+    ],
+    "state_file": "ifc_state.json"
+  },
+  "daily_auto": {
+    "enabled": true,
+    "hour": 9,
+    "minute": 30,
+    "projects": [
+      "GG-31 Warnertown BESS",
+      "LMS"
+    ]
+  }
+}
