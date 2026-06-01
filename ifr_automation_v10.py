@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Engineering Pipeline - IFR Sync + Version Management + Sharepoint Sync + Deliverable Cross-Check
 工程文档自动化管线工具 v7.1
@@ -4482,6 +4482,16 @@ class IFCStampMixin:
     _REF_X_RIGHT_OFFSET = 29.779   # 841.0 - 811.221 = offset from right edge
     _REF_Y_BOTTOM = 73.259         # offset from frame bottom
 
+    # Per-title-block reference geometry overrides.
+    # Maps title block block-definition name (str) to a dict of _REF_* key overrides.
+    # All known projects (Warnertown, Tatua/Coleambally, LMS, Coleambally2) share the
+    # default 841x594 reference, so this dict is empty for now.
+    # To support a future project with different frame dimensions, add an entry:
+    #   "MyTitleBlock": {"_REF_TB_WIDTH": 1189.0, "_REF_TB_HEIGHT": 841.0,
+    #                    "_REF_X_RIGHT_OFFSET": 40.0, "_REF_Y_BOTTOM": 90.0, ...}
+    # Subclasses may extend or replace this dict for project-specific overrides.
+    _TB_REF_OVERRIDES: dict = {}
+
     # COLOUR stamp box (above FOR CONSTRUCTION): same width, taller for 2-line text
     _REF_COLOUR_RECT_H = 26.0     # 2-line text (h=5.5 x 2 + line spacing + padding)
     _REF_COLOUR_GAP = 2.0         # gap between FOR CONSTRUCTION and COLOUR boxes
@@ -4510,8 +4520,7 @@ class IFCStampMixin:
                 _pythoncom.VT_ARRAY | _pythoncom.VT_I2, [0])
             filter_data = win32com.client.VARIANT(
                 _pythoncom.VT_ARRAY | _pythoncom.VT_VARIANT, ["MTEXT"])
-            ss.Select(5, Point1=None, Point2=None,
-                      FilterType=filter_type, FilterData=filter_data)
+            ss.Select(5, None, None, filter_type, filter_data)
             for i in range(ss.Count):
                 try:
                     entity = ss.Item(i)
@@ -4643,8 +4652,7 @@ class IFCStampMixin:
                 _pythoncom.VT_ARRAY | _pythoncom.VT_I2, [0])  # entity type
             filter_data = win32com.client.VARIANT(
                 _pythoncom.VT_ARRAY | _pythoncom.VT_VARIANT, ["INSERT"])
-            ss0.Select(5, Point1=None, Point2=None,
-                        FilterType=filter_type, FilterData=filter_data)
+            ss0.Select(5, None, None, filter_type, filter_data)
 
             # Get title block name to avoid accidentally deleting it
             tb_name = getattr(self, 'title_block_name', None) or ''
@@ -4704,7 +4712,11 @@ class IFCStampMixin:
         # Pass 0b: delete IFR/IFC stamp block references in PaperSpace layouts
         # (Pass 0 SelectionSet only searches active space — misses PaperSpace)
         try:
-            for _layout_0b in doc.Layouts:
+            _layouts_0b = list(doc.Layouts)
+        except Exception:
+            _layouts_0b = []
+        for _layout_0b in _layouts_0b:
+            try:
                 if _layout_0b.Name.lower() == 'model':
                     continue
                 _block_0b = _layout_0b.Block
@@ -4746,8 +4758,8 @@ class IFCStampMixin:
                         _e_0b.Delete()
                     except Exception:
                         pass
-        except Exception:
-            pass
+            except Exception:
+                continue
 
         # Pass 1: delete all entities on IFC_STAMP layer via SelectionSet
         ss_name = f"_StampCleanup_{int(time.time() * 1000) % 1_000_000}"
@@ -4762,8 +4774,7 @@ class IFCStampMixin:
                 _pythoncom.VT_ARRAY | _pythoncom.VT_I2, [8])  # 8 = layer name
             filter_data = win32com.client.VARIANT(
                 _pythoncom.VT_ARRAY | _pythoncom.VT_VARIANT, [self.STAMP_LAYER])
-            ss.Select(5, Point1=None, Point2=None,
-                       FilterType=filter_type, FilterData=filter_data)
+            ss.Select(5, None, None, filter_type, filter_data)
             for i in range(ss.Count - 1, -1, -1):
                 try:
                     ss.Item(i).Delete()
@@ -4791,8 +4802,7 @@ class IFCStampMixin:
                 _pythoncom.VT_ARRAY | _pythoncom.VT_I2, [0])  # entity type
             filter_data = win32com.client.VARIANT(
                 _pythoncom.VT_ARRAY | _pythoncom.VT_VARIANT, ["MTEXT"])
-            ss2.Select(5, Point1=None, Point2=None,
-                        FilterType=filter_type, FilterData=filter_data)
+            ss2.Select(5, None, None, filter_type, filter_data)
             for i in range(ss2.Count - 1, -1, -1):
                 try:
                     entity = ss2.Item(i)
@@ -5187,20 +5197,47 @@ class IFCStampMixin:
             print(f"    印章: title block 宽度异常 ({tb_width:.1f})，跳过")
             return
 
+        # Resolve per-title-block reference geometry overrides.
+        # Look up the block definition name and apply any project-specific _REF_* values.
+        # To add a new project with different frame dimensions, populate _TB_REF_OVERRIDES
+        # on the relevant subclass (IFCManager, AsBuiltManager, etc.) with the title block
+        # name as key and a dict of _REF_* overrides as value.
+        _tb_name = ''
+        try:
+            _tb_name = block_ref.Name or ''
+        except Exception:
+            pass
+        _tb_overrides = (self._TB_REF_OVERRIDES or {}).get(_tb_name, {})
+        _ref_tb_w = _tb_overrides.get('_REF_TB_WIDTH', self._REF_TB_WIDTH)
+        _ref_tb_h = _tb_overrides.get('_REF_TB_HEIGHT', self._REF_TB_HEIGHT)
+        _ref_rect_w = _tb_overrides.get('_REF_RECT_W', self._REF_RECT_W)
+        _ref_rect_h = _tb_overrides.get('_REF_RECT_H', self._REF_RECT_H)
+        _ref_text_h = _tb_overrides.get('_REF_TEXT_H', self._REF_TEXT_H)
+        _ref_text_w = _tb_overrides.get('_REF_TEXT_W', self._REF_TEXT_W)
+        _ref_text_y_offset = _tb_overrides.get('_REF_TEXT_Y_OFFSET', self._REF_TEXT_Y_OFFSET)
+        _ref_x_right_offset = _tb_overrides.get('_REF_X_RIGHT_OFFSET', self._REF_X_RIGHT_OFFSET)
+        _ref_y_bottom = _tb_overrides.get('_REF_Y_BOTTOM', self._REF_Y_BOTTOM)
+        _ref_colour_rect_h = _tb_overrides.get('_REF_COLOUR_RECT_H', self._REF_COLOUR_RECT_H)
+        _ref_colour_gap = _tb_overrides.get('_REF_COLOUR_GAP', self._REF_COLOUR_GAP)
+        _ref_colour_text_h = _tb_overrides.get('_REF_COLOUR_TEXT_H', self._REF_COLOUR_TEXT_H)
+        if _tb_overrides:
+            print(f"    印章: 使用 title block '{_tb_name}' 专属参考尺寸 "
+                  f"({_ref_tb_w:.0f}x{_ref_tb_h:.0f})")
+
         # Scale all dimensions proportionally to title block size
-        scale = tb_width / self._REF_TB_WIDTH
-        rect_w = self._REF_RECT_W * scale
-        rect_h = self._REF_RECT_H * scale
-        text_h = self._REF_TEXT_H * scale
-        text_w = self._REF_TEXT_W * scale
-        text_y_offset = self._REF_TEXT_Y_OFFSET * scale
+        scale = tb_width / _ref_tb_w
+        rect_w = _ref_rect_w * scale
+        rect_h = _ref_rect_h * scale
+        text_h = _ref_text_h * scale
+        text_w = _ref_text_w * scale
+        text_y_offset = _ref_text_y_offset * scale
 
         # Position: INSIDE the frame, matching the original IFR stamp location
         # IFR stamp in standard frame: right edge at x=811.221, bottom at y=73.259
         # in a 841x594 frame. Scale proportionally to actual frame size.
-        scale_y = tb_height / self._REF_TB_HEIGHT if tb_height > 0 else scale
-        x_right_offset = self._REF_X_RIGHT_OFFSET * scale
-        y_bottom_offset = self._REF_Y_BOTTOM * scale_y
+        scale_y = tb_height / _ref_tb_h if tb_height > 0 else scale
+        x_right_offset = _ref_x_right_offset * scale
+        y_bottom_offset = _ref_y_bottom * scale_y
 
         # Stamp right edge = frame_right - offset; stamp insertion point is right edge
         stamp_right_x = tb_right_x - x_right_offset
@@ -5362,8 +5399,8 @@ class IFCStampMixin:
             # --- DRAWINGS TO BE PRINTED IN COLOUR stamp (upper box) ---
             # Only draw if: (1) original DWG has no COLOUR stamp, AND
             #               (2) no overlap with existing entities in the COLOUR area
-            colour_rect_h = self._REF_COLOUR_RECT_H * scale
-            colour_gap = self._REF_COLOUR_GAP * scale
+            colour_rect_h = _ref_colour_rect_h * scale
+            colour_gap = _ref_colour_gap * scale
             colour_bottom_y = stamp_top_y + colour_gap
             colour_top_y = colour_bottom_y + colour_rect_h
 
@@ -5399,7 +5436,7 @@ class IFCStampMixin:
                 colour_center_pt = win32com.client.VARIANT(
                     pythoncom.VT_ARRAY | pythoncom.VT_R8,
                     [colour_center_x, colour_center_y, 0.0])
-                colour_text_h = self._REF_COLOUR_TEXT_H * scale
+                colour_text_h = _ref_colour_text_h * scale
                 mtext2 = draw_space.AddMText(colour_center_pt, rect_w, self.COLOUR_TEXT)
                 mtext2.Height = colour_text_h
                 mtext2.AttachmentPoint = 5  # MiddleCenter
@@ -5684,8 +5721,7 @@ class IFCManager(IFCStampMixin):
                 _pythoncom.VT_ARRAY | _pythoncom.VT_I2, [0])
             filter_data = win32com.client.VARIANT(
                 _pythoncom.VT_ARRAY | _pythoncom.VT_VARIANT, ["INSERT"])
-            ss.Select(5, Point1=None, Point2=None,
-                       FilterType=filter_type, FilterData=filter_data)
+            ss.Select(5, None, None, filter_type, filter_data)
 
             ms = doc.ModelSpace
             for i in range(ss.Count):
@@ -10031,6 +10067,7 @@ class AsBuiltManager(IFCManager):
                         w = float(mx[0]) - float(mn[0])
                         h = float(mx[1]) - float(mn[1])
                         cw = entity.ConstantWidth
+                        # cw > 3.0: targets bot-drawn thick-border stamps; hand-drawn (cw=0) caught by _remove_stamps_by_geometry
                         if w > 300 and h > 30 and cw > 3.0:
                             to_delete.append(entity)
                     except Exception:
