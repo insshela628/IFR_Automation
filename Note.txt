@@ -1,6 +1,24 @@
 1.新增 C:\Users\ACE\GREEN GOLD ENERGY Dropbox\Projects\Project (EPC)\2.SA\GG-31 Warnertown BESS\Design\Engineering\8. Deliverables 到IFR subfolder的同步
 2.改一版V5
 
+————————————————————————————————————02/06/26
+TODO: 两个 AS BUILT 转换失败待查
+
+[FAIL-1] GG31-C-PLN-002 — Open.Close 异常
+  路径 262 chars → 触发 temp path SaveAs
+  SaveAs 完成后 doc.Close() 抛 "Open.Close" COM 异常 → PDF 未生成
+  复现: python test_ab_issue_fixes.py (force PLN-002)
+  方向: 检查 convert_to_ab 里 temp path SaveAs 后的 doc.Close() 调用；
+        可能需要 try/except 包住 Close，并在 Close 失败时仍继续 PUBLISH 流程
+
+[FAIL-2] GG31-E-PLN-004 — AutoCAD server exception (-2147417851)
+  XREF 绑定成功（1 个外部引用已绑定）后，下一步 COM 调用触发
+  "The server threw an exception" → RPC_E_SERVERFAULT
+  复现: python test_ab_issue_fixes.py (force PLN-004)
+  方向: 检查 XREF bind 后哪个 COM 调用最先接触；
+        可能是 doc.SaveAs() 或 Layout 访问。可加 acad.ActiveDocument 重新
+        拿句柄，或在 server exception 后 Dispatch(doc) 重新包装再重试
+
 IFR sync已经增加IFC到IFC的映射
 
 不知道为什么 GG31-C-RPT-001_MV Power Station (MVPS) Foundation Plan_RevA.pdf总是出现在report，即便那个report文件夹已经没有这个了，并且显示损坏
