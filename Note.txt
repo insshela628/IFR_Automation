@@ -4,12 +4,12 @@
 ————————————————————————————————————02/06/26
 TODO: 两个 AS BUILT 转换失败待查
 
-[FAIL-1] GG31-C-PLN-002 — Open.Close 异常
-  路径 262 chars → 触发 temp path SaveAs
-  SaveAs 完成后 doc.Close() 抛 "Open.Close" COM 异常 → PDF 未生成
-  复现: python test_ab_issue_fixes.py (force PLN-002)
-  方向: 检查 convert_to_ab 里 temp path SaveAs 后的 doc.Close() 调用；
-        可能需要 try/except 包住 Close，并在 Close 失败时仍继续 PUBLISH 流程
+[FAIL-1] GG31-C-PLN-002 — Open.Close 异常 ✅ FIXED (commit 1c6f67a)
+  Root cause: doc.Close(False) 未 guard，SaveAs 到 temp path 后 AutoCAD
+  还在 flush，COM 抛 Open.Close → 整个转换失败，PUBLISH 从未跑到
+  Fix: convert_to_ab/multi/ifc 里 4 处 Close 全加 try/except，Close 失败
+       仅 warning log，不中断后续 PUBLISH 流程
+  待验证: python test_ab_issue_fixes.py (force PLN-002) 重跑确认 PDF 生成
 
 [FAIL-2] GG31-E-PLN-004 — AutoCAD server exception (-2147417851)
   XREF 绑定成功（1 个外部引用已绑定）后，下一步 COM 调用触发
