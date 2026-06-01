@@ -6428,7 +6428,10 @@ class IFCManager(IFCStampMixin):
                     break
             if not personnel and ifc_rev == 0:
                 result['errors'].append("未找到有效的 IFR revision 行")
-                doc.Close(False)
+                try:
+                    doc.Close(False)
+                except Exception:
+                    pass
                 return result
             if not personnel:
                 personnel = {}
@@ -6597,7 +6600,10 @@ class IFCManager(IFCStampMixin):
                 return result
 
             # Close document after SaveAs (clean state for PUBLISH)
-            doc.Close(False)
+            try:
+                doc.Close(False)
+            except Exception as _ce:
+                logging.warning(f"doc.Close warning (non-fatal): {_ce}")
             doc = None
             time.sleep(2)
 
@@ -10418,8 +10424,13 @@ class AsBuiltManager(IFCManager):
                     pass
                 return result
 
-            # Close document
-            doc.Close(False)
+            # Close document — guarded: Close can throw "Open.Close" after
+            # temp-path SaveAs while AutoCAD is still flushing. Continue to
+            # PUBLISH regardless; the DWG is already saved.
+            try:
+                doc.Close(False)
+            except Exception as _ce:
+                logging.warning(f"doc.Close warning (non-fatal): {_ce}")
             doc = None
             time.sleep(2)
 
@@ -10660,7 +10671,10 @@ class AsBuiltManager(IFCManager):
                     except Exception as e:
                         result['errors'].append(f"{page_label}: SaveAs 失败 ({e})")
 
-                doc.Close(False)
+                try:
+                    doc.Close(False)
+                except Exception as _ce:
+                    logging.warning(f"doc.Close warning (non-fatal): {_ce}")
                 doc = None
                 time.sleep(1)
 
