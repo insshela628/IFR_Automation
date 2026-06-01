@@ -2243,13 +2243,14 @@ def _classify_dwg(filename: str) -> Tuple[str, str]:
 
 
 def _parse_folder_name(folder_name: str) -> Tuple[str, str]:
-    m = re.match(r'^([A-Z0-9][\w-]+-\d{3})[_\s](.+?)(?:[_\s]Rev.*)?$', folder_name, re.IGNORECASE)
+    cleaned = re.sub(r'^[^\w]+', '', folder_name)
+    m = re.match(r'^([A-Z0-9][\w-]+-\d{2,3})[_\s](.+?)(?:[_\s]Rev.*)?$', cleaned, re.IGNORECASE)
     if m:
         return (m.group(1), m.group(2).strip())
-    if '_' in folder_name:
-        parts = folder_name.split('_', 1)
+    if '_' in cleaned:
+        parts = cleaned.split('_', 1)
         return (parts[0], parts[1].rstrip().rstrip('_Rev').strip())
-    return (folder_name, '')
+    return (cleaned if cleaned else folder_name, '')
 
 
 def _make_standard_dwg_name(doc_id: str, description: str, rev_type: str,
@@ -4553,7 +4554,12 @@ class IFCStampMixin:
                 err_str = str(e)
                 # -2147418111 = RPC_E_CALL_REJECTED (callee busy)
                 # -2147417848 = RPC_E_SERVERFAULT
-                if '-2147418111' in err_str or '-2147417848' in err_str:
+                if any(code in err_str for code in (
+                    '-2147418111',  # RPC_E_CALL_REJECTED
+                    '-2147417848',  # RPC_E_DISCONNECTED
+                    '-2147417851',  # RPC_E_SERVERFAULT
+                    '-2147352567',  # DISP_E_EXCEPTION
+                )):
                     if attempt < max_retries - 1:
                         time.sleep(delay * (attempt + 1))
                         continue
@@ -4603,8 +4609,8 @@ class IFCStampMixin:
                     if bname.startswith('*'):
                         continue  # skip anonymous/special blocks
                     bname_upper = bname.upper()
-                    # Quick name check
-                    if 'IFR' in bname_upper:
+                    # Quick name check — catch both IFR and IFC stamp blocks
+                    if 'IFR' in bname_upper or 'IFC' in bname_upper:
                         _ifr_block_names.add(bname)
                         continue
                     # Check block definition entities for review MText (only small blocks)
@@ -4615,7 +4621,8 @@ class IFCStampMixin:
                                 if ent.EntityName in ('AcDbMText', 'AcDbText'):
                                     txt = ent.TextString.upper()
                                     plain = self._strip_mtext_formatting(txt).upper()
-                                    if plain in ('ISSUED FOR REVIEW', 'FOR REVIEW'):
+                                    if plain in ('ISSUED FOR REVIEW', 'FOR REVIEW',
+                                                 'FOR CONSTRUCTION'):
                                         _ifr_block_names.add(bname)
                                         break
                             except Exception:
@@ -4653,9 +4660,10 @@ class IFCStampMixin:
                     # Check 1: block name in known IFR stamp names (from definition scan)
                     is_ifr_stamp = block_name in _ifr_block_names
 
-                    # Check 2: block name contains 'IFR' (case-insensitive)
+                    # Check 2: block name contains 'IFR' or 'IFC' (case-insensitive)
                     if not is_ifr_stamp:
-                        is_ifr_stamp = 'IFR' in block_name.upper()
+                        bname_u = block_name.upper()
+                        is_ifr_stamp = 'IFR' in bname_u or 'IFC' in bname_u
 
                     # Check 3: block attributes contain stamp phrases
                     if not is_ifr_stamp:
@@ -4665,7 +4673,9 @@ class IFCStampMixin:
                                 for attr in attrs:
                                     try:
                                         val = attr.TextString.upper()
-                                        if 'ISSUED FOR REVIEW' in val or 'FOR REVIEW' in val:
+                                        if ('ISSUED FOR REVIEW' in val or
+                                                'FOR REVIEW' in val or
+                                                'FOR CONSTRUCTION' in val):
                                             is_ifr_stamp = True
                                             break
                                     except Exception:
@@ -4690,6 +4700,54 @@ class IFCStampMixin:
                 doc.SelectionSets.Item(ss_name0).Delete()
             except Exception:
                 pass
+
+        # Pass 0b: delete IFR/IFC stamp block references in PaperSpace layouts
+        # (Pass 0 SelectionSet only searches active space — misses PaperSpace)
+        try:
+            for _layout_0b in doc.Layouts:
+                if _layout_0b.Name.lower() == 'model':
+                    continue
+                _block_0b = _layout_0b.Block
+                _to_delete_0b = []
+                for _i_0b in range(_block_0b.Count):
+                    try:
+                        _ent_0b = _block_0b.Item(_i_0b)
+                        if _ent_0b.EntityName != 'AcDbBlockReference':
+                            continue
+                        _bname_0b = _ent_0b.Name
+                        if tb_name and _bname_0b.upper() == tb_name.upper():
+                            continue
+                        _bname_0b_u = _bname_0b.upper()
+                        _is_stamp_0b = ('IFR' in _bname_0b_u or 'IFC' in _bname_0b_u or
+                                        _bname_0b in _ifr_block_names)
+                        if not _is_stamp_0b:
+                            try:
+                                _attrs_0b = _ent_0b.GetAttributes()
+                                if len(_attrs_0b) < 5:
+                                    for _a in _attrs_0b:
+                                        _v = _a.TextString.upper()
+                                        if ('FOR REVIEW' in _v or
+                                                'FOR CONSTRUCTION' in _v):
+                                            _is_stamp_0b = True
+                                            break
+                            except Exception:
+                                pass
+                        if _is_stamp_0b:
+                            try:
+                                if len(_ent_0b.GetAttributes()) >= 5:
+                                    continue
+                            except Exception:
+                                pass
+                            _to_delete_0b.append(_ent_0b)
+                    except Exception:
+                        continue
+                for _e_0b in reversed(_to_delete_0b):
+                    try:
+                        _e_0b.Delete()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
         # Pass 1: delete all entities on IFC_STAMP layer via SelectionSet
         ss_name = f"_StampCleanup_{int(time.time() * 1000) % 1_000_000}"
@@ -4721,7 +4779,7 @@ class IFCStampMixin:
         # Pass 2: delete legacy MText with EXACT stamp content (filtered to MTEXT only)
         # Only delete if the entire text (after stripping formatting) matches a stamp phrase.
         _STAMP_PHRASES = {'FOR CONSTRUCTION', 'ISSUED FOR REVIEW', 'FOR REVIEW',
-                          'DRAWINGS TO BE PRINTED IN COLOUR'}
+                          'DRAWINGS TO BE PRINTED IN COLOUR', 'AS BUILT', 'AS-BUILT'}
         ss_name2 = f"_StampCleanup2_{int(time.time() * 1000) % 1_000_000}"
         try:
             try:
@@ -4740,8 +4798,9 @@ class IFCStampMixin:
                     entity = ss2.Item(i)
                     text = entity.TextString
                     if text:
-                        plain = self._strip_mtext_formatting(text).upper()
-                        if plain in _STAMP_PHRASES:
+                        plain = self._strip_mtext_formatting(text).upper().strip()
+                        if plain in _STAMP_PHRASES or any(
+                                p in plain for p in _STAMP_PHRASES):
                             entity.Delete()
                 except Exception:
                     pass
@@ -4756,7 +4815,7 @@ class IFCStampMixin:
         # SelectionSet only searches active space — PaperSpace layouts need direct iteration
         # Also clean stamp-like polylines (closed rectangles ~111x18 at x>500 y<200)
         _STAMP_PHRASES_UPPER = {'FOR CONSTRUCTION', 'ISSUED FOR REVIEW', 'FOR REVIEW',
-                                'DRAWINGS TO BE PRINTED IN COLOUR'}
+                                'DRAWINGS TO BE PRINTED IN COLOUR', 'AS BUILT', 'AS-BUILT'}
 
         def _is_stamp_polyline(ent):
             """Check if a closed polyline looks like a stamp border."""
@@ -4778,7 +4837,11 @@ class IFCStampMixin:
             return False
 
         try:
-            for layout in doc.Layouts:
+            layouts = list(doc.Layouts)
+        except Exception:
+            layouts = []
+        for layout in layouts:
+            try:
                 if layout.Name.lower() == 'model':
                     continue
                 block = layout.Block
@@ -4795,12 +4858,13 @@ class IFCStampMixin:
                         except Exception:
                             pass
                         # Delete legacy stamp MText (exact match)
-                        if ename == 'AcDbMText':
+                        if ename in ('AcDbMText', 'AcDbText'):
                             try:
                                 text = entity.TextString
                                 if text:
-                                    plain = self._strip_mtext_formatting(text).upper()
-                                    if plain in _STAMP_PHRASES_UPPER:
+                                    plain = self._strip_mtext_formatting(text).upper().strip()
+                                    if plain in _STAMP_PHRASES_UPPER or any(
+                                            p in plain for p in _STAMP_PHRASES_UPPER):
                                         to_delete.append(entity)
                             except Exception:
                                 pass
@@ -4815,38 +4879,45 @@ class IFCStampMixin:
                         entity.Delete()
                     except Exception:
                         pass
-        except Exception:
-            pass
+            except Exception:
+                continue
 
     def _scan_has_colour(self, doc):
         """Scan DWG for existing 'DRAWINGS TO BE PRINTED IN COLOUR' MTEXT.
 
         Returns True if found. Also fixes typos (COULOUR→COLOUR) in-place.
-        The original COLOUR stamp is preserved — automation only draws FOR CONSTRUCTION.
+        Searches BOTH ModelSpace (via SelectionSet) and all PaperSpace layouts
+        (via direct iteration) — SelectionSet mode 5 only searches active space.
         """
         import re as _re
         has_colour = False
+
+        def _check_and_fix(ent):
+            nonlocal has_colour
+            try:
+                raw = self._com_retry(lambda e=ent: e.TextString) or ''
+                txt = self._strip_mtext_formatting(raw).upper()
+                if ('COLOUR' in txt or 'COULOUR' in txt or 'COLOR' in txt) and 'PRINT' in txt:
+                    has_colour = True
+                    fixed = _re.sub(r'[Cc][Oo][Uu]?[Ll][Oo][Uu]+[Rr]', 'COLOUR',
+                                    raw, flags=_re.IGNORECASE)
+                    if fixed != raw:
+                        self._com_retry(lambda e=ent, v=fixed: setattr(e, 'TextString', v))
+                        print(f"    COLOUR typo 修复: {raw[:40]}... → {fixed[:40]}...")
+            except Exception:
+                pass
+
+        # Pass A: ModelSpace via SelectionSet (safe for 400K+ entity DWGs)
         try:
             ss_name = f"COLOUR_SCAN_{int(time.time()*1000)}"
             ss = doc.SelectionSets.Add(ss_name)
             try:
-                # Filter: MTEXT entities only
                 ft = win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_I2, [0])
                 fv = win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_VARIANT, ["AcDbMText"])
-                ss.Select(5, None, None, ft, fv)  # mode 5 = all entities
+                ss.Select(5, None, None, ft, fv)
                 for i in range(ss.Count):
                     try:
-                        ent = ss.Item(i)
-                        raw = self._com_retry(lambda e=ent: e.TextString) or ''
-                        txt = self._strip_mtext_formatting(raw).upper()
-                        if ('COLOUR' in txt or 'COULOUR' in txt or 'COLOR' in txt) and 'PRINT' in txt:
-                            has_colour = True
-                            # Fix typo in-place (COULOUR→COLOUR) — do NOT delete
-                            fixed = _re.sub(r'[Cc][Oo][Uu]?[Ll][Oo][Uu]+[Rr]', 'COLOUR',
-                                            raw, flags=_re.IGNORECASE)
-                            if fixed != raw:
-                                self._com_retry(lambda e=ent, v=fixed: setattr(e, 'TextString', v))
-                                print(f"    COLOUR typo 修复: {raw[:40]}... → {fixed[:40]}...")
+                        _check_and_fix(ss.Item(i))
                     except Exception:
                         continue
             finally:
@@ -4855,18 +4926,73 @@ class IFCStampMixin:
                 except Exception:
                     pass
         except Exception as e:
-            print(f"    COLOUR 扫描异常: {e}")
+            print(f"    COLOUR 扫描(MS)异常: {e}")
+
+        # Pass B: Each PaperSpace layout via direct iteration (small, safe)
+        try:
+            for layout in doc.Layouts:
+                if layout.Name.lower() == 'model':
+                    continue
+                block = layout.Block
+                for i in range(block.Count):
+                    try:
+                        entity = block.Item(i)
+                        if entity.EntityName == 'AcDbMText':
+                            _check_and_fix(entity)
+                    except Exception:
+                        continue
+        except Exception as e:
+            print(f"    COLOUR 扫描(PS)异常: {e}")
+
         return has_colour
 
-    def _check_colour_overlap(self, doc, stamp_left, stamp_right, colour_bottom, colour_top):
+    def _check_colour_overlap(self, doc, stamp_left, stamp_right,
+                              colour_bottom, colour_top, layout_name=None):
         """Check if the COLOUR stamp area overlaps with existing entities.
 
         Returns True if overlap found (should skip COLOUR drawing).
         Expands search area slightly to catch nearby entities.
+        When layout_name is a PaperSpace name, iterates that layout directly
+        (SelectionSet crossing window only searches the active space).
         """
         import pythoncom as _pycom
         skip_layers = {self.STAMP_LAYER, 'DEFPOINTS', 'ASHADE'}
         expand = 15.0
+
+        def _entity_overlaps(ent):
+            try:
+                if ent.Layer.upper() in skip_layers:
+                    return False
+                if ent.EntityName == 'AcDbViewport':
+                    return False
+                mn, mx = ent.GetBoundingBox()
+                el, eb = float(mn[0]), float(mn[1])
+                er, et = float(mx[0]), float(mx[1])
+                if (el < stamp_right + expand and er > stamp_left - expand and
+                        eb < colour_top + expand and et > colour_bottom - expand):
+                    return True
+            except Exception:
+                pass
+            return False
+
+        # PaperSpace: direct iteration (small layouts, safe)
+        if layout_name and layout_name.lower() != 'model':
+            try:
+                for layout in doc.Layouts:
+                    if layout.Name == layout_name:
+                        block = layout.Block
+                        for i in range(block.Count):
+                            try:
+                                if _entity_overlaps(block.Item(i)):
+                                    return True
+                            except Exception:
+                                continue
+                        break
+            except Exception:
+                pass
+            return False
+
+        # ModelSpace: SelectionSet crossing window (handles 400K+ entities)
         try:
             ss_name = f"_ColourOvlp_{int(time.time() * 1000) % 1_000_000}"
             ss = doc.SelectionSets.Add(ss_name)
@@ -4874,7 +5000,8 @@ class IFCStampMixin:
                 [stamp_left - expand, colour_bottom - expand, 0.0])
             pt2 = win32com.client.VARIANT(_pycom.VT_ARRAY | _pycom.VT_R8,
                 [stamp_right + expand, colour_top + expand, 0.0])
-            ss.Select(1, pt1, pt2)  # crossing window
+            ss.Select(1, pt1, pt2)
+            found = False
             for i in range(ss.Count):
                 try:
                     ent = ss.Item(i)
@@ -4882,14 +5009,151 @@ class IFCStampMixin:
                         continue
                     if ent.EntityName == 'AcDbViewport':
                         continue
-                    ss.Delete()
-                    return True
+                    found = True
+                    break
                 except Exception:
                     continue
             ss.Delete()
+            return found
         except Exception:
             pass
         return False
+
+    def _ensure_colour_has_border(self, doc, draw_space, stamp_left, stamp_right,
+                                   colour_bottom, colour_top, cw, layout_name=None):
+        """Ensure existing COLOUR MText has a border rectangle.
+
+        Called when has_colour=True. If original COLOUR text lacks a rect
+        border, draws one at the stamp position on IFC_STAMP layer.
+        """
+        colour_entity = None
+
+        # Find the COLOUR MText entity
+        if layout_name and layout_name.lower() != 'model':
+            try:
+                for layout in doc.Layouts:
+                    if layout.Name == layout_name:
+                        block = layout.Block
+                        for i in range(block.Count):
+                            try:
+                                e = block.Item(i)
+                                if e.EntityName == 'AcDbMText':
+                                    raw = self._com_retry(lambda ent=e: ent.TextString) or ''
+                                    txt = self._strip_mtext_formatting(raw).upper()
+                                    if ('COLOUR' in txt or 'COLOR' in txt) and 'PRINT' in txt:
+                                        colour_entity = e
+                                        break
+                            except Exception:
+                                continue
+                        break
+            except Exception:
+                pass
+        else:
+            import pythoncom as _pycom
+            try:
+                ss_name = f"_ColBorder_{int(time.time()*1000) % 1_000_000}"
+                ss = doc.SelectionSets.Add(ss_name)
+                ft = win32com.client.VARIANT(_pycom.VT_ARRAY | _pycom.VT_I2, [0])
+                fv = win32com.client.VARIANT(_pycom.VT_ARRAY | _pycom.VT_VARIANT, ["AcDbMText"])
+                ss.Select(5, None, None, ft, fv)
+                for i in range(ss.Count):
+                    try:
+                        e = ss.Item(i)
+                        raw = self._com_retry(lambda ent=e: ent.TextString) or ''
+                        txt = self._strip_mtext_formatting(raw).upper()
+                        if ('COLOUR' in txt or 'COLOR' in txt) and 'PRINT' in txt:
+                            colour_entity = e
+                            break
+                    except Exception:
+                        continue
+                ss.Delete()
+            except Exception:
+                pass
+
+        if colour_entity is None:
+            return
+
+        try:
+            mn, mx = colour_entity.GetBoundingBox()
+            cx_l, cx_b = float(mn[0]), float(mn[1])
+            cx_r, cx_t = float(mx[0]), float(mx[1])
+        except Exception:
+            return
+
+        # Search for and DELETE any existing enclosing polyline near COLOUR text,
+        # then always redraw at correct position/cw to match the main stamp box.
+        old_border = None
+        if layout_name and layout_name.lower() != 'model':
+            try:
+                for layout in doc.Layouts:
+                    if layout.Name == layout_name:
+                        block = layout.Block
+                        for i in range(block.Count):
+                            try:
+                                e = block.Item(i)
+                                if e.EntityName in ('AcDbPolyline', 'AcDbLwPolyline') and e.Closed:
+                                    emn, emx = e.GetBoundingBox()
+                                    pl, pb = float(emn[0]), float(emn[1])
+                                    pr, pt_ = float(emx[0]), float(emx[1])
+                                    if (pl <= cx_l + 5 and pr >= cx_r - 5 and
+                                            pb <= cx_b + 5 and pt_ >= cx_t - 5):
+                                        old_border = e
+                                        break
+                            except Exception:
+                                continue
+                        break
+            except Exception:
+                pass
+        else:
+            import pythoncom as _pycom
+            try:
+                ss2_name = f"_ColBChk_{int(time.time()*1000) % 1_000_000}"
+                ss2 = doc.SelectionSets.Add(ss2_name)
+                pt1 = win32com.client.VARIANT(_pycom.VT_ARRAY | _pycom.VT_R8,
+                    [cx_l - 20, cx_b - 20, 0.0])
+                pt2 = win32com.client.VARIANT(_pycom.VT_ARRAY | _pycom.VT_R8,
+                    [cx_r + 20, cx_t + 20, 0.0])
+                ss2.Select(1, pt1, pt2)
+                for i in range(ss2.Count):
+                    try:
+                        e = ss2.Item(i)
+                        if e.EntityName in ('AcDbPolyline', 'AcDbLwPolyline') and e.Closed:
+                            emn, emx = e.GetBoundingBox()
+                            pl, pb = float(emn[0]), float(emn[1])
+                            pr, pt_ = float(emx[0]), float(emx[1])
+                            if (pl <= cx_l + 5 and pr >= cx_r - 5 and
+                                    pb <= cx_b + 5 and pt_ >= cx_t - 5):
+                                old_border = e
+                                break
+                    except Exception:
+                        continue
+                ss2.Delete()
+            except Exception:
+                pass
+
+        if old_border is not None:
+            try:
+                old_border.Delete()
+            except Exception:
+                pass
+
+        # Draw border rectangle at correct stamp position with matching cw
+        try:
+            colour_pts = win32com.client.VARIANT(
+                pythoncom.VT_ARRAY | pythoncom.VT_R8,
+                [stamp_left, colour_bottom,
+                 stamp_right, colour_bottom,
+                 stamp_right, colour_top,
+                 stamp_left, colour_top])
+            pline = draw_space.AddLightWeightPolyline(colour_pts)
+            pline.Closed = True
+            pline.Layer = self.STAMP_LAYER
+            pline.color = 7
+            pline.ConstantWidth = cw
+            action = "重画" if old_border is not None else "补画"
+            print(f"    印章: COLOUR 边框已{action} (cw={cw:.2f})")
+        except Exception as e:
+            print(f"    印章: COLOUR 边框绘制失败 ({e})")
 
     def _stamp_via_com_draw(self, doc, block_ref, space, has_colour=True,
                             layout_name=None):
@@ -5105,9 +5369,13 @@ class IFCStampMixin:
 
             _draw_colour = False
             if has_colour:
-                pass  # Original DWG has COLOUR, keep as-is
+                self._ensure_colour_has_border(
+                    doc, draw_space, stamp_left_x, stamp_right_x,
+                    colour_bottom_y, colour_top_y, 0.5 * scale,
+                    layout_name=layout_name)
             elif self._check_colour_overlap(doc, stamp_left_x, stamp_right_x,
-                                             colour_bottom_y, colour_top_y):
+                                             colour_bottom_y, colour_top_y,
+                                             layout_name=layout_name):
                 print(f"    印章: COLOUR 区域有重叠实体，跳过")
             else:
                 _draw_colour = True
@@ -5189,7 +5457,12 @@ class IFCManager(IFCStampMixin):
                 return func()
             except Exception as e:
                 err_str = str(e)
-                if '-2147418111' in err_str or '-2147417848' in err_str:
+                if any(code in err_str for code in (
+                    '-2147418111',  # RPC_E_CALL_REJECTED
+                    '-2147417848',  # RPC_E_DISCONNECTED
+                    '-2147417851',  # RPC_E_SERVERFAULT
+                    '-2147352567',  # DISP_E_EXCEPTION
+                )):
                     if attempt < max_retries - 1:
                         time.sleep(delay * (attempt + 1))
                         continue
@@ -5686,7 +5959,20 @@ class IFCManager(IFCStampMixin):
         runs -PUBLISH, waits for completion.
         """
         doc = None
+        _temp_dir = None
         try:
+            # PUBLISH SendCommand fails silently on non-ASCII paths (e.g. √)
+            _use_temp = not str(dwg_path).isascii() or not str(pdf_path).isascii()
+            actual_dwg = dwg_path
+            actual_pdf = pdf_path
+            if _use_temp:
+                import tempfile
+                _temp_dir = Path(tempfile.mkdtemp(prefix="publish_"))
+                actual_dwg = _temp_dir / dwg_path.name
+                actual_pdf = _temp_dir / pdf_path.name
+                shutil.copy2(str(dwg_path), str(actual_dwg))
+                print(f"    PUBLISH: Unicode path detected, using temp dir")
+
             # Close all open documents first (clean state)
             try:
                 while acad.Documents.Count > 0:
@@ -5700,7 +5986,7 @@ class IFCManager(IFCStampMixin):
             for _retry in range(3):
                 try:
                     doc = self._com_retry(
-                        lambda p=str(dwg_path): acad.Documents.Open(p))
+                        lambda p=str(actual_dwg): acad.Documents.Open(p))
                     break
                 except Exception:
                     time.sleep(3)
@@ -5737,6 +6023,15 @@ class IFCManager(IFCStampMixin):
                                 continue
                         except Exception:
                             pass  # if can't check, include it
+                        # Skip phantom layouts with no plot configuration
+                        # (can appear after XREF bind adds entities to previously-empty layouts)
+                        try:
+                            config = layout.ConfigName
+                            if not config or config.strip() == '' or config.strip().lower() == 'none':
+                                print(f"    跳过无打印配置布局: {layout.Name}")
+                                continue
+                        except Exception:
+                            pass
                         layout_info.append((tab_order, layout.Name))
             except Exception:
                 pass
@@ -5747,10 +6042,10 @@ class IFCManager(IFCStampMixin):
             print(f"    PDF Layouts (sorted): {layout_names}")
 
             # Build DSD content with ALL layouts
-            dwg_str = str(dwg_path)
-            pdf_str = str(pdf_path)
-            out_str = str(pdf_path.parent)
-            sheet_name = dwg_path.stem
+            dwg_str = str(actual_dwg)
+            pdf_str = str(actual_pdf)
+            out_str = str(actual_pdf.parent)
+            sheet_name = actual_dwg.stem
 
             dsd_lines = [
                 '[DWF6Version]', 'Ver=1',
@@ -5789,7 +6084,9 @@ class IFCManager(IFCStampMixin):
 
             # Write DSD file
             to_long_path(pdf_path.parent).mkdir(parents=True, exist_ok=True)
-            dsd_path = dwg_path.parent / f"{sheet_name}.dsd"
+            if _use_temp:
+                _temp_dir.mkdir(parents=True, exist_ok=True)
+            dsd_path = actual_dwg.parent / f"{sheet_name}.dsd"
             dsd_path.write_text(dsd_content, encoding='utf-8')
 
             # Suppress all dialogs for silent PUBLISH
@@ -5844,15 +6141,66 @@ class IFCManager(IFCStampMixin):
             except Exception:
                 pass
 
-            # Wait for PDF flush to disk
-            time.sleep(3)
-            return pdf_path.exists()
+            # Poll for PDF to appear and stabilize on disk
+            # (CMDACTIVE=0 doesn't guarantee the plot engine has flushed)
+            check_pdf = actual_pdf
+            for _poll in range(30):
+                if check_pdf.exists():
+                    try:
+                        sz1 = check_pdf.stat().st_size
+                        if sz1 > 0:
+                            time.sleep(2)
+                            sz2 = check_pdf.stat().st_size
+                            if sz1 == sz2:
+                                break
+                    except OSError:
+                        pass
+                time.sleep(2)
+
+            # Move PDF from temp to target if needed
+            if _use_temp and actual_pdf.exists():
+                try:
+                    shutil.move(str(actual_pdf), str(pdf_path))
+                except Exception as e:
+                    logging.warning(f"Failed to move PDF from temp: {e}")
+
+            # Cleanup temp dir
+            if _temp_dir and _temp_dir.exists():
+                try:
+                    shutil.rmtree(str(_temp_dir), ignore_errors=True)
+                except Exception:
+                    pass
+
+            exists = pdf_path.exists()
+            if not exists:
+                print(f"    ⚠ PDF 未生成: {pdf_path.name}")
+                print(f"      DWG={dwg_path}")
+                print(f"      PDF={pdf_path}")
+                if timed_out:
+                    print(f"      原因: PUBLISH 超时 ({max_wait}s)")
+                # Check if PUBLISH wrote PDF next to DWG instead of target
+                alt_pdf = Path(str(actual_dwg)).parent / pdf_path.name
+                if alt_pdf != pdf_path and alt_pdf.exists():
+                    print(f"      发现 PDF 在 DWG 目录: {alt_pdf}")
+                    try:
+                        shutil.move(str(alt_pdf), str(pdf_path))
+                        print(f"      已移动到目标目录")
+                        exists = True
+                    except Exception as e:
+                        print(f"      移动失败: {e}")
+            return exists
 
         except Exception as e:
             logging.warning(f"PDF PUBLISH failed: {e}")
+            print(f"    ⚠ PDF PUBLISH 异常: {e}")
             if doc is not None:
                 try:
                     doc.Close(False)
+                except Exception:
+                    pass
+            if _temp_dir and _temp_dir.exists():
+                try:
+                    shutil.rmtree(str(_temp_dir), ignore_errors=True)
                 except Exception:
                     pass
             return False
@@ -6234,13 +6582,13 @@ class IFCManager(IFCStampMixin):
 
             result['dwg_path'] = str(ifc_dwg_path)
 
-            pdf_ok = pdf_ok  # already set above
             if pdf_ok:
                 result['pdf_path'] = str(ifc_pdf_path)
+                result['success'] = True
             else:
-                result['errors'].append("PDF PUBLISH 导出失败")
-
-            result['success'] = True
+                result['errors'].append(
+                    f"PDF PUBLISH 导出失败: {ifc_pdf_path.name} (DWG已保存)")
+                result['success'] = False
 
         except Exception as e:
             result['errors'].append(f"转换异常: {e}")
@@ -7197,10 +7545,23 @@ class PanelIFCManager(IFCStampMixin):
             except Exception:
                 pass
 
-            # Wait a moment for PDF to be flushed to disk
-            time.sleep(3)
+            # Poll for PDF to appear and stabilize on disk
+            pdf_ok = False
+            for _poll in range(30):
+                if pdf_path.exists():
+                    try:
+                        sz1 = pdf_path.stat().st_size
+                        if sz1 > 0:
+                            time.sleep(2)
+                            sz2 = pdf_path.stat().st_size
+                            if sz1 == sz2:
+                                pdf_ok = True
+                                break
+                    except OSError:
+                        pass
+                time.sleep(2)
 
-            if pdf_path.exists():
+            if pdf_ok or pdf_path.exists():
                 result['success'] = True
             else:
                 reason = "PUBLISH 超时" if timed_out else "PUBLISH 完成但 PDF 未生成"
@@ -9154,8 +9515,27 @@ class AsBuiltManager(IFCManager):
     title block finding, stamp drawing, PDF export infrastructure.
     """
 
-    AB_OUTPUT = "Design/Engineering/1. Drawings/5. As Built/3. As Built Client"
     STAMP_TEXT = "{\\fArial Narrow|b1;AS BUILT}"
+
+    LMS_TITLE_BLOCKS = {"Coleamablly", "Riverina_tellhow"}
+
+    PERSONNEL_TAGS = ['DESIGNED', 'DRAWN', 'CHECK', 'APPROVED',
+                      'ENGINEER', 'QA', 'PROJECT']
+
+
+    _NATIVE_CANDIDATES = [
+        "Design/Engineering/1. Drawings/1. Native",
+        "1. Drawings/1. Native",
+    ]
+    _AB_OUTPUT_CANDIDATES = [
+        "Design/Engineering/1. Drawings/5. As Built/3. As Built Client",
+        "Design/Engineering/1. Drawings/5. As Built",
+        "1. Drawings/6.AS Built",
+    ]
+
+    _SAME_DIR_AB_OUTPUTS = {
+        "Design/Engineering/1. Drawings/5. As Built",
+    }
 
     def __init__(self, project_path, dry_run=False, title_block_name=None,
                  native_root=None, ab_output=None):
@@ -9167,12 +9547,39 @@ class AsBuiltManager(IFCManager):
         self._dm = DeliverableManager(self.project_path, dry_run=dry_run)
         self._native_root_override = Path(native_root) if native_root else None
         self._ab_output_override = Path(ab_output) if ab_output else None
+        self._detected_native = self._NATIVE_CANDIDATES[0]
+        self._detected_ab_output = self._AB_OUTPUT_CANDIDATES[0]
+        if not native_root:
+            for cand in self._NATIVE_CANDIDATES:
+                if (self.project_path / cand).exists():
+                    self._detected_native = cand
+                    break
+        if not ab_output:
+            for cand in self._AB_OUTPUT_CANDIDATES:
+                if (self.project_path / cand).exists():
+                    self._detected_ab_output = cand
+                    break
+            if self._detected_ab_output in self._SAME_DIR_AB_OUTPUTS:
+                ab_path = self.project_path / self._detected_ab_output
+                for child in sorted(ab_path.iterdir()):
+                    if child.is_dir() and child.name.lower().startswith('3.'):
+                        self._detected_ab_output = (
+                            f"{self._detected_ab_output}/{child.name}")
+                        break
+        self._save_in_source_dir = (
+            self._detected_ab_output in self._SAME_DIR_AB_OUTPUTS)
+
+    @property
+    def native_root(self) -> Path:
+        if self._native_root_override:
+            return self._native_root_override
+        return self.project_path / self._detected_native
 
     @property
     def ab_output(self) -> Path:
         if self._ab_output_override:
             return self._ab_output_override
-        return self.project_path / self.AB_OUTPUT
+        return self.project_path / self._detected_ab_output
 
     @property
     def ifc_output(self) -> Path:
@@ -9200,11 +9607,15 @@ class AsBuiltManager(IFCManager):
                 continue
             if item.name.lower() in ('ss', 'superseded', 'superceded',
                                       'lms template', 'not_named_drawings',
-                                      'site plan_from development'):
+                                      'site plan_from development',
+                                      'delivered to chint', 'new_drawings_not_named',
+                                      'template', 'templates'):
                 continue
 
             doc_id, description = _parse_folder_name(item.name)
             if not doc_id:
+                continue
+            if not re.search(r'-\d{2,3}', doc_id):
                 continue
 
             ifc_source = self._find_latest_ifc_source(item)
@@ -9247,11 +9658,19 @@ class AsBuiltManager(IFCManager):
                     continue
                 if '_AB' in stem_upper:
                     continue
+                if 'ASBUILT' in stem_upper or 'AS_BUILT' in stem_upper or 'AS BUILT' in stem_upper:
+                    continue
                 rev_type, revision = _classify_dwg(f.name)
                 if rev_type == 'IFC':
                     try:
                         rev_num = int(revision)
                     except ValueError:
+                        rev_num = 0
+                    flat_ifc.setdefault(rev_num, []).append(f)
+                elif '_IFC' in stem_upper:
+                    if revision and revision[0].isalpha():
+                        rev_num = ord(revision[0].upper()) - ord('A')
+                    else:
                         rev_num = 0
                     flat_ifc.setdefault(rev_num, []).append(f)
         except (OSError, PermissionError):
@@ -9322,7 +9741,9 @@ class AsBuiltManager(IFCManager):
                 continue
             if f.suffix.lower() != '.pdf':
                 continue
-            if '_AS BUILT' not in f.stem and '_AS_BUILT' not in f.stem:
+            stem_upper = f.stem.upper()
+            if ('_AS BUILT' not in stem_upper and '_AS_BUILT' not in stem_upper
+                    and '_ASBUILT' not in stem_upper):
                 continue
             doc_id = _extract_doc_id_standalone(f.name)
             if not doc_id:
@@ -9418,6 +9839,266 @@ class AsBuiltManager(IFCManager):
             if full_tag in attrs:
                 self._safe_set_text(attrs[full_tag], personnel.get(tag.lower(), ''))
 
+    # ── Stamp removal (LMS-enhanced) ────────────────────────────────────
+
+    _QA_STAMP_PHRASES = {'FOR CONSTRUCTION', 'ISSUED FOR REVIEW', 'FOR REVIEW',
+                         'DRAWINGS TO BE PRINTED IN COLOUR', 'AS BUILT', 'AS-BUILT'}
+
+    def _remove_ifc_stamp(self, doc):
+        """Remove stamps from all spaces — parent + QA + geometry-based cleanup."""
+        super()._remove_ifc_stamp(doc)
+        self._remove_qa_layer_stamps(doc)
+        self._remove_stamps_by_geometry(doc)
+
+    def _remove_stamps_by_geometry(self, doc):
+        """Remove stamp-like entities near title block by spatial detection.
+
+        Catches stamps on any layer (not just IFC_STAMP/QA) — prevents
+        overlapping frames when old stamp was drawn with different style.
+        """
+        all_tbs = self._find_all_title_blocks(doc)
+        if not all_tbs:
+            return
+
+        for tb_item in all_tbs:
+            block_ref = tb_item[0]
+            layout_name = tb_item[3] if len(tb_item) > 3 else 'Model'
+
+            try:
+                min_pt, max_pt = block_ref.GetBoundingBox()
+                tb_left = float(min_pt[0])
+                tb_bottom = float(min_pt[1])
+                tb_right = float(max_pt[0])
+                tb_top = float(max_pt[1])
+                tb_w = tb_right - tb_left
+                tb_h = tb_top - tb_bottom
+            except Exception:
+                continue
+
+            if tb_w <= 0 or tb_h <= 0:
+                continue
+
+            zone_left = tb_left + tb_w * 0.55
+            zone_right = tb_right
+            zone_bottom = tb_bottom
+            zone_top = tb_bottom + tb_h * 0.40
+
+            to_delete = []
+
+            if layout_name and layout_name.lower() != 'model':
+                try:
+                    for layout in doc.Layouts:
+                        if layout.Name == layout_name:
+                            block = layout.Block
+                            self._scan_block_for_stamp_entities(
+                                block, zone_left, zone_right, zone_bottom, zone_top,
+                                tb_w, tb_h, to_delete)
+                            break
+                except Exception:
+                    pass
+            else:
+                import pythoncom as _pythoncom
+                ss_name = f"_GeoClean_{int(time.time() * 1000) % 1_000_000}"
+                try:
+                    ss = doc.SelectionSets.Add(ss_name)
+                    pt1 = win32com.client.VARIANT(
+                        _pythoncom.VT_ARRAY | _pythoncom.VT_R8,
+                        [zone_left, zone_bottom, 0.0])
+                    pt2 = win32com.client.VARIANT(
+                        _pythoncom.VT_ARRAY | _pythoncom.VT_R8,
+                        [zone_right, zone_top, 0.0])
+                    ss.Select(1, pt1, pt2)
+                    for i in range(ss.Count):
+                        try:
+                            entity = ss.Item(i)
+                            self._check_stamp_entity(
+                                entity, zone_left, zone_right, zone_bottom, zone_top,
+                                tb_w, tb_h, to_delete)
+                        except Exception:
+                            continue
+                    ss.Delete()
+                except Exception:
+                    try:
+                        doc.SelectionSets.Item(ss_name).Delete()
+                    except Exception:
+                        pass
+
+            for entity in reversed(to_delete):
+                try:
+                    entity.Delete()
+                except Exception:
+                    pass
+
+            if to_delete:
+                print(f"    Geometry cleanup [{layout_name}]: "
+                      f"{len(to_delete)} stamp entities removed")
+
+    def _scan_block_for_stamp_entities(self, block, zone_left, zone_right,
+                                        zone_bottom, zone_top, tb_w, tb_h,
+                                        to_delete):
+        """Scan a block's entities for stamp-like items in the given zone."""
+        try:
+            count = block.Count
+        except Exception:
+            return
+        for i in range(count):
+            try:
+                entity = block.Item(i)
+                self._check_stamp_entity(
+                    entity, zone_left, zone_right, zone_bottom, zone_top,
+                    tb_w, tb_h, to_delete)
+            except Exception:
+                continue
+
+    def _check_stamp_entity(self, entity, zone_left, zone_right,
+                             zone_bottom, zone_top, tb_w, tb_h, to_delete):
+        """Check if a single entity is a stamp that should be removed."""
+
+        try:
+            ename = entity.EntityName
+        except Exception:
+            return
+
+        if ename in ('AcDbPolyline', 'AcDbLwPolyline'):
+            try:
+                if not entity.Closed:
+                    return
+                mn, mx = entity.GetBoundingBox()
+                el, eb = float(mn[0]), float(mn[1])
+                er, et = float(mx[0]), float(mx[1])
+                if not (el >= zone_left - 5 and er <= zone_right + 5 and
+                        eb >= zone_bottom - 5 and et <= zone_top + 5):
+                    return
+                w = er - el
+                h = et - eb
+                w_ratio = w / tb_w
+                h_ratio = h / tb_h
+                if 0.02 < w_ratio < 0.20 and 0.005 < h_ratio < 0.08:
+                    to_delete.append(entity)
+            except Exception:
+                pass
+
+        elif ename in ('AcDbMText', 'AcDbText'):
+            try:
+                mn, mx = entity.GetBoundingBox()
+                el, eb = float(mn[0]), float(mn[1])
+                er, et = float(mx[0]), float(mx[1])
+                if not (el >= zone_left - 5 and er <= zone_right + 5 and
+                        eb >= zone_bottom - 5 and et <= zone_top + 5):
+                    return
+                text = self._com_retry(lambda e=entity: e.TextString) or ''
+                plain = self._strip_mtext_formatting(text).upper().strip()
+                if any(phrase in plain for phrase in self._QA_STAMP_PHRASES):
+                    to_delete.append(entity)
+            except Exception:
+                pass
+
+    def _remove_qa_layer_stamps(self, doc):
+        """Remove stamp entities on QA layer (LMS projects use QA, not IFC_STAMP).
+
+        Targets: closed polylines matching stamp box dimensions + stamp MText +
+        block references with stamp-like names. Scans PaperSpace and ModelSpace.
+        """
+        _stamp_block_kw = ('IFR', 'IFC_STAMP', 'FOR_CONSTRUCTION', 'AS_BUILT', 'ASBUILT')
+
+        def _collect_qa_stamp_entities(block_space):
+            to_delete = []
+            try:
+                count = block_space.Count
+            except Exception:
+                return to_delete
+            for i in range(count):
+                try:
+                    entity = block_space.Item(i)
+                except Exception:
+                    continue
+                try:
+                    layer = entity.Layer
+                except Exception:
+                    continue
+                if layer != 'QA':
+                    continue
+                try:
+                    ename = entity.EntityName
+                except Exception:
+                    continue
+
+                if ename in ('AcDbPolyline', 'AcDbLwPolyline'):
+                    try:
+                        if not entity.Closed:
+                            continue
+                        mn, mx = entity.GetBoundingBox()
+                        w = float(mx[0]) - float(mn[0])
+                        h = float(mx[1]) - float(mn[1])
+                        cw = entity.ConstantWidth
+                        if w > 300 and h > 30 and cw > 3.0:
+                            to_delete.append(entity)
+                    except Exception:
+                        pass
+
+                elif ename in ('AcDbMText', 'AcDbText'):
+                    try:
+                        raw = self._com_retry(lambda e=entity: e.TextString) or ''
+                        plain = self._strip_mtext_formatting(raw).upper().strip()
+                        if plain in self._QA_STAMP_PHRASES or any(
+                                p in plain for p in self._QA_STAMP_PHRASES):
+                            to_delete.append(entity)
+                    except Exception:
+                        pass
+
+                elif ename == 'AcDbBlockReference':
+                    try:
+                        bname = entity.Name.upper()
+                        if any(k in bname for k in _stamp_block_kw):
+                            ac = len(entity.GetAttributes())
+                            if ac < 5:
+                                to_delete.append(entity)
+                    except Exception:
+                        pass
+            return to_delete
+
+        # PaperSpace layouts (per-layout try/except to avoid one COM error skipping all)
+        try:
+            layouts = list(doc.Layouts)
+        except Exception:
+            layouts = []
+        for layout in layouts:
+            try:
+                if layout.Name.lower() == 'model':
+                    continue
+                block = layout.Block
+                victims = _collect_qa_stamp_entities(block)
+                for e in reversed(victims):
+                    try:
+                        e.Delete()
+                    except Exception:
+                        pass
+                if victims:
+                    print(f"    QA stamp cleanup [{layout.Name}]: {len(victims)} entities removed")
+            except Exception:
+                continue
+
+        # ModelSpace
+        try:
+            ms = doc.ModelSpace
+            victims = _collect_qa_stamp_entities(ms)
+            for e in reversed(victims):
+                try:
+                    e.Delete()
+                except Exception:
+                    pass
+            if victims:
+                print(f"    QA stamp cleanup [Model]: {len(victims)} entities removed")
+        except Exception:
+            pass
+
+    # ── Stamp drawing ─────────────────────────────────────────────────────
+    # Delegates to IFCStampMixin._stamp_via_com_draw so the AS BUILT box
+    # has identical width / position / cw as the FOR CONSTRUCTION box that
+    # was drawn during IFC conversion.  self.STAMP_TEXT is already
+    # "AS BUILT", so the parent method prints the correct label.
+    # COLOUR box also uses the same ratios → guaranteed alignment.
+
     # ── Single DWG conversion ────────────────────────────────────────────
 
     def convert_to_ab(self, dwg_info: Dict) -> Dict:
@@ -9456,11 +10137,21 @@ class AsBuiltManager(IFCManager):
         result['ab_rev'] = ab_rev
 
         # Build output paths
-        ab_subfolder = dwg_info['folder'] / f"Rev.{ab_rev} - AB"
-        ab_dwg_name = self._build_ab_dwg_name(dwg_path.name, ab_rev)
-        ab_dwg_path = ab_subfolder / ab_dwg_name
-        ab_pdf_name = self._build_ab_pdf_filename(doc_id, description, ab_rev)
-        ab_pdf_path = self.ab_output / f"{ab_pdf_name}.pdf"
+        if self._save_in_source_dir:
+            ab_dwg_stem = re.sub(r'\s*_?IFC$', '_AsBuilt', dwg_path.stem,
+                                 flags=re.IGNORECASE)
+            ab_dwg_name = ab_dwg_stem + dwg_path.suffix
+            ab_dwg_path = ifc_source['source_dir'] / ab_dwg_name
+            ab_pdf_stem = re.sub(r'\s*_?IFC$', '_As Built', dwg_path.stem,
+                                 flags=re.IGNORECASE)
+            ab_pdf_path = self.ab_output / f"{ab_pdf_stem}.pdf"
+            ab_subfolder = None
+        else:
+            ab_subfolder = dwg_info['folder'] / f"Rev.{ab_rev} - AB"
+            ab_dwg_name = self._build_ab_dwg_name(dwg_path.name, ab_rev)
+            ab_dwg_path = ab_subfolder / ab_dwg_name
+            ab_pdf_name = self._build_ab_pdf_filename(doc_id, description, ab_rev)
+            ab_pdf_path = self.ab_output / f"{ab_pdf_name}.pdf"
 
         if self.dry_run:
             result['success'] = True
@@ -9594,24 +10285,15 @@ class AsBuiltManager(IFCManager):
                 else:
                     print(f"    ⚠ Sheet {tb_idx}: block_ref 或 space 为空，跳过印章")
 
-            # Create AB subfolder
-            to_long_path(ab_subfolder).mkdir(parents=True, exist_ok=True)
-
-            # Ensure AB output directory exists
+            # Create output directories
+            if ab_subfolder:
+                to_long_path(ab_subfolder).mkdir(parents=True, exist_ok=True)
             to_long_path(self.ab_output).mkdir(parents=True, exist_ok=True)
 
-            # SaveAs — use temp short path if > 240 chars
-            final_dwg_path = ab_dwg_path
-            use_temp = len(str(ab_dwg_path)) > 240
-            if use_temp:
-                import tempfile
-                temp_dir = Path(tempfile.gettempdir()) / "AB_TEMP"
-                temp_dir.mkdir(parents=True, exist_ok=True)
-                temp_dwg = temp_dir / ab_dwg_name
-                save_path = temp_dwg
-                print(f"    路径过长({len(str(ab_dwg_path))}字符)，使用临时路径 SaveAs")
-
-                # Bind XREFs before temp SaveAs
+            if not self._save_in_source_dir:
+                # Bind XREFs before SaveAs — subfolder mode changes relative
+                # path base. Without binding, PUBLISH reopens DWG and XREFs
+                # fail to resolve → empty/missing PDF.
                 xref_bound = 0
                 try:
                     for bi in range(doc.Blocks.Count):
@@ -9629,8 +10311,33 @@ class AsBuiltManager(IFCManager):
                             time.sleep(2)
                         except Exception:
                             pass
+                        # Verify all XREFs resolved
+                        _unresolved = 0
+                        try:
+                            for _bi2 in range(doc.Blocks.Count):
+                                try:
+                                    _blk2 = doc.Blocks.Item(_bi2)
+                                    if _blk2.IsXRef:
+                                        _unresolved += 1
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                        if _unresolved:
+                            print(f"    ⚠ XREF: {_unresolved} 个外部引用绑定后仍未解析")
                 except Exception:
                     pass
+
+            # SaveAs — use temp short path if > 240 chars
+            final_dwg_path = ab_dwg_path
+            use_temp = len(str(ab_dwg_path)) > 240
+            if use_temp:
+                import tempfile
+                temp_dir = Path(tempfile.gettempdir()) / "AB_TEMP"
+                temp_dir.mkdir(parents=True, exist_ok=True)
+                temp_dwg = temp_dir / ab_dwg_name
+                save_path = temp_dwg
+                print(f"    路径过长({len(str(ab_dwg_path))}字符)，使用临时路径 SaveAs")
             else:
                 save_path = ab_dwg_path
 
@@ -9696,10 +10403,19 @@ class AsBuiltManager(IFCManager):
 
             if pdf_ok:
                 result['pdf_path'] = str(ab_pdf_path)
+                result['success'] = True
+                # QA validation
+                qa_warnings = self._qa_validate_ab_pdf(
+                    ab_pdf_path, doc_id,
+                    expected_pages=len(all_tbs) if all_tbs else None)
+                if qa_warnings:
+                    for _qw in qa_warnings:
+                        print(f"    [QA] {_qw}")
+                    result['qa_warnings'] = qa_warnings
             else:
-                result['errors'].append("PDF PUBLISH 导出失败")
-
-            result['success'] = True
+                result['errors'].append(
+                    f"PDF PUBLISH 导出失败: {ab_pdf_path.name} (DWG已保存)")
+                result['success'] = False
 
         except Exception as e:
             result['errors'].append(f"转换异常: {e}")
@@ -9743,19 +10459,34 @@ class AsBuiltManager(IFCManager):
         result['ab_rev'] = ab_rev
 
         # Working folder for AB DWGs
-        ab_subfolder = dwg_info['folder'] / f"Rev.{ab_rev} - AB"
-        ab_pdf_name = self._build_ab_pdf_filename(doc_id, description, ab_rev)
-        ab_pdf_path = self.ab_output / f"{ab_pdf_name}.pdf"
+        if self._save_in_source_dir:
+            ab_subfolder = None
+            ab_dwg_dir = ifc_source['source_dir']
+            first_stem = re.sub(r'\s*_?IFC$', '_As Built', page_dwgs[0].stem,
+                                flags=re.IGNORECASE)
+            ab_pdf_path = self.ab_output / f"{first_stem}.pdf"
+        else:
+            ab_subfolder = dwg_info['folder'] / f"Rev.{ab_rev} - AB"
+            ab_dwg_dir = ab_subfolder
+            ab_pdf_name = self._build_ab_pdf_filename(doc_id, description, ab_rev)
+            ab_pdf_path = self.ab_output / f"{ab_pdf_name}.pdf"
 
         if self.dry_run:
             result['success'] = True
-            result['dwg_paths'] = [str(ab_subfolder / self._build_ab_dwg_name(p.name, ab_rev))
-                                   for p in page_dwgs]
+            if self._save_in_source_dir:
+                result['dwg_paths'] = [
+                    str(ab_dwg_dir / (re.sub(r'\s*_?IFC$', '_AsBuilt', p.stem,
+                                             flags=re.IGNORECASE) + p.suffix))
+                    for p in page_dwgs]
+            else:
+                result['dwg_paths'] = [str(ab_dwg_dir / self._build_ab_dwg_name(p.name, ab_rev))
+                                       for p in page_dwgs]
             result['pdf_path'] = str(ab_pdf_path)
             return result
 
         # --- Process each page ---
-        to_long_path(ab_subfolder).mkdir(parents=True, exist_ok=True)
+        if ab_subfolder:
+            to_long_path(ab_subfolder).mkdir(parents=True, exist_ok=True)
         to_long_path(self.ab_output).mkdir(parents=True, exist_ok=True)
 
         acad = self._get_acad()
@@ -9768,8 +10499,13 @@ class AsBuiltManager(IFCManager):
             page_label = page_dwg.stem
             print(f"    [{page_idx}/{total_pages}] {page_label}")
 
-            ab_dwg_name = self._build_ab_dwg_name(page_dwg.name, ab_rev)
-            ab_dwg_path = ab_subfolder / ab_dwg_name
+            if self._save_in_source_dir:
+                ab_dwg_stem = re.sub(r'\s*_?IFC$', '_AsBuilt', page_dwg.stem,
+                                     flags=re.IGNORECASE)
+                ab_dwg_name = ab_dwg_stem + page_dwg.suffix
+            else:
+                ab_dwg_name = self._build_ab_dwg_name(page_dwg.name, ab_rev)
+            ab_dwg_path = ab_dwg_dir / ab_dwg_name
 
             doc = None
             try:
@@ -9834,6 +10570,40 @@ class AsBuiltManager(IFCManager):
                                                      has_colour=has_colour,
                                                      layout_name=layout_name)
 
+                # Bind XREFs before SaveAs (only for subfolder mode)
+                if not self._save_in_source_dir:
+                    _xb = 0
+                    try:
+                        for bi in range(doc.Blocks.Count):
+                            try:
+                                blk = doc.Blocks.Item(bi)
+                                if blk.IsXRef:
+                                    blk.Bind(False)
+                                    _xb += 1
+                            except Exception:
+                                pass
+                        if _xb:
+                            print(f"    XREF 绑定: {_xb} 个外部引用已绑定")
+                            try:
+                                doc.Regen(1)
+                                time.sleep(2)
+                            except Exception:
+                                pass
+                            _unres = 0
+                            try:
+                                for _bi3 in range(doc.Blocks.Count):
+                                    try:
+                                        if doc.Blocks.Item(_bi3).IsXRef:
+                                            _unres += 1
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                            if _unres:
+                                print(f"    ⚠ XREF: {_unres} 个外部引用绑定后仍未解析")
+                    except Exception:
+                        pass
+
                 # SaveAs to AB subfolder
                 try:
                     sp = Path(ab_dwg_path)
@@ -9885,9 +10655,17 @@ class AsBuiltManager(IFCManager):
         if pdf_result['success']:
             result['pdf_path'] = pdf_result['pdf_path']
             result['success'] = True
+            # QA validation
+            qa_warnings = self._qa_validate_ab_pdf(
+                ab_pdf_path, doc_id,
+                expected_pages=len(ok_pages))
+            if qa_warnings:
+                for _qw in qa_warnings:
+                    print(f"    [QA] {_qw}")
+                result['qa_warnings'] = qa_warnings
         else:
             result['errors'].append(pdf_result.get('error', 'PDF 合并失败'))
-            result['success'] = len(ok_pages) > 0
+            result['success'] = False
 
         return result
 
@@ -10032,8 +10810,23 @@ class AsBuiltManager(IFCManager):
             except Exception:
                 pass
 
-            time.sleep(3)
-            if pdf_path.exists():
+            # Poll for PDF to appear and stabilize on disk
+            pdf_ok = False
+            for _poll in range(30):
+                if pdf_path.exists():
+                    try:
+                        sz1 = pdf_path.stat().st_size
+                        if sz1 > 0:
+                            time.sleep(2)
+                            sz2 = pdf_path.stat().st_size
+                            if sz1 == sz2:
+                                pdf_ok = True
+                                break
+                    except OSError:
+                        pass
+                time.sleep(2)
+
+            if pdf_ok or pdf_path.exists():
                 result['success'] = True
             else:
                 reason = "PUBLISH 超时" if timed_out else "PUBLISH 完成但 PDF 未生成"
@@ -10084,9 +10877,89 @@ class AsBuiltManager(IFCManager):
                 continue
             file_doc_id = _extract_doc_id_standalone(f.name)
             if file_doc_id and file_doc_id.upper() == doc_id.upper():
-                if '_AS BUILT' in f.stem or '_AS_BUILT' in f.stem:
+                s_upper = f.stem.upper()
+                if '_AS BUILT' in s_upper or '_AS_BUILT' in s_upper or '_ASBUILT' in s_upper:
                     return True
         return False
+
+    # ── Post-conversion QA validation ────────────────────────────────────
+
+    def _qa_validate_ab_pdf(self, pdf_path: Path, doc_id: str,
+                             expected_pages: int = None) -> List[str]:
+        """Post-conversion QA validation of an AS BUILT PDF.
+
+        Returns list of warning strings. Empty list = all checks passed.
+        """
+        warnings = []
+        if not pdf_path.exists():
+            return [f'PDF not found: {pdf_path.name}']
+
+        try:
+            import fitz
+        except ImportError:
+            return []
+
+        try:
+            pdf_doc = fitz.open(str(pdf_path))
+            page_count = pdf_doc.page_count
+
+            if expected_pages is not None and page_count != expected_pages:
+                warnings.append(
+                    f'页数不匹配: PDF={page_count}, 预期={expected_pages}')
+
+            page_dims = []
+            for pi in range(page_count):
+                page = pdf_doc[pi]
+                page_text = page.get_text().upper()
+                pw, ph = page.rect.width, page.rect.height
+                page_dims.append((round(pw), round(ph)))
+
+                # Duplicate COLOUR stamps
+                import re as _re_qa
+                colour_count = len(_re_qa.findall(
+                    r'PRINTED\s+IN\s+COLOU?R', page_text))
+                if colour_count > 1:
+                    warnings.append(
+                        f'Page {pi+1}: COLOUR 印章出现 {colour_count} 次 (重复)')
+
+                # Duplicate AS BUILT stamps
+                ab_count = len(_re_qa.findall(r'AS\s*BUILT', page_text))
+                if ab_count > 1:
+                    warnings.append(
+                        f'Page {pi+1}: AS BUILT 印章出现 {ab_count} 次 (重复)')
+
+                # Leftover IFC stamps
+                if _re_qa.search(r'FOR\s+CONSTRUCTION', page_text):
+                    warnings.append(
+                        f'Page {pi+1}: "FOR CONSTRUCTION" 残留 — IFC 印章未清除')
+
+                # Leftover IFR stamps
+                if _re_qa.search(r'ISSUED\s+FOR\s+REVIEW', page_text):
+                    warnings.append(
+                        f'Page {pi+1}: "ISSUED FOR REVIEW" 残留 — IFR 印章未清除')
+
+                # Missing AS BUILT stamp
+                if not _re_qa.search(r'AS\s*BUILT', page_text):
+                    warnings.append(
+                        f'Page {pi+1}: 缺少 AS BUILT 印章')
+
+            # Phantom page detection (different dimensions from majority)
+            if page_count > 1:
+                from collections import Counter
+                dim_counts = Counter(page_dims)
+                majority_dim = dim_counts.most_common(1)[0][0]
+                for pi, dims in enumerate(page_dims):
+                    if dims != majority_dim:
+                        warnings.append(
+                            f'Page {pi+1}: 尺寸异常 ({dims[0]}x{dims[1]} '
+                            f'vs 多数页 {majority_dim[0]}x{majority_dim[1]}) '
+                            f'— 可能是 Model tab')
+
+            pdf_doc.close()
+        except Exception as e:
+            warnings.append(f'QA 扫描异常: {e}')
+
+        return warnings
 
     # ── Batch conversion ─────────────────────────────────────────────────
 
@@ -10100,6 +10973,10 @@ class AsBuiltManager(IFCManager):
 
         Returns list of result dicts.
         """
+        mode_label = "同目录" if self._save_in_source_dir else "子文件夹"
+        print(f"  AS BUILT 模式: {mode_label} | Native: {self._detected_native} | "
+              f"Output: {self._detected_ab_output}")
+
         scan = self.scan_native_for_ab()
         if doc_ids:
             doc_id_set = {d.upper() for d in doc_ids}
@@ -10148,20 +11025,16 @@ class AsBuiltManager(IFCManager):
                 print(f"    [{status}] {', '.join(extra_parts)}")
             else:
                 print(f"    [FAIL] {'; '.join(r.get('errors', ['未知错误']))}")
-
-            # Recovery between files: close all open documents
-            try:
-                acad = self._get_acad()
-                while acad.Documents.Count > 0:
-                    acad.Documents.Item(0).Close(False)
-                    time.sleep(1)
-            except Exception:
-                pass
+                self._acad = None
+                time.sleep(3)
 
         # Summary
         ok = sum(1 for r in results if r['success'])
         fail = len(results) - ok
+        qa_issues = sum(1 for r in results if r.get('qa_warnings'))
         print(f"\n  AS BUILT done: ok={ok}, fail={fail}")
+        if qa_issues:
+            print(f"  ⚠ QA 警告: {qa_issues} 个文件有质量问题，请检查日志")
 
         return results
 

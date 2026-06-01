@@ -1,0 +1,29 @@
+[DWF6Version]
+Ver=1
+[DWF6MinorVersion]
+MinorVer=1
+[DWF6Sheet:GG31-E-BLD-001_Auxiliary Cable Block Diagram_RevA_IFC_TEST-Layout1]
+DWG=D:\1. SOP\SOP_Stage 2 IFR Sync√\V6√\test_output\GG31-E-BLD-001_Auxiliary Cable Block Diagram_RevA_IFC_TEST.dwg
+Layout=Layout1
+Setup=
+OriginalSheetPath=D:\1. SOP\SOP_Stage 2 IFR Sync√\V6√\test_output\GG31-E-BLD-001_Auxiliary Cable Block Diagram_RevA_IFC_TEST.dwg
+Has Plot Port=0
+Has3DDWF=0
+[Target]
+Type=6
+DWF=D:\1. SOP\SOP_Stage 2 IFR Sync√\V6√\test_output\GG31-E-BLD-001_Auxiliary Cable Block Diagram_RevA_IFC_TEST.pdf
+OUT=D:\1. SOP\SOP_Stage 2 IFR Sync√\V6√\test_output
+PWD=
+PromptForDwfName=FALSE
+[PdfOptions]
+VectorResolution=600
+RasterResolution=400
+[SheetSetProperties]
+IsSheetSet=FALSE
+IsHomogeneous=FALSE
+SheetSet Storage File=
+AcadProfile=<<Default>>
+CategoryCount=0
+[AutoCAD Block Information]
+IncludeBlockInfo=0
+BlockTmplFilePath=

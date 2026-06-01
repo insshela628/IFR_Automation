@@ -1,0 +1,162 @@
+1.新增 C:\Users\ACE\GREEN GOLD ENERGY Dropbox\Projects\Project (EPC)\2.SA\GG-31 Warnertown BESS\Design\Engineering\8. Deliverables 到IFR subfolder的同步
+2.改一版V5
+
+IFR sync已经增加IFC到IFC的映射
+
+不知道为什么 GG31-C-RPT-001_MV Power Station (MVPS) Foundation Plan_RevA.pdf总是出现在report，即便那个report文件夹已经没有这个了，并且显示损坏
+
+GG31-E-RPT-007_HV Cable Calculation Report_Rev B Pre.pdf和GG31-E-RPT-007_HV Cable Calculation Report_Rev B.pdf同时出现的时候，选择日期更新 的那个
+
+ifc要怎么办？编号从0开始，
+
+————————————————————————————————
+  项目: GG-31 Warnertown BESS
+
+  筛选文件夹 (留空=全部, 或输入关键字如 PLN-001): 全部
+
+  没有找到 _Rev 文件夹
+
+按 Enter 返回...
+
+设置太死板，不是要找Rev 文件夹，是每个Native下独立的文件夹打开
+
+ Here is Claude's plan:
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Version Manager v3 - 灵活的工作文件版本管理
+
+ Context
+
+ 当前 NativeVersionManager 过于死板：
+ - 只扫描 1. Native/ — 实际上 Reports、Schedule 下也有版本文件夹
+ - 只匹配 _Rev 结尾 — 实际有 _RevA、_RevB、无 _Rev 后缀等
+ - Doc ID 只支持 GG 前缀 — LMS 项目用 50023-XX-NNN
+ - 只处理 .dwg — Reports 里有 .docx/.pdf/.xlsx
+ - Superseded 文件夹固定 SS/ — 实际有 SUPERSEDED/、Superceded/ 三种
+
+ 目标: 选择一个项目 → 一次性扫描所有工作文件夹 → 整理所有旧版本
+
+ 文件计划
+
+ - 新建: D:/1. SOP/SOP_Stage 2 IFR Sync√/V4√/version_manager_v3.py (基于 v2 升版)
+ - 保留: D:/1. SOP/SOP_Stage 2 IFR Sync√/V4√/version_manager.py (旧版不动)
+ - 新建: D:/1. SOP/SOP_Stage 2 IFR Sync√/V4√/Skill_version_manager.md
+
+ 具体改动
+
+ 1. 扩展扫描范围 — 基于路径定义
+
+ 定义多个扫描根目录和扫描深度：
+
+ SCAN_ROOTS = [
+     # (相对路径, 扫描深度)
+     # depth=1: 直接子文件夹就是文档文件夹 (如 Native/GG31-C-PLN-001_xxx/)
+     # depth=2: 需要先进一层分类目录 (如 Reports/Civil & Structure/GG31-C-RPT-001_xxx/)
+     ("Design/Engineering/1. Drawings/1. Native", 1),
+     ("Design/Engineering/2. Calcs & Reports/Reports", 2),
+     ("Design/Engineering/2. Calcs & Reports/Schedule", 1),
+ ]
+
+ 文件夹发现逻辑（find_doc_folders() 替代 find_rev_folders()）：
+ - 遍历每个 SCAN_ROOT
+ - 按 depth 决定扫描层级
+ - 排除已知非文档文件夹名：SS, SUPERSEDED, Superceded, BOM, Appendix, Approved, SY Supply* 等（不区分大小写）
+ - 排除以 . 开头的隐藏文件夹
+ - 不依赖 doc_id 正则来发现文件夹 — 所有不在排除列表中的子文件夹都纳入扫描
+ - 从文件夹名中尽力提取 doc_id（仅用于显示），提取失败就用文件夹名本身
+
+ 2. 删除 _RE_FOLDER_NAME 正则
+
+ 不再用正则匹配文件夹名。改为简单的文件夹名解析：
+ - 尝试以第一个 _ 分割文件夹名：前部分当 doc_id，后部分当 description
+ - 提取失败不影响扫描 — 所有子文件夹都会被处理
+
+ 3. 处理多种文件类型
+
+ 忽略列表（不处理这些扩展名）：
+ _IGNORE_EXT = {'.dwl', '.dwl2', '.err', '.log', '.tmp', '.lnk', '.db', '.ini'}
+ 忽略列表之外的所有文件都参与版本管理。
+
+ 4. 统一 Superseded 文件夹检测
+
+ 新函数 _find_or_create_ss_folder(folder):
+ - 扫描文件夹下现有子目录，不区分大小写匹配 ss、superseded、superceded
+ - 如果找到，使用已有的（避免创建重复）
+ - 如果都不存在，默认创建 SS/
+ - 扫描文件时跳过这些文件夹
+
+ 5. 版本分类逻辑保持不变
+
+ - IFR (字母版本 RevA/B/C) vs IFC (数字版本 Rev0/1/2)
+ - 每类保留最新的，旧的移到 superseded 文件夹
+
+ 6. UI 分组显示
+
+ 在交互界面和 CLI 中，按扫描根目录分组显示：
+
+   === 1. Native === (15 folders)
+     GG31-C-PLN-001_Civil Site Layout Plan_Rev
+       [保留 IFR] GG31-C-PLN-001 Civil Site Plan_rB.dwg
+       [->SS/] GG31-Site Plan - 11544 Augusta Hwy revK.dwg
+
+   === Reports/Civil & Structure === (5 folders)
+     GG31-C-RPT-001_MV Power Station Foundation Report_Rev
+       [保留] GG31-C-RPT-001_...Rev0_IFC.docx
+       ...
+
+
+ 7. CLI 参数
+
+ - --native 仍然有效，扫描范围扩大到所有 SCAN_ROOTS
+ - --folder 关键字筛选仍然有效
+ - 新增 --scope native|reports|schedule|all 可选过滤（默认 all）
+
+ 不改动的部分
+
+ - PDF 模式 (VersionManager 类) 完全不动
+ - InteractiveUI 菜单结构保持，只修改选项 [5] 的处理逻辑
+ - config.json 格式不变
+
+ 验证方式
+
+ 1. python version_manager.py --native → 确认扫描到 Native + Reports + Schedule 所有文件夹
+ 2. python version_manager.py --native --folder PLN-001 → 确认筛选有效
+ 3. 交互模式选 [5] → 确认分组显示正确
+ 4. dry-run 确认识别正确后再 --execute
+
+
+————————————————————————————————————17/02/26
+
+  v3.0 主要变更对照:
+
+  ┌───────────────────┬───────────────────────────────────┬────────────────────────────────────────────────────────────┐
+  │       项目        │               v2.0                │                            v3.0                            │
+  ├───────────────────┼───────────────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ 扫描范围          │ 仅 1. Native/                     │ Native + Reports + Schedule (SCAN_ROOTS)                   │
+  ├───────────────────┼───────────────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ 文件夹发现        │ _RE_FOLDER_NAME 正则匹配 _Rev     │ _parse_folder_name() 宽松匹配，排除列表外全部纳入          │
+  │                   │ 结尾                              │                                                            │
+  ├───────────────────┼───────────────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ 文件类型          │ 仅 .dwg                           │ 忽略列表 (_IGNORE_EXT) 外所有文件                          │
+  ├───────────────────┼───────────────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ SS 文件夹         │ 硬编码 folder / 'SS'              │ _find_or_create_ss_folder() 自动检测                       │
+  │                   │                                   │ SS/SUPERSEDED/Superceded                                   │
+  ├───────────────────┼───────────────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ 排除列表          │ 忽略 .xlsx/.txt/.csv              │ 不再忽略（Reports 正式文件）                               │
+  ├───────────────────┼───────────────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ process_all()     │ List[NativeFolderResult]          │ List[Tuple[str, NativeFolderResult]] (含分组名)            │
+  │ 返回              │                                   │                                                            │
+  ├───────────────────┼───────────────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ CLI 参数          │ --native --folder --execute       │ 新增 --scope native/reports/schedule/all                   │
+  ├───────────────────┼───────────────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ 交互模式 [5]      │ 直接扫描 Native                   │ 先选范围，再分组显示                                       │
+  └───────────────────┴───────────────────────────────────┴──────────────────────────────────────────────────────
+
+
+乱改！不读取IFR electrical report了
+
+ifr_automation_v5.py需要把electrical的IFC文件放到C:\Users\ACE\GREEN GOLD ENERGY Dropbox\Projects\Project (EPC)\2.SA\GG-31 Warnertown BESS\Design\Engineering\1. Drawings\4. IFC(Client)，而不是放去C:\Users\ACE\GREEN GOLD ENERGY Dropbox\Projects\Project (EPC)\2.SA\GG-31 Warnertown BESS\Design\Engineering\1. Drawings\3. IFR(Client)\2.Reports
+
+Version Manager增加 IFR和IFC的区分，独立文件夹同时存在一版IFR和IFC的时候，不需要把旧版本的IFR移到SS
+
+ 你对我的version_manager_v3.py做了什么，他没法检测出这个目录下的旧版本和IFC文件了，如果有旧版本要删除（不同版本号
+  删除date modified更早的）,如果有IFC，IFC需要删掉不要保留在IFR/reports这个目录里， IFC文件有自己的去处！

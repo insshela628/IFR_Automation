@@ -1,0 +1,12 @@
+IFR Pipeline Dry-Run Summary — 20260324
+==================================================
+PASS: 6/6  |  FAIL: 0/6
+
+LMS Excel preload: 72 doc-IDs loaded — PASS
+LMS Phase 4b: 6 newly collected files (old=16, new=22) — PASS (improvement detected)
+LMS full pipeline dry-run: SUCCESS — PASS
+  IFR sync: drawings=0, reports=0
+  Version mgmt: scanned=107, moved=0
+Warnertown Excel preload: 74 doc-IDs — PASS
+Warnertown Phase 4b: IDENTICAL (old=32, new=32) — PASS
+Warnertown full pipeline dry-run: SUCCESS — PASS

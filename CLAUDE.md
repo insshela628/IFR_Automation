@@ -17,6 +17,8 @@ AutoCAD IFR sync and IFC conversion automation for solar farm engineering projec
 | `inspect_attrs.py` | List all title block attributes from a panel DWG (discovered ACE_TitleBlock_CHINT) |
 | `test_ifc_v9.py` | **Reusable** automated IFC test: frame measure → TB update → stamp → SaveAs → PDF. Multi-DWG per project, multi-TB per DWG. Project-configurable (`python test_ifc_v9.py warnertown`, `tatua`, etc). Logs to `test_logs/` |
 | `inspect_bot_ifc.py` | Inspect bot IFC output DWGs — IFC_STAMP entities, COLOUR MTEXT, IFR blocks, viewport freeze status |
+| `test_ab_dryrun.py` | Dry-run test for AsBuiltManager — scans all 3 projects (LMS, Warnertown, Tatua) |
+| `test_ab_stamp_warnertown.py` | Live stamp test on Warnertown standard frame DWG — visual verification |
 
 ## Key Classes in ifr_automation_v10.py
 | Class | Purpose |
@@ -29,6 +31,7 @@ AutoCAD IFR sync and IFC conversion automation for solar farm engineering projec
 | `PanelIFCManager` | Multi-page panel IFC conversion + PUBLISH PDF (inherits IFCStampMixin) |
 | `ApprovedIFCManager` | Detect approved IFR → archive → locate Native DWG → IFC convert (inherits IFCStampMixin) |
 | `IssueRegisterManager` | Three-angle responder assignment for Design Review Comments / RFI Register (pdfplumber title-block extraction, writes `_updated.xlsx`) |
+| `AsBuiltManager` | Multi-project AS BUILT conversion (inherits IFCManager). Auto-detects native/ab_output paths + SaveAs mode. Two modes: subfolder (`Rev.N - AB/` + XREF bind, for Warnertown) and same-dir (save alongside IFC source, no XREF bind, for Coleambally2). Overrides: `_remove_ifc_stamp` (QA + geometry-based cleanup), `_stamp_via_com_draw` (unified proportional thick-border stamp for ALL TBs), `_update_title_block` (AS BUILT rev row). Supports LMS, Warnertown, Coleambally (Tatua), Coleambally2 |
 | `PipelineOrchestrator` | 6-stage pipeline: Health Check → IFR Sync → Version Mgmt → IFC Transmittal → Sharepoint Sync → Deliverable. IFC Transmittal (Stage 3) calls `IFCTransmittalManager.run_for_pipeline()` — scan+dedup only, passes `ifc_map` to Stage 5 for unified Excel write |
 
 ## Top-Level Constraint
@@ -53,12 +56,21 @@ for lname in layout_names:
 ```
 - This applies to `_publish_single_pdf` (IFCManager) AND `_publish_group_pdf` (PanelIFCManager)
 - **XREF binding before temp SaveAs**: When path > 240 chars, DWG is saved to temp dir first. All XREFs must be bound (`blk.Bind(False)`) BEFORE SaveAs, otherwise relative XREF paths break → missing lines/content in PDF. Insert bind (`False`) preserves original layer names.
-- **Failure mode if XREF not bound**: E-PLN-003 (252 chars) exported with missing cable route lines because XREFs couldn't resolve from temp dir
+- **XREF binding for AS BUILT (subfolder mode only)**: `convert_to_ab` and `convert_multi_to_ab` bind XREFs before SaveAs ONLY when `_save_in_source_dir=False` (subfolder mode — DWG saved to `Rev.N - AB/`, different directory than source). When `_save_in_source_dir=True` (same-dir mode — Coleambally2), DWG stays in source folder so XREF paths remain valid, no binding needed.
+- **AS BUILT SaveAs modes**: Auto-detected by `_AB_OUTPUT_CANDIDATES` match. `5. As Built/3. As Built Client` → subfolder mode (Warnertown). `5. As Built/` (flat) → same-dir mode (Coleambally2). `6.AS Built` → subfolder mode (LMS/Tatua).
+- **Failure mode if XREF not bound**: E-PLN-003 (252 chars) exported with missing cable route lines because XREFs couldn't resolve from temp dir. Warnertown AS BUILT: 10 DWGs reported success but 0 PDFs created because XREFs in subfolder couldn't resolve.
+- **Unicode path workaround**: PUBLISH SendCommand silently fails on non-ASCII paths (e.g. `√` in directory names). `_publish_single_pdf` detects non-ASCII via `str(path).isascii()`, copies DWG to temp dir, builds DSD with temp paths, moves PDF back after export. Applied to `_publish_single_pdf` only (other methods already operate from controlled output dirs).
+- **PDF wait**: CMDACTIVE=0 doesn't guarantee plot engine has flushed to disk. All 3 PUBLISH methods (`_publish_single_pdf`, `_publish_group_pdf`, `_publish_ab_group_pdf`) poll with file-size-stable check (2s intervals, up to 60s) instead of blind `sleep(3)`.
 
 ### IFR Stamp Removal
-- `_remove_ifc_stamp()`: pre-scan `doc.Blocks` definitions to find IFR stamp block names (blocks with ≤10 entities containing "FOR REVIEW" MText), then delete matching INSERT references
+- `_remove_ifc_stamp()`: pre-scan `doc.Blocks` definitions to find IFR/IFC stamp block names (blocks with ≤10 entities containing "FOR REVIEW" or "FOR CONSTRUCTION" MText, or name containing 'IFR'/'IFC'), then delete matching INSERT references
+- **Pass 0**: ModelSpace INSERT scan + **Pass 0b**: PaperSpace block reference scan (Pass 0 SelectionSet only searches active space — PaperSpace block references missed without 0b)
 - Use exact text matching via `_strip_mtext_formatting()` (not substring) — substring match would delete "Drawing to be Printed in colour"
 - All SelectionSet names must use timestamps to avoid stale name collisions
+- **Failure mode if only 'IFR' checked**: IFC-named stamp blocks (e.g. `IFC_STAMP_*`) not caught → FOR CONSTRUCTION leftover in AS BUILT output (BLD-001)
+- **AsBuiltManager `_remove_stamps_by_geometry`**: catch-all safety net that removes stamp entities near title blocks by spatial detection. Does NOT skip any layer (IFC_STAMP/QA included) — catches stamps that passes 1-3 missed (e.g. manually-drawn stamps from pre-bot IFC conversions). Uses substring matching for MText (not exact) since entities are already spatially filtered to the stamp zone.
+- **Pass 3 resilience**: PaperSpace iteration uses per-layout try/except so one layout failure doesn't skip the rest (previously entire loop was wrapped in single try/except → one COM error skipped all subsequent layouts, e.g. SEC-02 9-page all with leftover FOR CONSTRUCTION)
+- **Failure mode if geometry cleanup skips IFC_STAMP layer**: Pass 1 only searches active space; Pass 3 may fail silently on COM error → FOR CONSTRUCTION on IFC_STAMP layer in PaperSpace survives all removal passes → leftover in AS BUILT output (SEC-02, CFG-001)
 
 ### IFC Revision History
 - `preserve_ifr=True` **(default for ALL projects)**: KEEP all existing IFR revision rows, add IFC row AFTER the last IFR row. **Idempotent**: if an IFC row already exists (DESCRIPTION contains "CONSTRUCTION"), overwrite it in-place instead of appending a new row. Clean up any duplicate IFC rows above target_row (from previous bug).
@@ -86,8 +98,10 @@ for lname in layout_names:
   1. `has_colour=True` → original DWG already has COLOUR text → keep as-is, fix typo only, do NOT redraw
   2. `has_colour=False` + overlap detected → existing drawings/text in COLOUR area → skip to avoid overlap
   3. `has_colour=False` + no overlap → draw COLOUR box (rect + MText "DRAWINGS TO BE PRINTED IN COLOUR")
-- `_scan_has_colour(doc)`: SelectionSet MTEXT scan for COLOUR/COULOUR/COLOR + PRINT, fixes typos in-place
-- `_check_colour_overlap(doc, ...)`: SelectionSet crossing window (mode 1) with ±15 unit expansion, skips IFC_STAMP/DEFPOINTS/ASHADE layers and viewports
+- `_scan_has_colour(doc)`: **Two-pass scan** — Pass A: SelectionSet MTEXT in ModelSpace (safe for 400K+), Pass B: direct iteration of each PaperSpace layout. Fixes COULOUR→COLOUR typos in-place. MUST search both spaces — SelectionSet mode 5 only searches active space, PaperSpace COLOUR MText is invisible to it.
+- `_check_colour_overlap(doc, ..., layout_name=None)`: When layout_name is PaperSpace, iterates layout block directly (bounding box overlap check). When ModelSpace, uses SelectionSet crossing window (mode 1) with ±15 unit expansion. Skips IFC_STAMP/DEFPOINTS/ASHADE layers and viewports.
+- `_ensure_colour_has_border(doc, ...)`: When `has_colour=True`, checks if existing COLOUR MText has an enclosing rectangle. If not, draws one at calculated stamp position on IFC_STAMP layer. Called from both IFCStampMixin and AsBuiltManager `_stamp_via_com_draw`.
+- **Failure mode if `_scan_has_colour` only searches active space**: PaperSpace COLOUR text missed → `has_colour=False` → duplicate COLOUR box drawn → stamp overlap (PLN-002, PLN-005)
 - Position INSIDE frame bottom-right, scaled proportionally from reference measurements
 - Cover sheet (page `00`): NO stamp
 - **Black border**: Both polyline and MText explicitly set `color = 7` (black). Layer color also set to 7.
@@ -105,6 +119,12 @@ for lname in layout_names:
 - `_build_ifc_filename()` strips `()` and `&` from description (in addition to `<>:"/\|?*`)
 - **Why**: AutoCAD `-PUBLISH` command parsing breaks on `()` and `&` in DWG filenames
 - Failure mode: PUBLISH fails silently → no PDF output
+
+### Conversion Success = PDF Created
+- `result['success']` in `convert_to_ifc`, `convert_to_ab`, `convert_multi_to_ab` MUST depend on `pdf_ok` (PDF actually exists on disk)
+- DWG-only conversion (SaveAs succeeded but PUBLISH failed) is NOT success — user needs the PDF
+- **Failure mode if success unconditional**: bot reports "转换=10, 失败=0" but 0 PDFs created → user thinks conversion worked, wastes time investigating missing files
+- Previously (before 2026-05-25 fix): `result['success'] = True` was set regardless of pdf_ok
 
 ### Incremental Check
 - NO mtime comparison (unreliable with Dropbox/cloud sync — Dropbox touches mtime on sync)
@@ -210,6 +230,22 @@ for lname in layout_names:
 - **Failure mode if rev col hardcoded**: `update_deliverable_ifc_status()` wrote integer revision (0) to date column (L) → Excel showed `0/01/00`
 - **Failure mode if deliverable gated by new_files**: All IFC files already transmitted → `new_files` empty → deliverable never updated → Excel shows stale IFR status for items already at IFC
 
+### AS BUILT Post-Conversion QA (MANDATORY)
+- `_qa_validate_ab_pdf()`: Auto-runs after every successful AB PDF export. Uses PyMuPDF (fitz) to check:
+  1. Page count matches expected (from title block count or page DWG count)
+  2. No duplicate stamps (COLOUR count > 1 per page)
+  3. No leftover IFC stamps ("FOR CONSTRUCTION" text)
+  4. No leftover IFR stamps ("ISSUED FOR REVIEW" text)
+  5. No phantom pages (different dimensions from majority — indicates Model tab export)
+  6. AS BUILT stamp present on every page
+- Results stored in `result['qa_warnings']`, logged inline, summarized in `batch_convert`
+- **Critical**: QA must detect ALL issues that were previously found manually. If QA passes, the output is production-ready.
+
+### PDF Layout Filtering (Phantom Page Prevention)
+- `_publish_single_pdf()` skips layouts with no plot configuration (`ConfigName` empty or 'None') — phantom layouts that gain entities after XREF bind but have no real content
+- This is IN ADDITION to the existing entity count check (`≤1 entity = empty`)
+- **Failure mode if not filtered**: XREF bind adds entities to previously-empty layouts → DSD includes them → PDF has extra blank Model-tab-sized pages (E-PLN-004: 2 pages instead of 1)
+
 ### Other
 - **Bot flow**: No interactive prompts. COM mode default (no COM/UTB selection menu)
 - **Imports**: `telegram_bot_v4.py` imports from `ifr_automation_v10` (not v7/v8/v9). Bot picks up fixes to VersionManager/IFCManager automatically without bot code changes.
@@ -263,17 +299,21 @@ for lname in layout_names:
 
 ## Projects
 - **Warnertown BESS** (SA):
-  - Title block: `ACE-Wanertown_Siyuan` (ModelSpace, 69 attrs, 6 revision rows)
+  - Title block: `ACE-Wanertown_Siyuan` (ModelSpace + PaperSpace, 69 attrs, 6 revision rows)
   - Tags: DRAWN/CHECK/ENGINEER/QA/PROJECT (plus SUBJECT, DRAWINGNUMBER per row)
-  - Reference frame: `ACE_Standard_Frame_wanertown_UPDATED.dwg` in `1. Native/`
+  - Reference frame: `ACE_Standard_Frame_wanertown_UPDATED by MG.dwg` in `1. Native/`
   - No built-in IFR stamp block (stamps are standalone entities per drawing)
   - Stamp geometry: proportional scaling from 841×594 reference (verified 2026-03-19, same as Tatua)
+  - AS BUILT: `AsBuiltManager` auto-detects paths. Native: `Design/Engineering/1. Drawings/1. Native`. AB output: `Design/Engineering/1. Drawings/5. As Built/3. As Built Client`. 13 doc-IDs detected, 11 existing AB Rev1.
+  - AS BUILT stamp verified on real DWG (BLD-001, 1689×1192.9 = 2× standard frame): CW=3.16, text=11.07 — proportional scaling works
   - `preserve_ifr=True`
-- **Tatua Solar Farm** (NZ):
+- **Tatua Solar Farm** (NZ, Coleambally):
   - Standard frame: `Coleamablly` (ModelSpace), tags: DESIGNED/DRAWN/APPROVED/PROJECT
   - Has built-in 'IFR' block with stamp text
   - Panel design: `ACE_TitleBlock_CHINT` (PaperSpace, 45 attrs), tags: DESIGNED/DRAWN/APPROVED/PROJECT, plus `SHEET_NO`, `TOTAL_SHEETS`, 4 revision rows
   - Reference frame: 841×594 (verified)
+  - Folder names: `☆` prefix + 2-digit doc-ID suffixes (e.g. `☆TSF-EN-CIL-DRG-01`)
+  - AS BUILT: `AsBuiltManager` auto-detects paths. Native: `1. Drawings/1. Native` (no `Design/Engineering/` prefix). AB output: `1. Drawings/6.AS Built`. 2 doc-IDs detected.
   - `preserve_ifr=True`
 - **LMS / NAWMA BESS** (SA):
   - Doc-ID prefix: `50023-`
@@ -283,7 +323,22 @@ for lname in layout_names:
   - Brownfield project (existing substation expansion) — higher complexity
   - Design Review Comment Register: `50023-Design Review Comments Register_Rev{X}.xlsx` in `3. IFR(Client)/`
   - RFI Register: `LMS NAWMA BESS Project RFI_{X}.xlsx` in `3. IFR(Client)/`
-  - Title block / IFC conversion: TBD (not yet configured for IFC automation)
+  - Title blocks: `Coleamablly` (43 attrs) and `Riverina_tellhow` (43 attrs) — both in `AsBuiltManager.LMS_TITLE_BLOCKS`
+  - Tags: DESIGNED/DRAWN/CHECK/APPROVED/PROJECT (same as Tatua)
+  - AS BUILT conversion: `AsBuiltManager` inherits `IFCStampMixin._stamp_via_com_draw` (841×594 ratio system) — same frame as FOR CONSTRUCTION, guaranteed alignment with COLOUR stamp.
+  - Multi-page verified: EL-001 (3 PaperSpace layouts 01/02/03, Riverina_tellhow TB) — all 3 sheets stamped + PDF exported (982 KB)
+- **Coleambally #2** (NSW):
+  - Doc-ID prefix: `NSW153-`
+  - Dropbox path: `Project (EPC)/1.NSW/Coleambally #2/Design/Engineering/`
+  - Title block: likely `Coleamablly` (same as Tatua/LMS)
+  - Tags: DESIGNED/DRAWN/CHECK/APPROVED/PROJECT
+  - IFC DWGs: flat in native folder with `_IFC` suffix and LETTER revisions (e.g. `_RevF_IFC.dwg`)
+  - AS BUILT: **subfolder mode** (standardized to match Warnertown). `3. As Built Client/` created 2026-05-29. DWG to `Rev.N - AB/` inside Native doc-ID folders, PDF to `5. As Built/3. As Built Client/`. XREF binding enabled.
+  - IFC conversions are pre-bot (2025-05) — stamps may be on non-standard layers, see [[pre-bot-ifc-awareness]]
+  - Native cleaned 2026-05-29: 69 .bak + 5 .dwl + 4 old IFC DWG + 2 Copy DWG moved/deleted
+  - VersionManager cleaned 2026-05-29: IFR_internal 5 + IFC(Client) 2 old revisions → SUPERSEDED/
+  - 25 IFC DWGs in Native, 10 existing AB PDFs in `3. As Built Client/`
+  - `preserve_ifr=True`
 
 ## Approved IFC Flow (`/panel_ifc` without args)
 - **Trigger**: `/panel_ifc` no args → project selection → approved mode. `/panel_ifc <folder>` → existing panel flow.
