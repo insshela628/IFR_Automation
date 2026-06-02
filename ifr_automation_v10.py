@@ -5083,21 +5083,37 @@ class IFCStampMixin:
         if colour_entity is None:
             return
 
+        # Fix 1: Move COLOUR MText to align with stamp position.
+        # Original DWG text may be at a different X (e.g. 32 pts off).
+        # Both text and border must share the same stamp_left/stamp_right.
+        colour_center_x = (stamp_left + stamp_right) / 2.0
+        colour_center_y = (colour_bottom + colour_top) / 2.0
         try:
-            mn, mx = colour_entity.GetBoundingBox()
-            cx_l, cx_b = float(mn[0]), float(mn[1])
-            cx_r, cx_t = float(mx[0]), float(mx[1])
+            new_ip = win32com.client.VARIANT(
+                pythoncom.VT_ARRAY | pythoncom.VT_R8,
+                [colour_center_x, colour_center_y, 0.0])
+            colour_entity.InsertionPoint = new_ip
+            colour_entity.Width = stamp_right - stamp_left
+            colour_entity.AttachmentPoint = 5  # MiddleCenter
         except Exception:
-            return
+            pass
 
-        # Search for and DELETE any existing enclosing polyline near COLOUR text,
-        # then always redraw at correct position/cw to match the main stamp box.
-        old_border = None
+        # Fix 2: Delete ALL old border polylines near the stamp zone (not just
+        # the first one). Search by stamp_left/right so we catch borders that
+        # were at the wrong position too (e.g. original at x=1926 when stamp is
+        # at x=1958). Use a generous ±50 pt tolerance.
+        _search_l = min(stamp_left, stamp_left - 50)
+        _search_r = max(stamp_right, stamp_right + 50)
+        _search_b = colour_bottom - 50
+        _search_t = colour_top + 50
+        _deleted_count = 0
+
         if layout_name and layout_name.lower() != 'model':
             try:
                 for layout in doc.Layouts:
                     if layout.Name == layout_name:
                         block = layout.Block
+                        _to_del = []
                         for i in range(block.Count):
                             try:
                                 e = block.Item(i)
@@ -5105,12 +5121,20 @@ class IFCStampMixin:
                                     emn, emx = e.GetBoundingBox()
                                     pl, pb = float(emn[0]), float(emn[1])
                                     pr, pt_ = float(emx[0]), float(emx[1])
-                                    if (pl <= cx_l + 5 and pr >= cx_r - 5 and
-                                            pb <= cx_b + 5 and pt_ >= cx_t - 5):
-                                        old_border = e
-                                        break
+                                    # Candidate if centre falls in stamp zone
+                                    ec_x = (pl + pr) / 2.0
+                                    ec_y = (pb + pt_) / 2.0
+                                    if (_search_l <= ec_x <= _search_r and
+                                            _search_b <= ec_y <= _search_t):
+                                        _to_del.append(e)
                             except Exception:
                                 continue
+                        for _e in reversed(_to_del):
+                            try:
+                                _e.Delete()
+                                _deleted_count += 1
+                            except Exception:
+                                pass
                         break
             except Exception:
                 pass
@@ -5120,34 +5144,30 @@ class IFCStampMixin:
                 ss2_name = f"_ColBChk_{int(time.time()*1000) % 1_000_000}"
                 ss2 = doc.SelectionSets.Add(ss2_name)
                 pt1 = win32com.client.VARIANT(_pycom.VT_ARRAY | _pycom.VT_R8,
-                    [cx_l - 20, cx_b - 20, 0.0])
+                    [_search_l, _search_b, 0.0])
                 pt2 = win32com.client.VARIANT(_pycom.VT_ARRAY | _pycom.VT_R8,
-                    [cx_r + 20, cx_t + 20, 0.0])
+                    [_search_r, _search_t, 0.0])
                 ss2.Select(1, pt1, pt2)
+                _to_del = []
                 for i in range(ss2.Count):
                     try:
                         e = ss2.Item(i)
                         if e.EntityName in ('AcDbPolyline', 'AcDbLwPolyline') and e.Closed:
-                            emn, emx = e.GetBoundingBox()
-                            pl, pb = float(emn[0]), float(emn[1])
-                            pr, pt_ = float(emx[0]), float(emx[1])
-                            if (pl <= cx_l + 5 and pr >= cx_r - 5 and
-                                    pb <= cx_b + 5 and pt_ >= cx_t - 5):
-                                old_border = e
-                                break
+                            _to_del.append(e)
                     except Exception:
                         continue
                 ss2.Delete()
+                for _e in reversed(_to_del):
+                    try:
+                        _e.Delete()
+                        _deleted_count += 1
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
-        if old_border is not None:
-            try:
-                old_border.Delete()
-            except Exception:
-                pass
-
-        # Draw border rectangle at correct stamp position with matching cw
+        # Fix 3: Always redraw border at stamp position with matching cw.
+        # This guarantees same X alignment and same thickness as AS BUILT box.
         try:
             colour_pts = win32com.client.VARIANT(
                 pythoncom.VT_ARRAY | pythoncom.VT_R8,
@@ -5160,8 +5180,7 @@ class IFCStampMixin:
             pline.Layer = self.STAMP_LAYER
             pline.color = 7
             pline.ConstantWidth = cw
-            action = "重画" if old_border is not None else "补画"
-            print(f"    印章: COLOUR 边框已{action} (cw={cw:.2f})")
+            print(f"    印章: COLOUR 边框已重绘 (cw={cw:.2f}, 清除旧框={_deleted_count})")
         except Exception as e:
             print(f"    印章: COLOUR 边框绘制失败 ({e})")
 
