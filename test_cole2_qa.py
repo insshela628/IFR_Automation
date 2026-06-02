@@ -23,7 +23,7 @@ _ALIGN_TOL    = 20     # left/right edge alignment tolerance in PDF points
 
 
 def _stamp_rects(page):
-    """Return large filled rects in the stamp zone using get_drawings()."""
+    """Return stamp-box rects in the stamp zone (filled OR thin-stroked)."""
     pw, ph = page.rect.width, page.rect.height
     out = []
     for p in page.get_drawings():
@@ -31,7 +31,8 @@ def _stamp_rects(page):
         if (r.x0 > pw * _RECT_ZONE_X and r.y0 > ph * _RECT_ZONE_Y
                 and r.width  > pw * _RECT_MIN_W
                 and r.height > ph * _RECT_MIN_H
-                and p.get("fill") is not None):
+                and r.width  < pw * 0.30
+                and r.height < ph * 0.10):
             out.append(r)
     return out
 

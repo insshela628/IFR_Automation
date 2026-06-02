@@ -9627,10 +9627,12 @@ class AsBuiltManager(IFCManager):
 
     STAMP_TEXT = "{\\fArial Narrow|b1;AS BUILT}"
 
-    # Use default thick border (0.5*scale) matching gold standard BLD-003/SLD-001.
-    # Thin (0.0) was tried but makes boxes invisible to get_drawings(fill=None)
-    # filter used by QA — defeats alignment verification. Reverted to None=default.
-    _STAMP_CW = None
+    # Thin/hairline borders (cw=0) for BOTH AS BUILT and COLOUR boxes so the two
+    # stamps have IDENTICAL line weight — user's explicit requirement (线框粗细统一).
+    # The old pre-bot stamp used cw=2.0 (thick); the bot redraws both boxes at cw=0
+    # so they match. QA rect detection accepts stroked (non-filled) rects so thin
+    # borders are still verified — see _qa_validate_ab_pdf / _run_post_batch_qa.
+    _STAMP_CW = 0.0
 
     LMS_TITLE_BLOCKS = {"Coleamablly", "Riverina_tellhow"}
 
@@ -11134,13 +11136,17 @@ class AsBuiltManager(IFCManager):
                 page = pdf_doc[pi]
                 pw, ph = page.rect.width, page.rect.height
                 try:
+                    # Accept both filled and stroked (thin-border) rects — AS BUILT
+                    # boxes use cw=0 (thin stroke), so fill is None. Match by
+                    # zone + size + rectangularity instead of requiring fill.
                     stamp_boxes = [
                         p['rect'] for p in page.get_drawings()
                         if p['rect'].x0 > pw * 0.60
                         and p['rect'].y0 > ph * 0.60
                         and p['rect'].width  > pw * 0.08
                         and p['rect'].height > ph * 0.02
-                        and p.get('fill') is not None
+                        and p['rect'].width  < pw * 0.30
+                        and p['rect'].height < ph * 0.10
                     ]
                     if len(stamp_boxes) >= 2:
                         lefts  = [r.x0 for r in stamp_boxes]
@@ -11368,13 +11374,14 @@ class AsBuiltManager(IFCManager):
                     # Missing AS BUILT
                     if not _re.search(r'AS\s*BUILT', text):
                         issues.append(f"p{pi+1}: 缺 AS BUILT")
-                    # RECT alignment
+                    # RECT alignment — accept thin stroked rects (cw=0), not just filled
                     rects = [p['rect'] for p in page.get_drawings()
                              if p['rect'].x0 > pw*_ZONE_X
                              and p['rect'].y0 > ph*_ZONE_Y
                              and p['rect'].width  > pw*_MIN_W
                              and p['rect'].height > ph*_MIN_H
-                             and p.get('fill') is not None]
+                             and p['rect'].width  < pw*0.30
+                             and p['rect'].height < ph*0.10]
                     if len(rects) >= 2:
                         lefts = [r.x0 for r in rects]
                         spread = max(lefts) - min(lefts)
