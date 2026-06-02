@@ -4497,6 +4497,10 @@ class IFCStampMixin:
     _REF_COLOUR_GAP = 2.0         # gap between FOR CONSTRUCTION and COLOUR boxes
     _REF_COLOUR_TEXT_H = 5.5      # smaller text height for 2-line COLOUR stamp
 
+    # Polyline border width override.  None → use 0.5*scale (thick, default for IFC stamps).
+    # Subclasses set to 0.0 for thin/hairline borders (e.g. AsBuiltManager).
+    _STAMP_CW: Optional[float] = None
+
     STAMP_LAYER = "IFC_STAMP"
     STAMP_TEXT = "{\\fArial Narrow|b1;FOR CONSTRUCTION}"
     COLOUR_TEXT = "{\\fArial Narrow|b1;DRAWINGS TO BE\\PPRINTED IN COLOUR}"
@@ -5403,7 +5407,8 @@ class IFCStampMixin:
             pline.Closed = True
             pline.Layer = self.STAMP_LAYER
             pline.color = 7  # Explicit black (ByLayer might inherit non-black)
-            pline.ConstantWidth = 0.5 * scale  # 加粗边框
+            _cw = self._STAMP_CW if self._STAMP_CW is not None else (0.5 * scale)
+            pline.ConstantWidth = _cw
 
             center_pt = win32com.client.VARIANT(
                 pythoncom.VT_ARRAY | pythoncom.VT_R8,
@@ -5427,7 +5432,7 @@ class IFCStampMixin:
             if has_colour:
                 self._ensure_colour_has_border(
                     doc, draw_space, stamp_left_x, stamp_right_x,
-                    colour_bottom_y, colour_top_y, 0.5 * scale,
+                    colour_bottom_y, colour_top_y, _cw,
                     layout_name=layout_name)
             elif self._check_colour_overlap(doc, stamp_left_x, stamp_right_x,
                                              colour_bottom_y, colour_top_y,
@@ -5448,7 +5453,7 @@ class IFCStampMixin:
                 pline2.Closed = True
                 pline2.Layer = self.STAMP_LAYER
                 pline2.color = 7
-                pline2.ConstantWidth = 0.5 * scale
+                pline2.ConstantWidth = _cw  # same width as AS BUILT box
 
                 colour_center_x = (stamp_left_x + stamp_right_x) / 2.0
                 colour_center_y = (colour_bottom_y + colour_top_y) / 2.0
@@ -9587,6 +9592,10 @@ class AsBuiltManager(IFCManager):
 
     STAMP_TEXT = "{\\fArial Narrow|b1;AS BUILT}"
 
+    # Thin/hairline borders for AS BUILT stamps so both AS BUILT and COLOUR boxes
+    # are visually consistent regardless of the pre-bot COLOUR stamp thickness.
+    _STAMP_CW = 0.0
+
     LMS_TITLE_BLOCKS = {"Coleamablly", "Riverina_tellhow"}
 
     PERSONNEL_TAGS = ['DESIGNED', 'DRAWN', 'CHECK', 'APPROVED',
@@ -10319,15 +10328,24 @@ class AsBuiltManager(IFCManager):
                 return result
             print(f"    Found {len(all_tbs)} title block(s)")
 
-            # Read personnel from latest revision row
+            # Read personnel from latest revision row, fall back to root TB attrs
             personnel = {}
+            _root_attrs = all_tbs[0][1] if all_tbs else {}
             for _tb_item in all_tbs:
                 _attrs = _tb_item[1]
                 personnel = self._read_latest_ifr_row(_attrs)
                 if personnel:
+                    _root_attrs = _attrs
                     break
-            if not personnel:
-                personnel = {}
+            # If revision-row personnel fields are empty, read from root-level
+            # title block attributes (e.g. DESIGNED, DRAWN — not row-prefixed).
+            # Pre-bot IFC DWGs often leave revision row personnel empty.
+            if not any(v for v in personnel.values() if isinstance(v, str) and v):
+                for tag in self.PERSONNEL_TAGS:
+                    if tag in _root_attrs and not personnel.get(tag.lower()):
+                        val = self._safe_get_text(_root_attrs[tag]).strip()
+                        if val:
+                            personnel[tag.lower()] = val
 
             # Fix known typos
             self._fix_known_typos(doc)
