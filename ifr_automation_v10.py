@@ -11279,6 +11279,76 @@ class AsBuiltManager(IFCManager):
         if qa_issues:
             print(f"  ⚠ QA 警告: {qa_issues} 个文件有质量问题，请检查日志")
 
+        # Post-batch self-check: scan ALL PDFs in output dir for stamp issues
+        if not self.dry_run and ok > 0:
+            print(f"\n  [POST-QA] 对 {self.ab_output.name}/ 做批量自检...")
+            batch_qa = self._run_post_batch_qa()
+            if batch_qa:
+                fail_count = sum(1 for v in batch_qa.values() if v)
+                print(f"  [POST-QA] {len(batch_qa)} 个 PDF 扫描完毕 — "
+                      f"{fail_count} 个有问题, {len(batch_qa)-fail_count} 个通过")
+                for fname, issues in batch_qa.items():
+                    if issues:
+                        print(f"    ✗ {fname}: {'; '.join(issues[:3])}")
+            for r in results:
+                if r.get('success') and r.get('pdf_path'):
+                    pname = Path(r['pdf_path']).name
+                    r['post_qa'] = batch_qa.get(pname, [])
+
+        return results
+
+    def _run_post_batch_qa(self) -> Dict[str, List[str]]:
+        """Scan all PDFs in ab_output for stamp issues. Returns {filename: [issues]}."""
+        try:
+            import fitz as _fitz
+            import re as _re
+        except ImportError:
+            return {}
+
+        results: Dict[str, List[str]] = {}
+        ab_dir = self.ab_output
+        if not ab_dir.exists():
+            return results
+
+        _ZONE_X, _ZONE_Y = 0.60, 0.60
+        _MIN_W, _MIN_H    = 0.08, 0.02
+        _ALIGN_TOL        = 20.0
+
+        for pdf_path in sorted(ab_dir.glob("*.pdf")):
+            issues: List[str] = []
+            try:
+                doc = _fitz.open(str(pdf_path))
+                for pi in range(doc.page_count):
+                    page = doc[pi]
+                    pw, ph = page.rect.width, page.rect.height
+                    text = page.get_text().upper()
+
+                    # FOR CONSTRUCTION leftover
+                    if _re.search(r'FOR\s+CONSTRUCTION', text):
+                        issues.append(f"p{pi+1}: FOR CONSTRUCTION 残留")
+                    # Duplicate AS BUILT
+                    if len(_re.findall(r'AS\s*BUILT', text)) > 1:
+                        issues.append(f"p{pi+1}: AS BUILT 重复")
+                    # Missing AS BUILT
+                    if not _re.search(r'AS\s*BUILT', text):
+                        issues.append(f"p{pi+1}: 缺 AS BUILT")
+                    # RECT alignment
+                    rects = [p['rect'] for p in page.get_drawings()
+                             if p['rect'].x0 > pw*_ZONE_X
+                             and p['rect'].y0 > ph*_ZONE_Y
+                             and p['rect'].width  > pw*_MIN_W
+                             and p['rect'].height > ph*_MIN_H
+                             and p.get('fill') is not None]
+                    if len(rects) >= 2:
+                        lefts = [r.x0 for r in rects]
+                        spread = max(lefts) - min(lefts)
+                        if spread > _ALIGN_TOL:
+                            issues.append(f"p{pi+1}: 印章框未对齐({spread:.0f}pt)")
+                doc.close()
+            except Exception as e:
+                issues.append(f"扫描异常: {e}")
+            results[pdf_path.name] = issues
+
         return results
 
 
