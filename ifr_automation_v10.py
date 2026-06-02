@@ -4493,7 +4493,7 @@ class IFCStampMixin:
     _TB_REF_OVERRIDES: dict = {}
 
     # COLOUR stamp box (above FOR CONSTRUCTION): same width, taller for 2-line text
-    _REF_COLOUR_RECT_H = 26.0     # 2-line text (h=5.5 x 2 + line spacing + padding)
+    _REF_COLOUR_RECT_H = 29.0     # calibrated to gold std PLN-005: COL/AB ratio=1.63 (was 26→72pt, now 29→81pt)
     _REF_COLOUR_GAP = 2.0         # gap between FOR CONSTRUCTION and COLOUR boxes
     _REF_COLOUR_TEXT_H = 5.5      # smaller text height for 2-line COLOUR stamp
 
