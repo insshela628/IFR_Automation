@@ -5865,15 +5865,21 @@ class IFCManager(IFCStampMixin):
         try:
             attr.TextString = value
             return
-        except Exception:
-            pass
+        except Exception as _e1:
+            # "No database" = AutoCAD has no active drawing; retrying won't help
+            # and would block for ~20s per attribute (5 retries × sleeps).
+            if 'no database' in str(_e1).lower():
+                logging.warning(f"_safe_set_text: No database — skip retry")
+                return
         try:
             # Re-wrap with Dispatch in case COM proxy lost type info
             attr2 = win32com.client.Dispatch(attr)
             attr2.TextString = value
             return
-        except Exception:
-            pass
+        except Exception as _e2:
+            if 'no database' in str(_e2).lower():
+                logging.warning(f"_safe_set_text: No database — skip retry")
+                return
         try:
             self._com_retry(lambda: setattr(attr, 'TextString', value))
         except Exception as e:
