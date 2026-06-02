@@ -5102,15 +5102,28 @@ class IFCStampMixin:
         except Exception:
             pass
 
-        # Fix 2: Delete ALL old border polylines near the stamp zone (not just
-        # the first one). Search by stamp_left/right so we catch borders that
-        # were at the wrong position too (e.g. original at x=1926 when stamp is
-        # at x=1958). Use a generous ±50 pt tolerance.
-        _search_l = min(stamp_left, stamp_left - 50)
-        _search_r = max(stamp_right, stamp_right + 50)
-        _search_b = colour_bottom - 50
-        _search_t = colour_top + 50
+        # Fix 2: Delete ALL old border entities in the COLOUR stamp zone.
+        # Uses a wide search zone covering both COLOUR and AS BUILT areas.
+        # Handles multiple entity types: pre-bot stamps may use AcDb2dPolyline,
+        # AcDbSolid, or AcDbLwPolyline — all are matched.
+        _COLOUR_ENTITY_TYPES = frozenset((
+            'AcDbPolyline', 'AcDbLwPolyline', 'AcDb2dPolyline',
+            'AcDbSolid', 'AcDbTrace',
+        ))
+        # Wide zone: 200 units beyond stamp edges on each side, span entire
+        # COLOUR+AS BUILT height range so misplaced pre-bot borders are caught.
+        _margin = 200.0
+        _search_l = stamp_left  - _margin
+        _search_r = stamp_right + _margin
+        _search_b = stamp_bottom_y - _margin   # below AS BUILT box
+        _search_t = colour_top   + _margin     # above COLOUR box
         _deleted_count = 0
+
+        def _in_zone(bbox_min, bbox_max):
+            """Return True if entity centre falls in the wide search zone."""
+            cx = (float(bbox_min[0]) + float(bbox_max[0])) / 2.0
+            cy = (float(bbox_min[1]) + float(bbox_max[1])) / 2.0
+            return (_search_l <= cx <= _search_r and _search_b <= cy <= _search_t)
 
         if layout_name and layout_name.lower() != 'model':
             try:
@@ -5121,16 +5134,11 @@ class IFCStampMixin:
                         for i in range(block.Count):
                             try:
                                 e = block.Item(i)
-                                if e.EntityName in ('AcDbPolyline', 'AcDbLwPolyline') and e.Closed:
-                                    emn, emx = e.GetBoundingBox()
-                                    pl, pb = float(emn[0]), float(emn[1])
-                                    pr, pt_ = float(emx[0]), float(emx[1])
-                                    # Candidate if centre falls in stamp zone
-                                    ec_x = (pl + pr) / 2.0
-                                    ec_y = (pb + pt_) / 2.0
-                                    if (_search_l <= ec_x <= _search_r and
-                                            _search_b <= ec_y <= _search_t):
-                                        _to_del.append(e)
+                                if e.EntityName not in _COLOUR_ENTITY_TYPES:
+                                    continue
+                                emn, emx = e.GetBoundingBox()
+                                if _in_zone(emn, emx):
+                                    _to_del.append(e)
                             except Exception:
                                 continue
                         for _e in reversed(_to_del):
@@ -5143,30 +5151,28 @@ class IFCStampMixin:
             except Exception:
                 pass
         else:
-            import pythoncom as _pycom
+            # ModelSpace: iterate directly (SelectionSet crossing may miss Z≠0 entities)
             try:
-                ss2_name = f"_ColBChk_{int(time.time()*1000) % 1_000_000}"
-                ss2 = doc.SelectionSets.Add(ss2_name)
-                pt1 = win32com.client.VARIANT(_pycom.VT_ARRAY | _pycom.VT_R8,
-                    [_search_l, _search_b, 0.0])
-                pt2 = win32com.client.VARIANT(_pycom.VT_ARRAY | _pycom.VT_R8,
-                    [_search_r, _search_t, 0.0])
-                ss2.Select(1, pt1, pt2)
+                ms = doc.ModelSpace
                 _to_del = []
-                for i in range(ss2.Count):
+                for i in range(ms.Count):
                     try:
-                        e = ss2.Item(i)
-                        if e.EntityName in ('AcDbPolyline', 'AcDbLwPolyline') and e.Closed:
+                        e = ms.Item(i)
+                        if e.EntityName not in _COLOUR_ENTITY_TYPES:
+                            continue
+                        emn, emx = e.GetBoundingBox()
+                        if _in_zone(emn, emx):
                             _to_del.append(e)
                     except Exception:
                         continue
-                ss2.Delete()
                 for _e in reversed(_to_del):
                     try:
                         _e.Delete()
                         _deleted_count += 1
                     except Exception:
                         pass
+            except Exception:
+                pass
             except Exception:
                 pass
 
