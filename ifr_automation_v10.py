@@ -5102,30 +5102,47 @@ class IFCStampMixin:
         except Exception:
             pass
 
-        # Fix 2: Delete ALL old border entities in the COLOUR stamp zone.
-        # Uses a wide search zone covering both COLOUR and AS BUILT areas.
-        # Handles multiple entity types: pre-bot stamps may use AcDb2dPolyline,
-        # AcDbSolid, or AcDbLwPolyline — all are matched.
+        # Fix 2: Delete old border entities in the COLOUR+AS BUILT stamp zone.
+        # Pre-bot stamps may use AcDb2dPolyline, AcDbSolid, etc. — handle all.
+        # Use SelectionSet crossing window (safe for 400K+ entity DWGs — uses
+        # spatial index, NOT full iteration). Filter entity type in Python.
+        # Unlock layer before delete in case entity is on a locked layer.
         _COLOUR_ENTITY_TYPES = frozenset((
             'AcDbPolyline', 'AcDbLwPolyline', 'AcDb2dPolyline',
             'AcDbSolid', 'AcDbTrace',
         ))
-        # Wide zone: 200 units beyond stamp edges on each side, span entire
-        # COLOUR+AS BUILT height range so misplaced pre-bot borders are caught.
-        _margin = 200.0
-        _search_l = stamp_left  - _margin
-        _search_r = stamp_right + _margin
-        _search_b = stamp_bottom_y - _margin   # below AS BUILT box
-        _search_t = colour_top   + _margin     # above COLOUR box
+        # ±300 DWG units covers any pre-bot border regardless of position offset
+        _margin = 300.0
+        _search_l = stamp_left   - _margin
+        _search_r = stamp_right  + _margin
+        _search_b = colour_bottom - _margin   # spans COLOUR zone and below
+        _search_t = colour_top   + _margin
         _deleted_count = 0
 
-        def _in_zone(bbox_min, bbox_max):
-            """Return True if entity centre falls in the wide search zone."""
-            cx = (float(bbox_min[0]) + float(bbox_max[0])) / 2.0
-            cy = (float(bbox_min[1]) + float(bbox_max[1])) / 2.0
-            return (_search_l <= cx <= _search_r and _search_b <= cy <= _search_t)
+        def _delete_entity_safe(e):
+            """Unlock layer if needed, then delete."""
+            try:
+                lyr = doc.Layers.Item(e.Layer)
+                was_locked = lyr.Lock
+                if was_locked:
+                    lyr.Lock = False
+            except Exception:
+                was_locked = False
+                lyr = None
+            try:
+                e.Delete()
+                return True
+            except Exception:
+                return False
+            finally:
+                if lyr and was_locked:
+                    try:
+                        lyr.Lock = True
+                    except Exception:
+                        pass
 
         if layout_name and layout_name.lower() != 'model':
+            # PaperSpace: iterate layout block directly (small, safe)
             try:
                 for layout in doc.Layouts:
                     if layout.Name == layout_name:
@@ -5137,42 +5154,45 @@ class IFCStampMixin:
                                 if e.EntityName not in _COLOUR_ENTITY_TYPES:
                                     continue
                                 emn, emx = e.GetBoundingBox()
-                                if _in_zone(emn, emx):
+                                cx = (float(emn[0]) + float(emx[0])) / 2
+                                cy = (float(emn[1]) + float(emx[1])) / 2
+                                if (_search_l <= cx <= _search_r and
+                                        _search_b <= cy <= _search_t):
                                     _to_del.append(e)
                             except Exception:
                                 continue
                         for _e in reversed(_to_del):
-                            try:
-                                _e.Delete()
+                            if _delete_entity_safe(_e):
                                 _deleted_count += 1
-                            except Exception:
-                                pass
                         break
             except Exception:
                 pass
         else:
-            # ModelSpace: iterate directly (SelectionSet crossing may miss Z≠0 entities)
+            # ModelSpace: use SelectionSet crossing window (spatial index — safe for
+            # large DWGs). No entity type filter on SS itself; filter type in Python.
+            import pythoncom as _pycom
             try:
-                ms = doc.ModelSpace
+                ss2_name = f"_ColBChk_{int(time.time()*1000) % 1_000_000}"
+                ss2 = doc.SelectionSets.Add(ss2_name)
+                pt1 = win32com.client.VARIANT(
+                    _pycom.VT_ARRAY | _pycom.VT_R8,
+                    [_search_l, _search_b, 0.0])
+                pt2 = win32com.client.VARIANT(
+                    _pycom.VT_ARRAY | _pycom.VT_R8,
+                    [_search_r, _search_t, 0.0])
+                ss2.Select(1, pt1, pt2)   # crossing window, all entity types
                 _to_del = []
-                for i in range(ms.Count):
+                for i in range(ss2.Count):
                     try:
-                        e = ms.Item(i)
-                        if e.EntityName not in _COLOUR_ENTITY_TYPES:
-                            continue
-                        emn, emx = e.GetBoundingBox()
-                        if _in_zone(emn, emx):
+                        e = ss2.Item(i)
+                        if e.EntityName in _COLOUR_ENTITY_TYPES:
                             _to_del.append(e)
                     except Exception:
                         continue
+                ss2.Delete()
                 for _e in reversed(_to_del):
-                    try:
-                        _e.Delete()
+                    if _delete_entity_safe(_e):
                         _deleted_count += 1
-                    except Exception:
-                        pass
-            except Exception:
-                pass
             except Exception:
                 pass
 
