@@ -5454,27 +5454,25 @@ class IFCStampMixin:
             colour_bottom_y = stamp_top_y + colour_gap
             colour_top_y = colour_bottom_y + colour_rect_h
 
-            # COLOUR stamp strategy (lesson learned: never fix-in-place):
-            # When has_colour=True, the pre-bot IFC already has a COLOUR stamp.
-            # Rather than trying to reposition the old border (unreliable — entity
-            # type may differ, layer may be locked, position may be off), we:
-            #   1. Delete old COLOUR MText + border via _ensure_colour_has_border
-            #      (which now uses broad SelectionSet + layer unlock)
-            #   2. Force _draw_colour=True so we always redraw fresh at the
-            #      calculated position — guarantees alignment with AS BUILT box.
+            # COLOUR stamp strategy (lesson learned from 10+ misalignment failures):
+            # Step 1 ALWAYS: clear stale COLOUR borders from the zone BEFORE any
+            #   overlap check — old borders cause false "overlap detected → skip"
+            #   even when _scan_has_colour=False (MText removed but border survived).
+            # Step 2: if COLOUR MText existed (has_colour), move it to correct pos.
+            # Step 3: draw fresh COLOUR box unless genuine drawing content overlaps.
+            self._ensure_colour_has_border(
+                doc, draw_space, stamp_left_x, stamp_right_x,
+                colour_bottom_y, colour_top_y, _cw,
+                layout_name=layout_name)
+
             _draw_colour = False
             if has_colour:
-                # Delete old COLOUR entities (MText + border) then redraw fresh
-                self._ensure_colour_has_border(
-                    doc, draw_space, stamp_left_x, stamp_right_x,
-                    colour_bottom_y, colour_top_y, _cw,
-                    layout_name=layout_name)
-                _draw_colour = True   # always redraw — guaranteed alignment
+                _draw_colour = True   # MText existed → always redraw aligned
                 print(f"    印章: COLOUR 原DWG有 → 清除旧border，重绘对齐")
             elif self._check_colour_overlap(doc, stamp_left_x, stamp_right_x,
                                              colour_bottom_y, colour_top_y,
                                              layout_name=layout_name):
-                print(f"    印章: COLOUR 区域有重叠实体，跳过")
+                print(f"    印章: COLOUR 区域有真实重叠实体，跳过")
             else:
                 _draw_colour = True
 
