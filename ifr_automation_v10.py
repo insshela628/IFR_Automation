@@ -5454,12 +5454,23 @@ class IFCStampMixin:
             colour_bottom_y = stamp_top_y + colour_gap
             colour_top_y = colour_bottom_y + colour_rect_h
 
+            # COLOUR stamp strategy (lesson learned: never fix-in-place):
+            # When has_colour=True, the pre-bot IFC already has a COLOUR stamp.
+            # Rather than trying to reposition the old border (unreliable — entity
+            # type may differ, layer may be locked, position may be off), we:
+            #   1. Delete old COLOUR MText + border via _ensure_colour_has_border
+            #      (which now uses broad SelectionSet + layer unlock)
+            #   2. Force _draw_colour=True so we always redraw fresh at the
+            #      calculated position — guarantees alignment with AS BUILT box.
             _draw_colour = False
             if has_colour:
+                # Delete old COLOUR entities (MText + border) then redraw fresh
                 self._ensure_colour_has_border(
                     doc, draw_space, stamp_left_x, stamp_right_x,
                     colour_bottom_y, colour_top_y, _cw,
                     layout_name=layout_name)
+                _draw_colour = True   # always redraw — guaranteed alignment
+                print(f"    印章: COLOUR 原DWG有 → 清除旧border，重绘对齐")
             elif self._check_colour_overlap(doc, stamp_left_x, stamp_right_x,
                                              colour_bottom_y, colour_top_y,
                                              layout_name=layout_name):
