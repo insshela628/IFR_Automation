@@ -9629,9 +9629,10 @@ class AsBuiltManager(IFCManager):
 
     STAMP_TEXT = "{\\fArial Narrow|b1;AS BUILT}"
 
-    # Thin/hairline borders for AS BUILT stamps so both AS BUILT and COLOUR boxes
-    # are visually consistent regardless of the pre-bot COLOUR stamp thickness.
-    _STAMP_CW = 0.0
+    # Use default thick border (0.5*scale) matching gold standard BLD-003/SLD-001.
+    # Thin (0.0) was tried but makes boxes invisible to get_drawings(fill=None)
+    # filter used by QA — defeats alignment verification. Reverted to None=default.
+    _STAMP_CW = None
 
     LMS_TITLE_BLOCKS = {"Coleamablly", "Riverina_tellhow"}
 
