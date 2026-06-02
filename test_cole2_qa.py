@@ -14,6 +14,27 @@ CLIENT_DIR = AB_ROOT / "3. As Built Client"
 STAMP_PHRASES = ["AS BUILT", "FOR CONSTRUCTION", "PRINTED IN COLOUR",
                  "PRINTED IN COLOR", "DRAWINGS TO BE", "FOR REVIEW"]
 
+# Stamp box detection via get_drawings() (gold standard: BLD-003, SLD-001)
+_RECT_ZONE_X  = 0.60   # stamp rects start at x > 60% of page
+_RECT_ZONE_Y  = 0.60   # stamp rects start at y > 60% of page
+_RECT_MIN_W   = 0.08   # min width = 8% of page width (~190pt on A1)
+_RECT_MIN_H   = 0.02   # min height = 2% of page height (~34pt on A1)
+_ALIGN_TOL    = 20     # left/right edge alignment tolerance in PDF points
+
+
+def _stamp_rects(page):
+    """Return large filled rects in the stamp zone using get_drawings()."""
+    pw, ph = page.rect.width, page.rect.height
+    out = []
+    for p in page.get_drawings():
+        r = p["rect"]
+        if (r.x0 > pw * _RECT_ZONE_X and r.y0 > ph * _RECT_ZONE_Y
+                and r.width  > pw * _RECT_MIN_W
+                and r.height > ph * _RECT_MIN_H
+                and p.get("fill") is not None):
+            out.append(r)
+    return out
+
 
 def analyze_pdf(pdf_path):
     """Analyze a single PDF for stamp issues."""
@@ -63,19 +84,38 @@ def analyze_pdf(pdf_path):
     if colour and colour["count"] > 1:
         result["issues"].append(f"DUPLICATE: COLOUR stamp x{colour['count']}")
 
-    # Check stamp size consistency (AS BUILT vs COLOUR box width)
-    if as_built and colour:
-        ab_locs = as_built["locations"]
-        cl_locs = colour["locations"]
-        if ab_locs and cl_locs:
-            ab_w = float(ab_locs[0][2].split("x")[0])
-            cl_w = float(cl_locs[0][2].split("x")[0])
-            if ab_w > 0 and cl_w > 0:
-                ratio = ab_w / cl_w
-                if ratio < 0.7 or ratio > 1.3:
+    # Position check: AS BUILT stamp must be in bottom-right quadrant (x>50%, y>50%)
+    if as_built:
+        for page_idx, page in enumerate(doc):
+            pw, ph = page.rect.width, page.rect.height
+            words = page.get_text("words")
+            ab_words = [w for w in words if "BUILT" in w[4].upper()]
+            for w in ab_words:
+                cx = (w[0] + w[2]) / 2
+                cy = (w[1] + w[3]) / 2
+                if cx < pw * 0.5 or cy < ph * 0.5:
                     result["issues"].append(
-                        f"SIZE MISMATCH: AS BUILT width={ab_w:.0f} vs COLOUR width={cl_w:.0f} "
-                        f"(ratio={ratio:.2f}, expected ~1.0)")
+                        f"POSITION: Page {page_idx+1} AS BUILT not in bottom-right "
+                        f"(x={cx/pw:.0%}, y={cy/ph:.0%})")
+
+    # RECT alignment check: COLOUR and AS BUILT boxes must share same left edge (±20pt)
+    # Uses get_drawings() to find actual stamp rectangle borders (not text bounding boxes).
+    for page_idx, page in enumerate(doc):
+        rects = _stamp_rects(page)
+        if len(rects) >= 2:
+            rects_sorted = sorted(rects, key=lambda r: r.y0)  # top to bottom
+            lefts  = [r.x0 for r in rects_sorted]
+            rights = [r.x0 + r.width for r in rects_sorted]
+            l_spread = max(lefts)  - min(lefts)
+            r_spread = max(rights) - min(rights)
+            if l_spread > _ALIGN_TOL or r_spread > _ALIGN_TOL:
+                result["issues"].append(
+                    f"MISALIGN: Page {page_idx+1} stamp boxes not aligned "
+                    f"(left spread={l_spread:.0f}pt, right spread={r_spread:.0f}pt, "
+                    f"tol={_ALIGN_TOL}pt)")
+        elif len(rects) == 1:
+            # Only one stamp box visible — likely has_colour=True but COLOUR is thin/missing
+            pass  # not an error; AS BUILT box exists
 
     doc.close()
     return result

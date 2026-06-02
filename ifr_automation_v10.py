@@ -11073,6 +11073,33 @@ class AsBuiltManager(IFCManager):
                             f'vs 多数页 {majority_dim[0]}x{majority_dim[1]}) '
                             f'— 可能是 Model tab [需人工检查]')
 
+            # Stamp box alignment: COLOUR and AS BUILT rects must share same left edge
+            # Uses get_drawings() to detect large filled rects in the stamp zone.
+            # Misalignment is retryable — current code (4e010d2) should produce aligned output.
+            for pi in range(page_count):
+                page = pdf_doc[pi]
+                pw, ph = page.rect.width, page.rect.height
+                try:
+                    stamp_boxes = [
+                        p['rect'] for p in page.get_drawings()
+                        if p['rect'].x0 > pw * 0.60
+                        and p['rect'].y0 > ph * 0.60
+                        and p['rect'].width  > pw * 0.08
+                        and p['rect'].height > ph * 0.02
+                        and p.get('fill') is not None
+                    ]
+                    if len(stamp_boxes) >= 2:
+                        lefts  = [r.x0 for r in stamp_boxes]
+                        rights = [r.x0 + r.width for r in stamp_boxes]
+                        l_spread = max(lefts)  - min(lefts)
+                        r_spread = max(rights) - min(rights)
+                        if l_spread > 20 or r_spread > 20:
+                            warnings.append(
+                                f'Page {pi+1}: 印章框未对齐 '
+                                f'(左边差={l_spread:.0f}pt, 右边差={r_spread:.0f}pt)')
+                except Exception:
+                    pass
+
             pdf_doc.close()
         except Exception as e:
             warnings.append(f'QA 扫描异常: {e}')
@@ -11156,14 +11183,16 @@ class AsBuiltManager(IFCManager):
     # ── Batch conversion ─────────────────────────────────────────────────
 
     def batch_convert(self, doc_ids: Optional[List[str]] = None,
-                      force_doc_ids: Optional[set] = None) -> List[Dict]:
+                      force_doc_ids: Optional[set] = None,
+                      force_rev_1: bool = False) -> List[Dict]:
         """Convert IFC DWGs to AS BUILT.
 
         Args:
             doc_ids: If provided, only convert these doc-IDs.
             force_doc_ids: Force re-conversion even if AB PDF exists.
-
-        Returns list of result dicts.
+            force_rev_1: If True, always output REV 1 (overwrite existing).
+                Used during QA iteration before the user approves final output.
+                Bypasses incremental check for all files and resets existing_ab_rev to None.
         """
         mode_label = "同目录" if self._save_in_source_dir else "子文件夹"
         print(f"  AS BUILT 模式: {mode_label} | Native: {self._detected_native} | "
@@ -11174,6 +11203,13 @@ class AsBuiltManager(IFCManager):
             doc_id_set = {d.upper() for d in doc_ids}
             scan = [s for s in scan if s['doc_id'].upper() in doc_id_set]
         force_set = {d.upper() for d in (force_doc_ids or set())}
+
+        if force_rev_1:
+            # Override all to REV 1 and bypass incremental check for all items
+            for item in scan:
+                item['existing_ab_rev'] = None
+            force_set = {item['doc_id'].upper() for item in scan}
+            print("  [force_rev_1] 全部锁定 REV 1，已有 PDF 将被覆盖")
 
         if not scan:
             print("  没有找到需要转换的 IFC 文件")
