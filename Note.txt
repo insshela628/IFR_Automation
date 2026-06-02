@@ -2,17 +2,20 @@
 2.改一版V5
 
 ————————————————————————————————————02/06/26
-TODO: 两个 AS BUILT 转换失败待查
+✅ 两个 AS BUILT 转换失败均已修复并验证 (02/06/26)
 
-[FAIL-1] GG31-C-PLN-002 — Open.Close 异常 ✅ FIXED (commit 1c6f67a)
-  Root cause: doc.Close(False) 未 guard，SaveAs 到 temp path 后 AutoCAD
-  还在 flush，COM 抛 Open.Close → 整个转换失败，PUBLISH 从未跑到
-  Fix: convert_to_ab/multi/ifc 里 4 处 Close 全加 try/except，Close 失败
-       仅 warning log，不中断后续 PUBLISH 流程
-  待验证: python test_ab_issue_fixes.py (force PLN-002) 重跑确认 PDF 生成
+[FAIL-1] GG31-C-PLN-002 — Open.Close 异常 ✅ FIXED + VERIFIED (commit 1c6f67a)
+  Root cause: doc.Close(False) 未 guard，SaveAs 到 temp path (262 chars) 后
+  AutoCAD 还在 flush，COM 抛 Open.Close → 整个转换失败，PUBLISH 未跑
+  Fix: convert_to_ab/multi/ifc 里所有 doc.Close 加 try/except，失败仅 warning
+  Verified: force reconvert OK=1 fail=0，PDF 生成 ✅
 
-[FAIL-2] GG31-E-PLN-004 — AutoCAD server exception (-2147417851)
-  XREF 绑定成功（1 个外部引用已绑定）后，下一步 COM 调用触发
+[FAIL-2] GG31-E-PLN-004 — XREF bind 后 RPC_E_SERVERFAULT ✅ FIXED + VERIFIED (commit 154e20a)
+  Root cause: XREF bind 后 time.sleep(2) 在 try 内，不够长且可能被跳过；
+  AutoCAD 内部还在处理时 SaveAs 触发 RPC_E_SERVERFAULT (-2147417851)
+  Fix: 3 个转换方法的 XREF bind 后 sleep 移到 try 外，2s → 8s；
+       convert_to_ab 补 Strategy 4（就地 Save + PUBLISH 兜底）
+  Verified: force reconvert OK=1 fail=0，PDF 生成 ✅
   "The server threw an exception" → RPC_E_SERVERFAULT
   复现: python test_ab_issue_fixes.py (force PLN-004)
   方向: 检查 XREF bind 后哪个 COM 调用最先接触；
