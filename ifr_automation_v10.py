@@ -11019,6 +11019,23 @@ class AsBuiltManager(IFCManager):
                     warnings.append(
                         f'Page {pi+1}: 缺少 AS BUILT 印章')
 
+                # Stamp position — must be in bottom-right quadrant (>50% x, >50% y)
+                # Use fitz word extraction for bounding box of "AS BUILT" text
+                try:
+                    words = page.get_text("words")
+                    ab_boxes = [w for w in words if 'BUILT' in w[4].upper()]
+                    for wb in ab_boxes:
+                        wx_centre = (wb[0] + wb[2]) / 2
+                        wy_centre = (wb[1] + wb[3]) / 2
+                        if wx_centre < pw * 0.5 or wy_centre < ph * 0.5:
+                            warnings.append(
+                                f'Page {pi+1}: 印章位置异常 — 不在底右区域 '
+                                f'({wx_centre/pw:.0%} x, {wy_centre/ph:.0%} y) '
+                                f'[需人工检查]')
+                            break
+                except Exception:
+                    pass
+
             # Phantom page detection (different dimensions from majority)
             if page_count > 1:
                 from collections import Counter
@@ -11029,13 +11046,87 @@ class AsBuiltManager(IFCManager):
                         warnings.append(
                             f'Page {pi+1}: 尺寸异常 ({dims[0]}x{dims[1]} '
                             f'vs 多数页 {majority_dim[0]}x{majority_dim[1]}) '
-                            f'— 可能是 Model tab')
+                            f'— 可能是 Model tab [需人工检查]')
 
             pdf_doc.close()
         except Exception as e:
             warnings.append(f'QA 扫描异常: {e}')
 
         return warnings
+
+    # ── QA retry wrapper ─────────────────────────────────────────────────
+
+    # Warnings containing these substrings → escalate to user immediately (no retry)
+    _QA_ESCALATE_KEYWORDS = ('印章位置异常', '尺寸异常', '页数不匹配', '需人工检查')
+
+    def _convert_with_qa_retry(self, dwg_info: Dict,
+                                max_retries: int = 3) -> Dict:
+        """Convert a single DWG with QA check and auto-retry closed loop.
+
+        Retry policy:
+          - Auto-retryable: stamp missing, FOR CONSTRUCTION残留, IFR残留, duplicate stamp
+          - Escalate immediately: position anomaly, page count mismatch, dimension anomaly
+          - Max 3 attempts; only correct output reaches the caller.
+        """
+        doc_id = dwg_info['doc_id']
+        ifc_source = dwg_info['ifc_source']
+        is_multi = ifc_source['is_multi_page']
+        expected_pages = len(ifc_source['dwg_paths']) if not is_multi else None
+
+        for attempt in range(1, max_retries + 1):
+            # Convert
+            if is_multi:
+                result = self.convert_multi_to_ab(dwg_info)
+            else:
+                result = self.convert_to_ab(dwg_info)
+
+            if not result['success']:
+                if attempt < max_retries:
+                    logging.warning(f"[QA-RETRY] {doc_id} 转换失败 "
+                                    f"({attempt}/{max_retries}): "
+                                    f"{result.get('errors')} — 重试中...")
+                    self._acad = None
+                    time.sleep(5)
+                    continue
+                return result  # max retries exhausted on conversion failure
+
+            # QA check
+            pdf_path = Path(result['pdf_path'])
+            qa_warns = self._qa_validate_ab_pdf(
+                pdf_path, doc_id, expected_pages=expected_pages)
+
+            if not qa_warns:
+                return result  # ✅ QA PASS — return to caller
+
+            # Categorise
+            must_escalate = [w for w in qa_warns
+                             if any(kw in w for kw in self._QA_ESCALATE_KEYWORDS)]
+            retryable = [w for w in qa_warns if w not in must_escalate]
+
+            if must_escalate:
+                result['success'] = False
+                result['errors'].append(
+                    f"QA失败(需人工介入): {'; '.join(must_escalate)}")
+                if retryable:
+                    result['errors'].append(
+                        f"另有可重试问题: {'; '.join(retryable)}")
+                return result
+
+            # All failures are retryable
+            if attempt < max_retries:
+                logging.warning(f"[QA-RETRY] {doc_id} QA失败 "
+                                f"({attempt}/{max_retries}): {retryable} — 重试...")
+                self._acad = None
+                time.sleep(5)
+                continue
+
+            # Max retries exhausted with retryable failures
+            result['success'] = False
+            result['errors'].append(
+                f"QA失败({max_retries}次重试后仍未通过): {'; '.join(qa_warns)}")
+            return result
+
+        return result  # fallback (should not reach here)
 
     # ── Batch conversion ─────────────────────────────────────────────────
 
@@ -11081,10 +11172,7 @@ class AsBuiltManager(IFCManager):
             print(f"  [{idx}/{total}] {doc_id} ({type_label}, IFC Rev{ifc_source['ifc_rev']} -> "
                   f"AB Rev{ab_rev})...")
 
-            if is_multi:
-                r = self.convert_multi_to_ab(dwg_info)
-            else:
-                r = self.convert_to_ab(dwg_info)
+            r = self._convert_with_qa_retry(dwg_info)
             results.append(r)
 
             if r['success']:
