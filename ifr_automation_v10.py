@@ -6497,12 +6497,15 @@ class IFCManager(IFCStampMixin):
                             pass
                     if xref_bound:
                         print(f"    XREF 绑定: {xref_bound} 个外部引用已绑定")
-                        # Regen after XREF bind to stabilize document state
+                        # Regen after XREF bind to stabilize document state.
+                        # Sleep is OUTSIDE try so it always runs — 2s was too
+                        # short; SaveAs immediately after bind triggers
+                        # RPC_E_SERVERFAULT while AutoCAD is still processing.
                         try:
                             doc.Regen(1)  # acActiveViewport
-                            time.sleep(2)
                         except Exception:
                             pass
+                        time.sleep(8)
                 except Exception:
                     pass
             else:
@@ -10351,9 +10354,9 @@ class AsBuiltManager(IFCManager):
                         print(f"    XREF 绑定: {xref_bound} 个外部引用已绑定")
                         try:
                             doc.Regen(1)
-                            time.sleep(2)
                         except Exception:
                             pass
+                        time.sleep(8)  # outside try — must always run
                         # Verify all XREFs resolved
                         _unresolved = 0
                         try:
@@ -10417,11 +10420,33 @@ class AsBuiltManager(IFCManager):
                     print(f"    SaveAs 策略3失败({e3})")
 
             if not save_ok:
-                result['errors'].append("SaveAs 全部失败")
+                # Strategy 4 (last resort): in-place Save + PUBLISH from
+                # current document. DWG won't have the AB filename but PDF
+                # can still be exported. Triggered when XREF bind leaves
+                # AutoCAD in RPC_E_SERVERFAULT state across all SaveAs retries.
+                print(f"    SaveAs 全部失败 — 尝试就地 Save + 直接导出 PDF...")
+                try:
+                    self._com_retry(lambda: doc.Save())
+                    time.sleep(3)
+                    save_path = Path(doc.FullName)
+                    save_ok = True
+                    print(f"    ⚠ DWG 已就地保存（源文件），AB 文件名未另存")
+                except Exception as e4:
+                    print(f"    就地 Save 失败({e4})，仍尝试从当前路径导出 PDF...")
+                    save_path = Path(doc.FullName)
+
+                pdf_ok_s4 = self._publish_single_pdf(acad, save_path, ab_pdf_path)
                 try:
                     doc.Close(False)
                 except Exception:
                     pass
+                doc = None
+                if pdf_ok_s4:
+                    result['pdf_path'] = str(ab_pdf_path)
+                    result['success'] = True
+                    result['errors'].append("⚠ SaveAs 失败，DWG 未另存为 AB 文件名，但 PDF 已导出")
+                else:
+                    result['errors'].append("SaveAs 和 PDF 导出均失败")
                 return result
 
             # Close document — guarded: Close can throw "Open.Close" after
@@ -10634,9 +10659,9 @@ class AsBuiltManager(IFCManager):
                             print(f"    XREF 绑定: {_xb} 个外部引用已绑定")
                             try:
                                 doc.Regen(1)
-                                time.sleep(2)
                             except Exception:
                                 pass
+                            time.sleep(8)  # outside try — must always run
                             _unres = 0
                             try:
                                 for _bi3 in range(doc.Blocks.Count):
