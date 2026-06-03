@@ -6006,6 +6006,22 @@ class IFCManager(IFCStampMixin):
                     desc_tag = f"{row_num}DESCRIPTION"
                     if desc_tag in attrs:
                         info['description'] = self._safe_get_text(attrs[desc_tag]).strip()
+                    # Per-FIELD backfill: a later revision row may leave a single
+                    # personnel field blank (e.g. IFC row has DESIGNED='' while
+                    # DRAWN/APPROVED are filled). Don't copy that blank into the
+                    # AS BUILT row — backfill each empty field from the most recent
+                    # EARLIER row that has a non-empty value for it.
+                    for tag in self.PERSONNEL_TAGS:
+                        key = tag.lower()
+                        if info.get(key):
+                            continue
+                        for earlier in range(row_num - 1, 0, -1):
+                            et = f"{earlier}{tag}"
+                            if et in attrs:
+                                ev = self._safe_get_text(attrs[et]).strip()
+                                if ev:
+                                    info[key] = ev
+                                    break
                     return info
         return {}
 
