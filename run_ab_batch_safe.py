@@ -42,12 +42,29 @@ ACAD_SETTLE = 4         # seconds to wait after killing AutoCAD
 
 
 def kill_acad(reason=""):
-    """Force-kill all AutoCAD instances and wait for clean state."""
+    """Force-kill all AutoCAD instances, clear the autosave/recovery files the
+    kill leaves behind, and wait for a clean state.
+
+    Each forced kill drops a .sv$ autosave; they accumulate and make the NEXT
+    launch pop the Drawing Recovery dialog → COM hangs (even trivial files time
+    out). Clearing them here keeps repeated kill/relaunch cycles healthy."""
     subprocess.run(["taskkill", "/F", "/IM", "acad.exe"],
                    capture_output=True, text=True)
     time.sleep(ACAD_SETTLE)
+    # Remove leftover autosave/recovery files so the next launch starts clean.
+    tmp = os.environ.get("TEMP") or os.environ.get("TMP") or r"C:\Windows\Temp"
+    try:
+        for f in Path(tmp).glob("*.sv$"):
+            try: f.unlink()
+            except Exception: pass
+        for f in Path(tmp).glob("*.dwk"):
+            try: f.unlink()
+            except Exception: pass
+    except Exception:
+        pass
     if reason:
-        print(f"    [recover] killed AutoCAD ({reason})", flush=True)
+        print(f"    [recover] killed AutoCAD + cleared recovery files ({reason})",
+              flush=True)
 
 
 # Child worker: convert exactly ONE source (doc_id + source_dir substring).
