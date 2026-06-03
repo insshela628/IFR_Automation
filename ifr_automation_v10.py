@@ -5654,7 +5654,19 @@ class IFCManager(IFCStampMixin):
             try:
                 print("  正在启动 AutoCAD（可能需要30秒）...")
                 self._acad = win32com.client.Dispatch("AutoCAD.Application")
-                self._acad.Visible = True
+                # Cold-start race: a freshly-launched AutoCAD returns from Dispatch
+                # before it's ready; setting .Visible too soon raises "Visible can
+                # not be set". Wait until the app responds, then set Visible best-effort.
+                for _start_wait in range(30):
+                    try:
+                        _ = self._acad.Documents
+                        break
+                    except Exception:
+                        time.sleep(1)
+                try:
+                    self._acad.Visible = True
+                except Exception:
+                    pass
             except Exception as e:
                 raise RuntimeError(f"无法连接或启动 AutoCAD: {e}")
         # Wait for Documents collection to be ready
@@ -7013,7 +7025,19 @@ class PanelIFCManager(IFCStampMixin):
             try:
                 print("  正在启动 AutoCAD（可能需要30秒）...")
                 self._acad = win32com.client.Dispatch("AutoCAD.Application")
-                self._acad.Visible = True
+                # Cold-start race: a freshly-launched AutoCAD returns from Dispatch
+                # before it's ready; setting .Visible too soon raises "Visible can
+                # not be set". Wait until the app responds, then set Visible best-effort.
+                for _start_wait in range(30):
+                    try:
+                        _ = self._acad.Documents
+                        break
+                    except Exception:
+                        time.sleep(1)
+                try:
+                    self._acad.Visible = True
+                except Exception:
+                    pass
                 # Wait for AutoCAD to be ready
                 for _wait in range(60):
                     try:
@@ -10053,8 +10077,13 @@ class AsBuiltManager(IFCManager):
 
     # ── Stamp removal (LMS-enhanced) ────────────────────────────────────
 
+    # 'PRINTED IN COLO' is the spelling-agnostic catch-all: matches British
+    # "...PRINTED IN COLOUR" AND American "...PRINTED IN COLOR", plural OR singular
+    # "DRAWING(S)". Warnertown SLD-001's old stamp reads "DRAWING TO BE PRINTED IN
+    # COLOR" (singular, American) — the exact-plural-British phrase missed it.
     _QA_STAMP_PHRASES = {'FOR CONSTRUCTION', 'ISSUED FOR REVIEW', 'FOR REVIEW',
-                         'DRAWINGS TO BE PRINTED IN COLOUR', 'AS BUILT', 'AS-BUILT'}
+                         'DRAWINGS TO BE PRINTED IN COLOUR', 'PRINTED IN COLO',
+                         'AS BUILT', 'AS-BUILT'}
 
     def _remove_ifc_stamp(self, doc):
         """Remove stamps from all spaces — parent + QA + geometry-based cleanup."""
@@ -10246,8 +10275,12 @@ class AsBuiltManager(IFCManager):
                         return False
                     mn, mx = entity.GetBoundingBox()
                     w = float(mx[0]) - float(mn[0]); h = float(mx[1]) - float(mn[1])
-                    # cw>3: bot-drawn thick stamps; hand-drawn (cw=0) caught by geometry pass
-                    return w > 300 and h > 30 and entity.ConstantWidth > 3.0
+                    # cw>1.5: bot-drawn thick stamps; hand-drawn (cw=0) caught by geometry pass.
+                    # Size thresholds relaxed (was w>300 h>30) — they're in the TB's OWN units,
+                    # which vary with TB scale: Warnertown SLD-001's TB is ~1.8x, its QA COLOUR
+                    # box is only 200x60 and was missed by w>300. Layer=='QA' already strongly
+                    # filters to stamps, so a smaller box on QA is still a stamp.
+                    return w > 100 and h > 20 and entity.ConstantWidth > 1.5
                 except Exception:
                     return False
             if ename in ('AcDbMText', 'AcDbText'):
