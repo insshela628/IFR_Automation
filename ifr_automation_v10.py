@@ -9989,8 +9989,21 @@ class AsBuiltManager(IFCManager):
             target_row = last_occupied_row + 1
 
         if target_row > self.REV_ROWS:
-            print(f"    Warning: AB Rev{ab_rev} needs row {target_row}, "
-                  f"title block has {self.REV_ROWS} rows, using last row")
+            # Revision rows FULL → rolling history (bottom-to-top = old-to-new):
+            # drop the oldest (row 1), shift rows 2..N DOWN into 1..N-1, then write
+            # AS BUILT into the top row (REV_ROWS, newest). Preserves chronology;
+            # only the oldest revision rolls off. (User-confirmed behavior.)
+            print(f"    版本行已满({self.REV_ROWS}行) → 滚动:丢弃最旧Rev行1,"
+                  f"行2..{self.REV_ROWS}整体下移,AS BUILT写入最上行{self.REV_ROWS}")
+            for dest in range(1, self.REV_ROWS):
+                src = dest + 1
+                for suffix in all_suffixes:
+                    d_tag = f"{dest}{suffix}"
+                    s_tag = f"{src}{suffix}"
+                    if d_tag in attrs:
+                        sval = (self._safe_get_text(attrs[s_tag]).strip()
+                                if s_tag in attrs else '')
+                        self._safe_set_text(attrs[d_tag], sval)
             target_row = self.REV_ROWS
 
         # Clean up duplicate AB rows above target_row (idempotent safety)
