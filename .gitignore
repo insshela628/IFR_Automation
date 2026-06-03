@@ -5,3 +5,7 @@ SS/
 *.dwf
 *.bak
 backup_pre_restore_20260601/
+test_output/
+test_output.dwg
+test_logs/
+.env
