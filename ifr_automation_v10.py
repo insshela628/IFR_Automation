@@ -5957,30 +5957,33 @@ class IFCManager(IFCStampMixin):
                 except Exception:
                     return ''
 
-    def _safe_set_text(self, attr, value: str):
-        """Safely write attribute TextString with COM retry. Never raises."""
+    def _safe_set_text(self, attr, value: str) -> bool:
+        """Safely write attribute TextString with COM retry. Never raises.
+        Returns True if the write succeeded, False otherwise."""
         try:
             attr.TextString = value
-            return
+            return True
         except Exception as _e1:
             # "No database" = AutoCAD has no active drawing; retrying won't help
             # and would block for ~20s per attribute (5 retries × sleeps).
             if 'no database' in str(_e1).lower():
                 logging.warning(f"_safe_set_text: No database — skip retry")
-                return
+                return False
         try:
             # Re-wrap with Dispatch in case COM proxy lost type info
             attr2 = win32com.client.Dispatch(attr)
             attr2.TextString = value
-            return
+            return True
         except Exception as _e2:
             if 'no database' in str(_e2).lower():
                 logging.warning(f"_safe_set_text: No database — skip retry")
-                return
+                return False
         try:
             self._com_retry(lambda: setattr(attr, 'TextString', value))
+            return True
         except Exception as e:
             logging.warning(f"_safe_set_text failed (all 3 strategies): {e}")
+            return False
 
     def _read_latest_ifr_row(self, attrs: Dict) -> Dict:
         """Find the highest non-empty revision row and return personnel info.
@@ -10017,18 +10020,36 @@ class AsBuiltManager(IFCManager):
                         if tag in attrs:
                             self._safe_set_text(attrs[tag], '')
 
+        # Write the AS BUILT row, tracking write outcomes for cheap QA (no COM
+        # re-read — _safe_set_text returns success/failure). A non-empty value
+        # that fails to write = a blank field in the output → QA warning.
+        warnings = []
         tag_prefix = str(target_row)
         if f'{tag_prefix}REV' in attrs:
-            self._safe_set_text(attrs[f'{tag_prefix}REV'], str(ab_rev))
+            if not self._safe_set_text(attrs[f'{tag_prefix}REV'], str(ab_rev)):
+                warnings.append("AS BUILT 行 REV 写入失败")
         if f'{tag_prefix}DESCRIPTION' in attrs:
-            self._safe_set_text(attrs[f'{tag_prefix}DESCRIPTION'], 'AS BUILT')
+            if not self._safe_set_text(attrs[f'{tag_prefix}DESCRIPTION'], 'AS BUILT'):
+                warnings.append("AS BUILT 行 DESCRIPTION 写入失败")
         if f'{tag_prefix}DATE' in attrs:
-            self._safe_set_text(attrs[f'{tag_prefix}DATE'], date_str)
+            if not self._safe_set_text(attrs[f'{tag_prefix}DATE'], date_str):
+                warnings.append("AS BUILT 行 DATE 写入失败")
 
+        _personnel_written = 0
         for tag in self.PERSONNEL_TAGS:
             full_tag = f"{tag_prefix}{tag}"
             if full_tag in attrs:
-                self._safe_set_text(attrs[full_tag], personnel.get(tag.lower(), ''))
+                val = personnel.get(tag.lower(), '')
+                ok = self._safe_set_text(attrs[full_tag], val)
+                if val and not ok:
+                    warnings.append(f"AS BUILT 行 {tag} 写入失败 (应为 '{val}')")
+                if val and ok:
+                    _personnel_written += 1
+        # All-empty personnel on the AS BUILT row = likely a personnel-read failure
+        # (the source had none, or _read_latest_ifr_row backfill regressed).
+        if _personnel_written == 0:
+            warnings.append("AS BUILT 行人员字段全空 (检查源版本行/回退)")
+        return warnings
 
     # ── Stamp removal (LMS-enhanced) ────────────────────────────────────
 
@@ -10498,13 +10519,16 @@ class AsBuiltManager(IFCManager):
 
             # Update EVERY title block + add AS BUILT stamp near each one
             date_str = datetime.now().strftime('%d/%m/%y')
+            _tb_qa_all = []   # title-block QA warnings, collected per sheet from writes
             for tb_idx, tb_item in enumerate(all_tbs, 1):
                 block_ref = tb_item[0]
                 attrs = tb_item[1]
                 space = tb_item[2]
                 layout_name = tb_item[3] if len(tb_item) > 3 else None
                 print(f"    Sheet {tb_idx}/{len(all_tbs)}: 更新 title block + AS BUILT...")
-                self._update_title_block(attrs, ab_rev, personnel, date_str)
+                _tbw = self._update_title_block(attrs, ab_rev, personnel, date_str)
+                for _w in (_tbw or []):
+                    _tb_qa_all.append(f"Sheet {tb_idx}: {_w}")
                 if block_ref and space:
                     self._stamp_via_com_draw(doc, block_ref, space,
                                              has_colour=has_colour,
@@ -10512,15 +10536,13 @@ class AsBuiltManager(IFCManager):
                 else:
                     print(f"    ⚠ Sheet {tb_idx}: block_ref 或 space 为空，跳过印章")
 
-            # Title-block QA self-check (same closed loop as stamps): verify every
-            # sheet's AS BUILT revision row is complete BEFORE export. Caught here
-            # (COM attrs = ground truth) because PDF text can't reliably map to
-            # title-block fields. Feeds _convert_with_qa_retry via tb_qa_warnings.
-            tb_qa = self._qa_validate_title_blocks(all_tbs)
-            if tb_qa:
-                for _w in tb_qa:
+            # Title-block QA (same closed loop as stamps): warnings were collected
+            # per sheet from the WRITE RESULTS during _update_title_block — cheap,
+            # NO COM re-read (re-reading all sheets' attrs timed out 9-page files).
+            if _tb_qa_all:
+                for _w in _tb_qa_all:
                     print(f"    [TB-QA] {_w}")
-                result['tb_qa_warnings'] = tb_qa
+                result['tb_qa_warnings'] = _tb_qa_all
 
             # Create output directories
             if ab_subfolder:
@@ -11150,70 +11172,6 @@ class AsBuiltManager(IFCManager):
         return False
 
     # ── Post-conversion QA validation ────────────────────────────────────
-
-    def _qa_validate_title_blocks(self, all_tbs) -> List[str]:
-        """QA the title block of every sheet AFTER _update_title_block, on the open
-        doc's COM attributes (ground truth). Same closed-loop role as the PDF stamp
-        QA. Returns warning strings; empty = all good.
-
-        Checks per sheet's AS BUILT revision row:
-          - an AS BUILT row exists (and is not duplicated)
-          - its REV and DATE are filled
-          - it did NOT drop a personnel field that the source revision row had
-            (per-field — catches the SEC-02 blank-DESIGNED class of bug)
-        """
-        warnings = []
-        for idx, tb_item in enumerate(all_tbs, 1):
-            attrs = tb_item[1] if len(tb_item) > 1 else None
-            if not attrs:
-                continue
-            rowvals = {}
-            ab_rows = []
-            src_row = 0
-            for rn in range(1, self.REV_ROWS + 1):
-                rt = f"{rn}REV"
-                if rt not in attrs:
-                    continue
-                rev = self._safe_get_text(attrs[rt]).strip()
-                if not rev:
-                    continue
-                dt = f"{rn}DESCRIPTION"
-                desc = (self._safe_get_text(attrs[dt]).strip().upper()
-                        if dt in attrs else '')
-                vals = {'rev': rev, 'desc': desc}
-                dat = f"{rn}DATE"
-                vals['date'] = (self._safe_get_text(attrs[dat]).strip()
-                                if dat in attrs else '')
-                for tag in self.PERSONNEL_TAGS:
-                    ft = f"{rn}{tag}"
-                    vals[tag.lower()] = (self._safe_get_text(attrs[ft]).strip()
-                                         if ft in attrs else '')
-                rowvals[rn] = vals
-                if 'AS BUILT' in desc or 'AS-BUILT' in desc:
-                    ab_rows.append(rn)
-                else:
-                    src_row = max(src_row, rn)
-
-            label = f"Sheet {idx}"
-            if not ab_rows:
-                warnings.append(f"{label}: 标题栏缺 AS BUILT 版本行")
-                continue
-            if len(ab_rows) > 1:
-                warnings.append(f"{label}: 标题栏 AS BUILT 行重复 ({len(ab_rows)} 个)")
-            ab = rowvals[max(ab_rows)]
-            if not ab.get('rev'):
-                warnings.append(f"{label}: AS BUILT 行 REV 空")
-            if not ab.get('date'):
-                warnings.append(f"{label}: AS BUILT 行 DATE 空")
-            # Per-field: AS BUILT row must not blank a personnel field the source had.
-            if src_row and src_row in rowvals:
-                src = rowvals[src_row]
-                for tag in self.PERSONNEL_TAGS:
-                    k = tag.lower()
-                    if src.get(k) and not ab.get(k):
-                        warnings.append(
-                            f"{label}: AS BUILT 行 {tag} 空 (源版本行有 '{src[k]}')")
-        return warnings
 
     def _qa_validate_ab_pdf(self, pdf_path: Path, doc_id: str,
                              expected_pages: int = None) -> List[str]:
