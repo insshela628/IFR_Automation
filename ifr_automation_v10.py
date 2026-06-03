@@ -10110,6 +10110,27 @@ class AsBuiltManager(IFCManager):
             except Exception:
                 pass
 
+        elif ename == 'AcDbBlockReference':
+            # COLOUR / FOR CONSTRUCTION stamps may be INSERTED BLOCKS (not
+            # polylines). A stamp-sized block insert in the stamp zone is an
+            # old pre-bot stamp — remove it so the bot can redraw aligned.
+            # The title block itself is full-frame (w_ratio ~1.0) so won't match.
+            try:
+                mn, mx = entity.GetBoundingBox()
+                el, eb = float(mn[0]), float(mn[1])
+                er, et = float(mx[0]), float(mx[1])
+                if not (el >= zone_left - 5 and er <= zone_right + 5 and
+                        eb >= zone_bottom - 5 and et <= zone_top + 5):
+                    return
+                w = er - el
+                h = et - eb
+                w_ratio = w / tb_w
+                h_ratio = h / tb_h
+                if 0.02 < w_ratio < 0.20 and 0.005 < h_ratio < 0.08:
+                    to_delete.append(entity)
+            except Exception:
+                pass
+
     def _remove_qa_layer_stamps(self, doc):
         """Remove stamp entities on QA layer (LMS projects use QA, not IFC_STAMP).
 
