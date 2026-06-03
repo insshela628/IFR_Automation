@@ -120,8 +120,10 @@ def main():
 
     sources = list_sources(project_path)
     if filt:
-        sources = [s for s in sources if filt.lower() in s[0].lower()
-                   or filt.lower() in s[1].lower()]
+        # filt may be a comma-separated list of substrings; match if ANY term hits
+        terms = [t.strip().lower() for t in filt.split(',') if t.strip()]
+        sources = [s for s in sources
+                   if any(t in s[0].lower() or t in s[1].lower() for t in terms)]
     print(f"Sources to convert: {len(sources)}", flush=True)
 
     results = []
