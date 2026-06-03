@@ -402,3 +402,61 @@ Schema（md 里 ```json fence 内容）：
 2. **输入不同**：Pipeline 处理 drawings/reports；Issue Register 处理 client-returned Excel register
 3. **外部依赖**：需要 `pdfplumber`（IFR/IFC pipeline 不需要）
 4. **数据流向相反**：Pipeline 是内→外（发给客户）；Issue Register 是外→内（客户反馈回来）
+
+
+## 十二、Robust AS BUILT Batch Run (AutoCAD 自检 + QA 闭环)
+
+> **何时用**：批量跑 AS BUILT 转换（Coleambally2 / Warnertown 等多 DWG）。
+> AutoCAD 只有 COM 接口、可能无限卡死 —— **绝不要用裸 loop 直接驱动**。用下面的防卡死
+> 运行器，它把每个文件隔离、卡死时自动重启 AutoCAD。相关事实见 memory
+> `feedback-autocad-com-health`、`feedback-stamp-alignment`。
+
+### Step 1 — 开跑前：AutoCAD 在跑吗 / 卡死了吗？
+- `tasklist | findstr acad` —— 列出存活的 AutoCAD。
+- **卡死 vs 工作中**：看 acad.exe 的 CPU（隔几秒采样两次 `(Get-Process acad).CPU`）：
+  - CPU **平在 ~0% 不动** + 没有新文件产出 → **卡死**（模态对话框 / PUBLISH 卡 / RPC 拒绝）。
+  - CPU **在涨** → 正在工作，别动它。
+- **不要信 Python 控制台**：子进程输出是缓冲的，"看着不动"≠卡死。唯一可靠的进度信号是
+  **输出目录里有新的 AB DWG/PDF 出现**。
+- 开跑前若已有僵死 acad.exe，先按 Step 4 清掉，让批次从干净状态开始。
+
+### Step 2 — 跑防卡死批量运行器
+```
+python run_ab_batch_safe.py <project> [docid-or-srcdir-filter] [--timeout N]
+```
+- `<project>`：`cole2` | `warnertown` | `lms`（或完整项目路径）。
+- 可选 filter：doc-id 或 source 文件夹名的子串（如 `PLN-005`）。
+- `--timeout N`：每文件硬超时秒数（默认 240；大的多页 DWG 提到 ~300）。
+- 例：
+  - `python run_ab_batch_safe.py cole2`          —— 全部
+  - `python run_ab_batch_safe.py cole2 PLN-005`  —— 单个 doc-id
+  - `python run_ab_batch_safe.py cole2 --timeout 300`
+
+**运行器的保证**（所以不用守着）：
+- 每个 source 一个**子进程** + 硬超时 → 单个卡死文件拖不垮整批。
+- **每个文件前先 kill AutoCAD** → 每次转换都从同样的干净状态开始
+  （把多个文件链在一个 warm 实例上会让 COM 变脏、大多数转换失败 —— 已踩坑验证）。
+- UTF-8 子进程 IO（中文日志不再 cp1252 崩溃）。
+- 超时 → 杀 AutoCAD、记 `timeout`、继续下一个。
+- 末尾打印 `=== DONE: ok=.. (warn=..) fail=.. ===` 并列出每个 FAIL/WARN 的 doc-id。
+
+### Step 3 — QA 是自动的（闭环），只需读结果
+- 每文件：`_convert_with_qa_retry` → `_qa_validate_ab_pdf`（PyMuPDF/fitz）→ 自动重试最多 3 次，
+  仍不过则升级。另外 `_run_post_batch_qa` 扫描**所有**输出 PDF。
+- 运行器汇总里：`PASS`（通过）、`WARN`（成功但 QA 标记了问题——看该行）、`FAIL`。
+- QA 判据定义在 CLAUDE.md → "AS BUILT Post-Conversion QA"，不要重新实现。
+- **只做 QA / 验证的 agent 必须只读**：用 fitz 打开 PDF 即可，**绝不驱动 AutoCAD**
+  （不转换、不 SaveAs、不碰 COM）—— 否则可能引发第二次卡死 + 孤儿 acad.exe。
+
+### Step 4 — 手动卡死恢复（仅当你在运行器之外手动开过 AutoCAD、或留下孤儿时）
+```
+taskkill /F /IM acad.exe          # 强杀全部 AutoCAD
+tasklist | findstr acad           # 确认一个不剩
+```
+然后重启 / 重跑批次。
+- **绝不在转换事务进行中途杀掉并留下孤儿 acad.exe** —— 下次运行会报
+  "Invalid execution context" / "RPC server unavailable"。重跑前务必确认 `tasklist` 干净。
+  （运行器已经做了 kill-before-each，所以这步只针对手动运行。）
+
+相关文件：`run_ab_batch_safe.py`、`ifr_automation_v10.py`、`CLAUDE.md`、memory
+`feedback-autocad-com-health` / `feedback-stamp-alignment` / `project-asbuilt-qa-loop`。
