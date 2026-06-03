@@ -4494,7 +4494,9 @@ class IFCStampMixin:
 
     # COLOUR stamp box (above FOR CONSTRUCTION): same width, taller for 2-line text
     _REF_COLOUR_RECT_H = 29.0     # calibrated to gold std PLN-005: COL/AB ratio=1.63 (was 26→72pt, now 29→81pt)
-    _REF_COLOUR_GAP = 2.0         # gap between FOR CONSTRUCTION and COLOUR boxes
+    _REF_COLOUR_GAP = 5.0         # vertical gap between AS BUILT and COLOUR boxes
+                                  # (raised from 2.0 — boxes were touching; user
+                                  #  wanted them separated a bit more)
     _REF_COLOUR_TEXT_H = 5.5      # smaller text height for 2-line COLOUR stamp
 
     # Polyline border width override.  None → use 0.5*scale. Subclasses set a
@@ -5038,11 +5040,16 @@ class IFCStampMixin:
         return False
 
     def _ensure_colour_has_border(self, doc, draw_space, stamp_left, stamp_right,
-                                   colour_bottom, colour_top, cw, layout_name=None):
-        """Ensure existing COLOUR MText has a border rectangle.
+                                   colour_bottom, colour_top, cw, layout_name=None,
+                                   redraw=False):
+        """Reconcile the existing COLOUR stamp with the bot's stamp position.
 
-        Called when has_colour=True. If original COLOUR text lacks a rect
-        border, draws one at the stamp position on IFC_STAMP layer.
+        redraw=False (IFC keep-existing): move the existing COLOUR MText to the
+            stamp position and draw a border around it (Fix 1 + Fix 3).
+        redraw=True (AsBuilt force/redraw): the caller will draw a FRESH COLOUR
+            box + text, so DELETE the old COLOUR MText here (don't move/keep it)
+            and skip drawing a border — otherwise the old + fresh duplicate.
+        Either way, Fix 2 clears stale border entities in the zone.
         """
         colour_entity = None
 
@@ -5089,22 +5096,34 @@ class IFCStampMixin:
                 pass
 
         if colour_entity is None:
-            return
+            # No existing COLOUR MText. In redraw mode still run Fix 2 (clear any
+            # stale borders) below; in keep mode there's nothing to do.
+            if not redraw:
+                return
 
-        # Fix 1: Move COLOUR MText to align with stamp position.
-        # Original DWG text may be at a different X (e.g. 32 pts off).
-        # Both text and border must share the same stamp_left/stamp_right.
+        # Fix 1: reconcile the existing COLOUR MText.
         colour_center_x = (stamp_left + stamp_right) / 2.0
         colour_center_y = (colour_bottom + colour_top) / 2.0
-        try:
-            new_ip = win32com.client.VARIANT(
-                pythoncom.VT_ARRAY | pythoncom.VT_R8,
-                [colour_center_x, colour_center_y, 0.0])
-            colour_entity.InsertionPoint = new_ip
-            colour_entity.Width = stamp_right - stamp_left
-            colour_entity.AttachmentPoint = 5  # MiddleCenter
-        except Exception:
-            pass
+        if colour_entity is not None:
+            if redraw:
+                # Caller draws a fresh COLOUR box + text → delete the old MText so
+                # it isn't duplicated.
+                try:
+                    colour_entity.Delete()
+                except Exception:
+                    pass
+                colour_entity = None
+            else:
+                # Keep-existing: move it onto the stamp position.
+                try:
+                    new_ip = win32com.client.VARIANT(
+                        pythoncom.VT_ARRAY | pythoncom.VT_R8,
+                        [colour_center_x, colour_center_y, 0.0])
+                    colour_entity.InsertionPoint = new_ip
+                    colour_entity.Width = stamp_right - stamp_left
+                    colour_entity.AttachmentPoint = 5  # MiddleCenter
+                except Exception:
+                    pass
 
         # Fix 2: Delete old border entities in the COLOUR+AS BUILT stamp zone.
         # Pre-bot stamps may use AcDb2dPolyline, AcDbSolid, etc. — handle all.
@@ -5200,8 +5219,11 @@ class IFCStampMixin:
             except Exception:
                 pass
 
-        # Fix 3: Always redraw border at stamp position with matching cw.
-        # This guarantees same X alignment and same thickness as AS BUILT box.
+        # Fix 3: draw a border around the EXISTING COLOUR text (keep mode only).
+        # In redraw mode the caller draws a fresh box — drawing one here too would
+        # duplicate it, so skip.
+        if redraw:
+            return
         try:
             colour_pts = win32com.client.VARIANT(
                 pythoncom.VT_ARRAY | pythoncom.VT_R8,
@@ -5459,25 +5481,16 @@ class IFCStampMixin:
             colour_bottom_y = stamp_top_y + colour_gap
             colour_top_y = colour_bottom_y + colour_rect_h
 
-            # COLOUR stamp strategy (lesson learned from 10+ misalignment failures):
-            # Step 1 ALWAYS: clear stale COLOUR borders from the zone BEFORE any
-            #   overlap check — old borders cause false "overlap detected → skip"
-            #   even when _scan_has_colour=False (MText removed but border survived).
-            # Step 2: if COLOUR MText existed (has_colour), move it to correct pos.
-            # Step 3: draw fresh COLOUR box unless genuine drawing content overlaps.
-            self._ensure_colour_has_border(
-                doc, draw_space, stamp_left_x, stamp_right_x,
-                colour_bottom_y, colour_top_y, _cw,
-                layout_name=layout_name)
-
+            # COLOUR stamp strategy:
+            # 1) Decide whether we draw a FRESH COLOUR box.
+            #    - has_colour / _FORCE_COLOUR (AsBuilt): always redraw aligned.
+            #    - else: draw only if no genuine drawing content overlaps.
+            # 2) Then reconcile existing COLOUR entities via _ensure_colour_has_border:
+            #    - redraw=True  → DELETE old MText + clear borders (we draw fresh),
+            #                     so the old + fresh never duplicate.
+            #    - redraw=False → keep+border the existing COLOUR text.
             _draw_colour = False
             if has_colour or getattr(self, '_FORCE_COLOUR', False):
-                # has_colour: COLOUR MText existed → redraw aligned.
-                # _FORCE_COLOUR (AsBuiltManager): the source COLOUR stamp is often
-                #   an inserted BLOCK (not MText), so _scan_has_colour misses it and
-                #   the old block was just removed by geometry cleanup. AS BUILT
-                #   drawings always need the COLOUR stamp (matches gold standard),
-                #   so draw it fresh at the aligned position regardless of overlap.
                 _draw_colour = True
                 print(f"    印章: COLOUR → 重绘对齐 (has_colour={has_colour}, "
                       f"force={getattr(self, '_FORCE_COLOUR', False)})")
@@ -5487,6 +5500,12 @@ class IFCStampMixin:
                 print(f"    印章: COLOUR 区域有真实重叠实体，跳过")
             else:
                 _draw_colour = True
+
+            # Reconcile old COLOUR entities (delete-if-redraw, keep-if-not).
+            self._ensure_colour_has_border(
+                doc, draw_space, stamp_left_x, stamp_right_x,
+                colour_bottom_y, colour_top_y, _cw,
+                layout_name=layout_name, redraw=_draw_colour)
 
             if _draw_colour:
 
@@ -10598,10 +10617,10 @@ class AsBuiltManager(IFCManager):
             if pdf_ok:
                 result['pdf_path'] = str(ab_pdf_path)
                 result['success'] = True
-                # QA validation
+                # QA validation (expected_pages=None: single DWG may have many
+                # layouts → many pages; phantom/missing-stamp checks cover defects)
                 qa_warnings = self._qa_validate_ab_pdf(
-                    ab_pdf_path, doc_id,
-                    expected_pages=len(all_tbs) if all_tbs else None)
+                    ab_pdf_path, doc_id, expected_pages=None)
                 if qa_warnings:
                     for _qw in qa_warnings:
                         print(f"    [QA] {_qw}")
@@ -11223,7 +11242,13 @@ class AsBuiltManager(IFCManager):
         doc_id = dwg_info['doc_id']
         ifc_source = dwg_info['ifc_source']
         is_multi = ifc_source['is_multi_page']
-        expected_pages = len(ifc_source['dwg_paths']) if not is_multi else None
+        # Do NOT enforce a strict page count: a single source DWG can legitimately
+        # have multiple PaperSpace layouts → a multi-page PDF. We can't know the
+        # layout count from the PDF, so passing expected=1 caused false "页数不匹配"
+        # escalations on every multi-layout drawing. Phantom Model-tab pages are
+        # still caught by the dimension check, and dropped pages by the missing-
+        # AS-BUILT check, inside _qa_validate_ab_pdf.
+        expected_pages = None
 
         for attempt in range(1, max_retries + 1):
             # Convert
