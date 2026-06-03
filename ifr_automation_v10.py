@@ -10512,6 +10512,16 @@ class AsBuiltManager(IFCManager):
                 else:
                     print(f"    ⚠ Sheet {tb_idx}: block_ref 或 space 为空，跳过印章")
 
+            # Title-block QA self-check (same closed loop as stamps): verify every
+            # sheet's AS BUILT revision row is complete BEFORE export. Caught here
+            # (COM attrs = ground truth) because PDF text can't reliably map to
+            # title-block fields. Feeds _convert_with_qa_retry via tb_qa_warnings.
+            tb_qa = self._qa_validate_title_blocks(all_tbs)
+            if tb_qa:
+                for _w in tb_qa:
+                    print(f"    [TB-QA] {_w}")
+                result['tb_qa_warnings'] = tb_qa
+
             # Create output directories
             if ab_subfolder:
                 to_long_path(ab_subfolder).mkdir(parents=True, exist_ok=True)
@@ -11141,6 +11151,70 @@ class AsBuiltManager(IFCManager):
 
     # ── Post-conversion QA validation ────────────────────────────────────
 
+    def _qa_validate_title_blocks(self, all_tbs) -> List[str]:
+        """QA the title block of every sheet AFTER _update_title_block, on the open
+        doc's COM attributes (ground truth). Same closed-loop role as the PDF stamp
+        QA. Returns warning strings; empty = all good.
+
+        Checks per sheet's AS BUILT revision row:
+          - an AS BUILT row exists (and is not duplicated)
+          - its REV and DATE are filled
+          - it did NOT drop a personnel field that the source revision row had
+            (per-field — catches the SEC-02 blank-DESIGNED class of bug)
+        """
+        warnings = []
+        for idx, tb_item in enumerate(all_tbs, 1):
+            attrs = tb_item[1] if len(tb_item) > 1 else None
+            if not attrs:
+                continue
+            rowvals = {}
+            ab_rows = []
+            src_row = 0
+            for rn in range(1, self.REV_ROWS + 1):
+                rt = f"{rn}REV"
+                if rt not in attrs:
+                    continue
+                rev = self._safe_get_text(attrs[rt]).strip()
+                if not rev:
+                    continue
+                dt = f"{rn}DESCRIPTION"
+                desc = (self._safe_get_text(attrs[dt]).strip().upper()
+                        if dt in attrs else '')
+                vals = {'rev': rev, 'desc': desc}
+                dat = f"{rn}DATE"
+                vals['date'] = (self._safe_get_text(attrs[dat]).strip()
+                                if dat in attrs else '')
+                for tag in self.PERSONNEL_TAGS:
+                    ft = f"{rn}{tag}"
+                    vals[tag.lower()] = (self._safe_get_text(attrs[ft]).strip()
+                                         if ft in attrs else '')
+                rowvals[rn] = vals
+                if 'AS BUILT' in desc or 'AS-BUILT' in desc:
+                    ab_rows.append(rn)
+                else:
+                    src_row = max(src_row, rn)
+
+            label = f"Sheet {idx}"
+            if not ab_rows:
+                warnings.append(f"{label}: 标题栏缺 AS BUILT 版本行")
+                continue
+            if len(ab_rows) > 1:
+                warnings.append(f"{label}: 标题栏 AS BUILT 行重复 ({len(ab_rows)} 个)")
+            ab = rowvals[max(ab_rows)]
+            if not ab.get('rev'):
+                warnings.append(f"{label}: AS BUILT 行 REV 空")
+            if not ab.get('date'):
+                warnings.append(f"{label}: AS BUILT 行 DATE 空")
+            # Per-field: AS BUILT row must not blank a personnel field the source had.
+            if src_row and src_row in rowvals:
+                src = rowvals[src_row]
+                for tag in self.PERSONNEL_TAGS:
+                    k = tag.lower()
+                    if src.get(k) and not ab.get(k):
+                        warnings.append(
+                            f"{label}: AS BUILT 行 {tag} 空 (源版本行有 '{src[k]}')")
+        return warnings
+
     def _qa_validate_ab_pdf(self, pdf_path: Path, doc_id: str,
                              expected_pages: int = None) -> List[str]:
         """Post-conversion QA validation of an AS BUILT PDF.
@@ -11312,6 +11386,10 @@ class AsBuiltManager(IFCManager):
             pdf_path = Path(result['pdf_path'])
             qa_warns = self._qa_validate_ab_pdf(
                 pdf_path, doc_id, expected_pages=expected_pages)
+            # Fold in title-block QA (collected on the open doc during convert).
+            # Same closed loop: a bad title block (missing/blank AS BUILT row) is a
+            # QA failure → retry, then escalate, just like a bad stamp.
+            qa_warns = qa_warns + result.get('tb_qa_warnings', [])
 
             if not qa_warns:
                 return result  # ✅ QA PASS — return to caller
