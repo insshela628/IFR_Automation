@@ -5466,9 +5466,16 @@ class IFCStampMixin:
                 layout_name=layout_name)
 
             _draw_colour = False
-            if has_colour:
-                _draw_colour = True   # MText existed → always redraw aligned
-                print(f"    印章: COLOUR 原DWG有 → 清除旧border，重绘对齐")
+            if has_colour or getattr(self, '_FORCE_COLOUR', False):
+                # has_colour: COLOUR MText existed → redraw aligned.
+                # _FORCE_COLOUR (AsBuiltManager): the source COLOUR stamp is often
+                #   an inserted BLOCK (not MText), so _scan_has_colour misses it and
+                #   the old block was just removed by geometry cleanup. AS BUILT
+                #   drawings always need the COLOUR stamp (matches gold standard),
+                #   so draw it fresh at the aligned position regardless of overlap.
+                _draw_colour = True
+                print(f"    印章: COLOUR → 重绘对齐 (has_colour={has_colour}, "
+                      f"force={getattr(self, '_FORCE_COLOUR', False)})")
             elif self._check_colour_overlap(doc, stamp_left_x, stamp_right_x,
                                              colour_bottom_y, colour_top_y,
                                              layout_name=layout_name):
@@ -9633,6 +9640,12 @@ class AsBuiltManager(IFCManager):
     # so they match. QA rect detection accepts stroked (non-filled) rects so thin
     # borders are still verified — see _qa_validate_ab_pdf / _run_post_batch_qa.
     _STAMP_CW = 0.0
+
+    # AS BUILT drawings always carry the COLOUR stamp (matches gold standard
+    # BLD-003/SLD-001). The source COLOUR stamp is often an inserted BLOCK that
+    # _scan_has_colour (MText-only) misses; after geometry cleanup removes it,
+    # force a fresh aligned COLOUR box rather than skipping on false overlap.
+    _FORCE_COLOUR = True
 
     LMS_TITLE_BLOCKS = {"Coleamablly", "Riverina_tellhow"}
 
