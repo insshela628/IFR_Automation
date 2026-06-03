@@ -10213,64 +10213,54 @@ class AsBuiltManager(IFCManager):
         """
         _stamp_block_kw = ('IFR', 'IFC_STAMP', 'FOR_CONSTRUCTION', 'AS_BUILT', 'ASBUILT')
 
-        def _collect_qa_stamp_entities(block_space):
-            to_delete = []
+        def _is_qa_stamp(entity):
+            """True if a QA-layer entity is a stamp box / text / stamp block."""
             try:
-                count = block_space.Count
+                ename = entity.EntityName
             except Exception:
-                return to_delete
-            for i in range(count):
+                return False
+            if ename in ('AcDbPolyline', 'AcDbLwPolyline'):
                 try:
-                    entity = block_space.Item(i)
+                    if not entity.Closed:
+                        return False
+                    mn, mx = entity.GetBoundingBox()
+                    w = float(mx[0]) - float(mn[0]); h = float(mx[1]) - float(mn[1])
+                    # cw>3: bot-drawn thick stamps; hand-drawn (cw=0) caught by geometry pass
+                    return w > 300 and h > 30 and entity.ConstantWidth > 3.0
+                except Exception:
+                    return False
+            if ename in ('AcDbMText', 'AcDbText'):
+                try:
+                    plain = self._strip_mtext_formatting(
+                        self._com_retry(lambda e=entity: e.TextString) or '').upper().strip()
+                    return any(p in plain for p in self._QA_STAMP_PHRASES)
+                except Exception:
+                    return False
+            if ename == 'AcDbBlockReference':
+                try:
+                    return (any(k in entity.Name.upper() for k in _stamp_block_kw)
+                            and len(entity.GetAttributes()) < 5)
+                except Exception:
+                    return False
+            return False
+
+        def _collect_from_block(block_space):
+            """PaperSpace layout block — small, safe to iterate directly."""
+            out = []
+            try:
+                cnt = block_space.Count
+            except Exception:
+                return out
+            for i in range(cnt):
+                try:
+                    e = block_space.Item(i)
+                    if e.Layer == 'QA' and _is_qa_stamp(e):
+                        out.append(e)
                 except Exception:
                     continue
-                try:
-                    layer = entity.Layer
-                except Exception:
-                    continue
-                if layer != 'QA':
-                    continue
-                try:
-                    ename = entity.EntityName
-                except Exception:
-                    continue
+            return out
 
-                if ename in ('AcDbPolyline', 'AcDbLwPolyline'):
-                    try:
-                        if not entity.Closed:
-                            continue
-                        mn, mx = entity.GetBoundingBox()
-                        w = float(mx[0]) - float(mn[0])
-                        h = float(mx[1]) - float(mn[1])
-                        cw = entity.ConstantWidth
-                        # cw > 3.0: targets bot-drawn thick-border stamps; hand-drawn (cw=0) caught by _remove_stamps_by_geometry
-                        if w > 300 and h > 30 and cw > 3.0:
-                            to_delete.append(entity)
-                    except Exception:
-                        pass
-
-                elif ename in ('AcDbMText', 'AcDbText'):
-                    try:
-                        raw = self._com_retry(lambda e=entity: e.TextString) or ''
-                        plain = self._strip_mtext_formatting(raw).upper().strip()
-                        if plain in self._QA_STAMP_PHRASES or any(
-                                p in plain for p in self._QA_STAMP_PHRASES):
-                            to_delete.append(entity)
-                    except Exception:
-                        pass
-
-                elif ename == 'AcDbBlockReference':
-                    try:
-                        bname = entity.Name.upper()
-                        if any(k in bname for k in _stamp_block_kw):
-                            ac = len(entity.GetAttributes())
-                            if ac < 5:
-                                to_delete.append(entity)
-                    except Exception:
-                        pass
-            return to_delete
-
-        # PaperSpace layouts (per-layout try/except to avoid one COM error skipping all)
+        # PaperSpace layouts (per-layout try/except so one COM error doesn't skip all)
         try:
             layouts = list(doc.Layouts)
         except Exception:
@@ -10279,8 +10269,7 @@ class AsBuiltManager(IFCManager):
             try:
                 if layout.Name.lower() == 'model':
                     continue
-                block = layout.Block
-                victims = _collect_qa_stamp_entities(block)
+                victims = _collect_from_block(layout.Block)
                 for e in reversed(victims):
                     try:
                         e.Delete()
@@ -10291,10 +10280,26 @@ class AsBuiltManager(IFCManager):
             except Exception:
                 continue
 
-        # ModelSpace
+        # ModelSpace — use a SelectionSet filtered to layer 'QA' (spatial index).
+        # NEVER iterate ModelSpace entity-by-entity: PLN-005 has 24854 MS entities;
+        # the old full iteration was O(n) COM and pushed multi-layout drawings past
+        # the timeout. The layer filter returns only the few QA entities, fast.
+        import pythoncom as _pc
         try:
-            ms = doc.ModelSpace
-            victims = _collect_qa_stamp_entities(ms)
+            ssn = f"_QAms_{int(time.time()*1000) % 1_000_000}"
+            ss = doc.SelectionSets.Add(ssn)
+            ft = win32com.client.VARIANT(_pc.VT_ARRAY | _pc.VT_I2, [8])      # 8 = layer
+            fv = win32com.client.VARIANT(_pc.VT_ARRAY | _pc.VT_VARIANT, ["QA"])
+            ss.Select(5, None, None, ft, fv)   # mode 5 = whole space, filtered
+            victims = []
+            for i in range(ss.Count):
+                try:
+                    e = ss.Item(i)
+                    if _is_qa_stamp(e):
+                        victims.append(e)
+                except Exception:
+                    continue
+            ss.Delete()
             for e in reversed(victims):
                 try:
                     e.Delete()
