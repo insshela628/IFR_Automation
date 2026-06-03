@@ -4497,9 +4497,13 @@ class IFCStampMixin:
     _REF_COLOUR_GAP = 2.0         # gap between FOR CONSTRUCTION and COLOUR boxes
     _REF_COLOUR_TEXT_H = 5.5      # smaller text height for 2-line COLOUR stamp
 
-    # Polyline border width override.  None → use 0.5*scale (thick, default for IFC stamps).
-    # Subclasses set to 0.0 for thin/hairline borders (e.g. AsBuiltManager).
+    # Polyline border width override.  None → use 0.5*scale. Subclasses set a
+    # fixed value (e.g. AsBuiltManager uses thick red borders to match gold std).
     _STAMP_CW: Optional[float] = None
+
+    # AutoCAD color index for stamp box borders + text. 7 = black/white (IFC).
+    # AsBuiltManager overrides to 1 (red) to match the gold-standard AS BUILT look.
+    _STAMP_COLOR: int = 7
 
     STAMP_LAYER = "IFC_STAMP"
     STAMP_TEXT = "{\\fArial Narrow|b1;FOR CONSTRUCTION}"
@@ -5208,7 +5212,7 @@ class IFCStampMixin:
             pline = draw_space.AddLightWeightPolyline(colour_pts)
             pline.Closed = True
             pline.Layer = self.STAMP_LAYER
-            pline.color = 7
+            pline.color = getattr(self, '_STAMP_COLOR', 7)
             pline.ConstantWidth = cw
             print(f"    印章: COLOUR 边框已重绘 (cw={cw:.2f}, 清除旧框={_deleted_count})")
         except Exception as e:
@@ -5301,16 +5305,17 @@ class IFCStampMixin:
         print(f"    印章: COM 绘制 (scale={scale:.3f}, tb={tb_width:.0f}x{tb_height:.0f}, "
               f"pos=({stamp_left_x:.1f},{stamp_bottom_y:.1f})->({stamp_right_x:.1f},{stamp_top_y:.1f}))")
 
-        # Ensure IFC_STAMP layer exists, set to black color, ON, thawed
+        # Ensure IFC_STAMP layer exists, set to stamp color, ON, thawed
+        _stamp_color = getattr(self, '_STAMP_COLOR', 7)
         try:
             layer = doc.Layers.Add(self.STAMP_LAYER)
-            layer.color = 7          # White/Black (prints as black)
+            layer.color = _stamp_color
             layer.LayerOn = True
             layer.Freeze = False
         except Exception:
             try:
                 layer = doc.Layers.Item(self.STAMP_LAYER)
-                layer.color = 7
+                layer.color = _stamp_color
                 layer.LayerOn = True
                 layer.Freeze = False
             except Exception:
@@ -5432,7 +5437,7 @@ class IFCStampMixin:
             pline = draw_space.AddLightWeightPolyline(rect_pts)
             pline.Closed = True
             pline.Layer = self.STAMP_LAYER
-            pline.color = 7  # Explicit black (ByLayer might inherit non-black)
+            pline.color = _stamp_color  # explicit (ByLayer might inherit other)
             _cw = self._STAMP_CW if self._STAMP_CW is not None else (0.5 * scale)
             pline.ConstantWidth = _cw
 
@@ -5444,7 +5449,7 @@ class IFCStampMixin:
             mtext.AttachmentPoint = 5  # MiddleCenter
             mtext.InsertionPoint = center_pt
             mtext.Layer = self.STAMP_LAYER
-            mtext.color = 7  # Explicit black
+            mtext.color = _stamp_color
 
             # --- DRAWINGS TO BE PRINTED IN COLOUR stamp (upper box) ---
             # Only draw if: (1) original DWG has no COLOUR stamp, AND
@@ -5494,8 +5499,8 @@ class IFCStampMixin:
                 pline2 = draw_space.AddLightWeightPolyline(colour_pts)
                 pline2.Closed = True
                 pline2.Layer = self.STAMP_LAYER
-                pline2.color = 7
-                pline2.ConstantWidth = _cw  # same width as AS BUILT box
+                pline2.color = _stamp_color  # same color as AS BUILT box
+                pline2.ConstantWidth = _cw   # same width as AS BUILT box
 
                 colour_center_x = (stamp_left_x + stamp_right_x) / 2.0
                 colour_center_y = (colour_bottom_y + colour_top_y) / 2.0
@@ -5508,7 +5513,7 @@ class IFCStampMixin:
                 mtext2.AttachmentPoint = 5  # MiddleCenter
                 mtext2.InsertionPoint = colour_center_pt
                 mtext2.Layer = self.STAMP_LAYER
-                mtext2.color = 7
+                mtext2.color = _stamp_color
 
             doc.Regen(1)
             if has_colour:
@@ -9634,12 +9639,13 @@ class AsBuiltManager(IFCManager):
 
     STAMP_TEXT = "{\\fArial Narrow|b1;AS BUILT}"
 
-    # Thin/hairline borders (cw=0) for BOTH AS BUILT and COLOUR boxes so the two
-    # stamps have IDENTICAL line weight — user's explicit requirement (线框粗细统一).
-    # The old pre-bot stamp used cw=2.0 (thick); the bot redraws both boxes at cw=0
-    # so they match. QA rect detection accepts stroked (non-filled) rects so thin
-    # borders are still verified — see _qa_validate_ab_pdf / _run_post_batch_qa.
-    _STAMP_CW = 0.0
+    # Stamp box style — user requirement: RED, THICK border, BOTH boxes uniform
+    # (matches gold standard BLD-003/SLD-001). cw=2.0 matches the original pre-bot
+    # stamp thickness; color=1 is AutoCAD red. Both AS BUILT and COLOUR boxes use
+    # these same values via _stamp_via_com_draw (_cw + _stamp_color), guaranteeing
+    # identical weight and color.
+    _STAMP_CW = 2.0
+    _STAMP_COLOR = 1  # AutoCAD red
 
     # AS BUILT drawings always carry the COLOUR stamp (matches gold standard
     # BLD-003/SLD-001). The source COLOUR stamp is often an inserted BLOCK that
