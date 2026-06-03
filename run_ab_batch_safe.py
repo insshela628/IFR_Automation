@@ -18,6 +18,16 @@ summary, then runs read-only PDF QA on the output folder.
 import sys, os, json, time, subprocess
 from pathlib import Path
 
+# Children emit UTF-8 (Chinese log lines). Force UTF-8 everywhere so the parent
+# can decode child stdout and print summaries without cp1252 crashes.
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
+_CHILD_ENV = dict(os.environ, PYTHONIOENCODING='utf-8')
+
 PY = r"C:\Users\jilin\AppData\Local\Programs\Python\Python312\python.exe"
 SCRIPT_DIR = r"D:\1. SOP\SOP_Stage 2 IFR Sync√\V6√"
 
@@ -83,7 +93,8 @@ def list_sources(project_path):
         "print(json.dumps([[s['doc_id'], s['ifc_source']['source_dir'].name] "
         "for s in m.scan_native_for_ab()]))"
     ) % (SCRIPT_DIR, project_path)
-    r = subprocess.run([PY, "-c", code], capture_output=True, text=True, timeout=120)
+    r = subprocess.run([PY, "-c", code], capture_output=True, text=True,
+                       encoding='utf-8', errors='replace', env=_CHILD_ENV, timeout=120)
     line = [l for l in r.stdout.splitlines() if l.startswith('[')]
     return json.loads(line[-1]) if line else []
 
@@ -115,14 +126,21 @@ def main():
 
     results = []
     for idx, (doc_id, src_name) in enumerate(sources, 1):
-        # unique substring to pin the exact scope (handles multi-scope PLN-002)
-        src_sub = src_name[:40]
+        # Pass the FULL source-dir name so multi-scope doc-ids (PLN-002 Civil /
+        # Equipment / Fencing — identical first 40 chars) are pinned exactly.
+        src_sub = src_name
         print(f"[{idx}/{len(sources)}] {doc_id} | {src_name[:50]} ...", flush=True)
+        # Fresh AutoCAD per file: chaining workers against one warm instance left
+        # COM in a dirty state and most conversions failed. Killing first makes
+        # every file run in the same clean condition as a verified single run.
+        kill_acad()
         cmd = [PY, os.path.join(SCRIPT_DIR, "run_ab_batch_safe.py"),
                "--worker", project_path, doc_id, src_sub]
         t0 = time.time()
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  encoding='utf-8', errors='replace',
+                                  env=_CHILD_ENV, timeout=timeout)
             jline = [l for l in proc.stdout.splitlines() if l.startswith('{')]
             res = json.loads(jline[-1]) if jline else {
                 "doc_id": doc_id, "src": src_sub, "ok": False,
