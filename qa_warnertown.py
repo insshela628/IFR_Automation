@@ -69,15 +69,29 @@ def qa_one(pdf):
             style_issues.append(f"P{i+1}: DUPLICATE COLOUR x{col_on_page}")
 
         boxes = _box_styles(page)
-        reds = [b for b in boxes if _is_red(b["fill"]) or _is_red(b["stroke"])]
-        if len(boxes) >= 2 and len(reds) < 2:
-            style_issues.append(
-                f"P{i+1}: {len(boxes)} boxes but only {len(reds)} RED "
-                f"(styles={boxes})")
-        # both boxes should share the same stroke width (uniform weight)
-        widths = {b["width"] for b in boxes}
-        if len(boxes) >= 2 and len(widths) > 1:
-            style_issues.append(f"P{i+1}: mismatched line weight {widths}")
+        # The standard is "the two boxes must MATCH EACH OTHER" (same colour +
+        # same weight). It is NOT "must be red": a layout plotted with a
+        # monochrome CTB renders the WHOLE drawing — stamp included — black/thin,
+        # which is a legitimate fallback. So flag INCONSISTENCY between the two
+        # boxes, not absence of red. (A surviving old stamp shows up here as
+        # one red/thick + one black/thin → mismatch → caught.)
+        if len(boxes) >= 2:
+            fills = {b["fill"] for b in boxes}
+            widths = {b["width"] for b in boxes}
+            if len(fills) > 1 or len(widths) > 1:
+                style_issues.append(
+                    f"P{i+1}: stamp boxes don't match each other "
+                    f"(fills={fills}, widths={widths}) → likely old stamp survived "
+                    f"(styles={boxes})")
+            # If the page IS colour-capable (has red elsewhere) but the stamp is
+            # black, the stamp lost its colour — a real defect (not monochrome plot).
+            page_has_red = any(
+                _is_red(g.get("fill")) or _is_red(g.get("color"))
+                for g in page.get_drawings())
+            stamp_red = any(_is_red(b["fill"]) or _is_red(b["stroke"]) for b in boxes)
+            if page_has_red and not stamp_red:
+                style_issues.append(
+                    f"P{i+1}: colour drawing but stamp is black (lost colour)")
     doc.close()
     r["issues"].extend(style_issues)
     return r
