@@ -5176,6 +5176,12 @@ class IFCStampMixin:
                                 e = block.Item(i)
                                 if e.EntityName not in _COLOUR_ENTITY_TYPES:
                                     continue
+                                # NEVER delete the bot's own freshly-drawn boxes
+                                # (AS BUILT box is on IFC_STAMP, drawn just before
+                                # this cleanup runs). Only old pre-bot borders on
+                                # other layers ('0'/'QA'/etc) should go.
+                                if e.Layer == self.STAMP_LAYER:
+                                    continue
                                 emn, emx = e.GetBoundingBox()
                                 cx = (float(emn[0]) + float(emx[0])) / 2
                                 cy = (float(emn[1]) + float(emx[1])) / 2
@@ -5208,7 +5214,8 @@ class IFCStampMixin:
                 for i in range(ss2.Count):
                     try:
                         e = ss2.Item(i)
-                        if e.EntityName in _COLOUR_ENTITY_TYPES:
+                        if e.EntityName in _COLOUR_ENTITY_TYPES \
+                                and e.Layer != self.STAMP_LAYER:
                             _to_del.append(e)
                     except Exception:
                         continue
