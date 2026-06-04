@@ -5331,56 +5331,19 @@ class IFCStampMixin:
         mtext_x = (stamp_left_x + stamp_right_x) / 2.0
         mtext_y = (stamp_bottom_y + stamp_top_y) / 2.0
 
-        # --- P2a: content-aware placement (overlap avoidance) -------------
-        # The proportional position is correct on an EMPTY frame, but drawings
-        # whose bottom-right carries content (IP tables, legends — E-BLD-003,
-        # GAD-001) get the stamp drawn ON that content ("位置乱填跟现况重合").
-        # Detection uses _check_colour_overlap over the COLOUR-box rect — the
-        # discriminating area: empty on the 21 already-correct files (→ never
-        # shifts, no regression), occupied on the flagged ones. When it overlaps,
-        # search nearby positions (down toward the title strip, then right toward
-        # the frame edge, then up) and move the WHOLE stamp group to the first
-        # clear spot inside the frame. If none is clear, keep the original
-        # position (never worse). Caveat: content shown only through a viewport
-        # is invisible to this check — those need the viewport-aware path (TODO).
-        try:
-            _cz_h   = _ref_colour_rect_h * scale
-            _cz_gap = _ref_colour_gap * scale
-            def _ovl(sl, sr, sb, st):
-                # check the COLOUR-box rect at this candidate (cb..ct above main)
-                cb = sb + rect_h + _cz_gap
-                ct = cb + _cz_h
-                return self._check_colour_overlap(doc, sl, sr, cb, ct,
-                                                  layout_name=layout_name)
-            if _ovl(stamp_left_x, stamp_right_x, stamp_bottom_y, stamp_top_y):
-                _zone_h = rect_h + _cz_gap + _cz_h
-                _step = max(rect_h * 0.6, tb_height * 0.012)
-                _cands = []
-                for _k in range(1, 10):
-                    _cands += [(0.0, -_k*_step), (_k*_step, 0.0),
-                               (_k*_step, -_k*_step), (0.0, _k*_step)]
-                _moved = False
-                for _dx, _dy in _cands:
-                    nl, nr = stamp_left_x + _dx, stamp_right_x + _dx
-                    nb = stamp_bottom_y + _dy
-                    if (nl < tb_left_x or nr > tb_right_x or nb < tb_bottom_y
-                            or nb + _zone_h > tb_top_y):
-                        continue
-                    if not _ovl(nl, nr, nb, nb + rect_h):
-                        stamp_left_x, stamp_right_x = nl, nr
-                        stamp_bottom_y = nb
-                        stamp_top_y = nb + rect_h
-                        mtext_x = (stamp_left_x + stamp_right_x) / 2.0
-                        mtext_y = (stamp_bottom_y + stamp_top_y) / 2.0
-                        print(f"    印章: 与图面内容重叠 → 平移避让 "
-                              f"(dx={_dx:.0f}, dy={_dy:.0f})")
-                        _moved = True
-                        break
-                if not _moved:
-                    print(f"    印章: 检测到重叠但邻近无空位，保持原位 [需人工检查]")
-        except Exception as _e_ovl:
-            print(f"    印章: 重叠避让检查跳过 ({_e_ovl})")
-
+        # --- P2 (stamp-vs-content overlap): left at gold-standard position ---
+        # On drawings whose bottom-right corner is full (E-BLD-003 battery table,
+        # GAD-001 legend) the stamp lands on existing content. This resisted
+        # reliable automation and is NOT auto-handled here:
+        #   - auto-SHIFT is futile — the content fills the whole corner via a
+        #     viewport, so there is no clear spot to move to;
+        #   - reading ModelSpace-through-viewport at convert time needs an
+        #     active-space toggle that was slow (649s) and broke PUBLISH (GAD-001);
+        #   - a fitz text-in-box QA heuristic mis-judged (false-positive on the
+        #     gold E-PLN-002, missed BLD-003) — worse than nothing.
+        # So the stamp stays at the proportional gold-standard position (correct
+        # for the ~21 drawings with an empty corner); the few dense-corner
+        # drawings are handled MANUALLY. See [[asbuilt-ifr-stamp-standard]].
         print(f"    印章: COM 绘制 (scale={scale:.3f}, tb={tb_width:.0f}x{tb_height:.0f}, "
               f"pos=({stamp_left_x:.1f},{stamp_bottom_y:.1f})->({stamp_right_x:.1f},{stamp_top_y:.1f}))")
 
