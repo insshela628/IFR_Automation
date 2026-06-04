@@ -35,7 +35,7 @@ SCRIPT_DIR = r"D:\1. SOP\SOP_Stage 2 IFR Sync√\V6√"
 
 # CLI convenience aliases only — run_safe_batch takes a full project_path.
 PROJECTS = {
-    "cole2": r"C:\Users\ACE\GREEN GOLD ENERGY Dropbox\Projects\Project (EPC)\1.NSW\Coleambally #2",
+    "cole2": r"C:\Users\ACE\GREEN GOLD ENERGY Dropbox\Projects\Project (EPC)\1.NSW\NSW 153 - Coleambally #2",
     "warnertown": r"C:\Users\ACE\GREEN GOLD ENERGY Dropbox\Projects\Project (EPC)\2.SA\GG-31 Warnertown BESS",
     "lms": r"C:\Users\ACE\GREEN GOLD ENERGY Dropbox\Projects\Project (EPC)\2.SA\LMS",
 }
@@ -67,11 +67,13 @@ def kill_acad(reason=""):
               flush=True)
 
 
-def _worker(project_path, doc_id, src_sub, force_rev_1=True, force_redo=True):
+def _worker(project_path, doc_id, src_sub, force_rev_1=True, force_redo=False):
     """Child: convert exactly ONE source. Prints one JSON result line.
 
-    force_rev_1: lock output to REV 1. force_redo: convert even if an AS BUILT PDF
-    already exists (bypass the incremental skip). force_rev_1 implies force_redo.
+    force_rev_1: pin output to REV 1 (overwrite — one live AB version per doc-ID).
+    force_redo: convert even if an existing AB PDF is QA-clean (override the skip).
+    Default skip policy is QA-GATED ('skip only if QA-clean'): a doc-ID is skipped
+    only when its existing AB PDF passes QA; missing/faulty → export then re-QA.
     """
     import pythoncom, logging
     logging.basicConfig(level=logging.ERROR)
@@ -91,20 +93,23 @@ def _worker(project_path, doc_id, src_sub, force_rev_1=True, force_redo=True):
             print(json.dumps({"doc_id": doc_id, "src": src_sub,
                               "ok": False, "err": "source not found"}))
             return
-        # Incremental skip (preserve batch_convert behaviour) unless forced.
-        if not (force_rev_1 or force_redo) and mgr._check_ab_incremental(target):
+        if force_rev_1:
+            target['existing_ab_rev'] = None   # pin output to REV 1 (overwrite)
+        # QA-gated skip ('skip only if QA-clean'): skip ONLY when an existing AB
+        # PDF passes QA. force_redo (or an explicit filter) overrides.
+        if not force_redo and mgr._ab_existing_pdf_qa_clean(target):
             print(json.dumps({"doc_id": doc_id, "src": src_sub,
                               "ok": True, "skipped": True}))
             return
-        if force_rev_1:
-            target['existing_ab_rev'] = None   # lock output to REV 1
         r = mgr._convert_with_qa_retry(target)
         print(json.dumps({
             "doc_id": doc_id, "src": src_sub,
             "ok": bool(r.get('success')),
             "pdf": Path(r['pdf_path']).name if r.get('pdf_path') else None,
             "errs": r.get('errors', [])[:2],
-            "qa": r.get('post_qa', [])[:3],
+            # Surface QA notes: post-batch self-check OR the per-file QA/title-block
+            # WARNs (e.g. 'AS BUILT 行人员字段全空') so a PASS-with-WARN is visible.
+            "qa": (r.get('post_qa') or r.get('qa_warnings') or [])[:3],
         }))
     finally:
         pythoncom.CoUninitialize()
@@ -126,20 +131,38 @@ def list_sources(project_path):
 
 
 def run_safe_batch(project_path, terms=None, timeout=DEFAULT_TIMEOUT,
-                   force_rev_1=False, force_redo=False, on_event=None):
+                   force_rev_1=True, force_redo=False, cleanup_native=True,
+                   on_event=None):
     """Hang-proof batch over a project. Returns a summary dict; streams per-file
     dicts to on_event(ev). Cross-project: only needs project_path.
 
     terms: substring filter (str CSV or list) — convert only matching doc-ids.
-    force_rev_1: lock output to REV 1. force_redo: ignore the incremental skip.
+    force_rev_1 (default True): pin output to REV 1 (overwrite) — one live AB
+        version per doc-ID, never an accumulating Rev.2/Rev.3.
+    force_redo: ignore the QA-clean skip and re-convert everything.
+    cleanup_native (default True): house-keep 1. Native/ ONCE up front — collapse
+        duplicate 'Rev.N - AB' subfolders + move loose AB exports to Superseded/.
+    Default skip is QA-GATED ('skip only if QA-clean'): a doc-ID is skipped only
+    when its existing AB PDF passes QA; missing/faulty → export then re-QA.
     A `terms` filter implies force_redo (you asked for those specifically).
-    on_event: {"type":"start","total"} | {"type":"file",...,"ok","pdf","qa","err",
-    "skipped","seconds"} | {"type":"done","total","ok","fail","warn","skipped"}.
+    on_event: {"type":"start","total"} | {"type":"cleanup","moved"} | {"type":
+    "file",...,"ok","pdf","qa","err","skipped","seconds"} | {"type":"done",...}.
     """
     def emit(ev):
         if on_event:
             try: on_event(ev)
             except Exception: pass
+
+    # Native AB house-keeping ONCE up front — pure filesystem, no COM, so it runs
+    # safely in this parent process (no AutoCAD). Reversible (→ Superseded/).
+    if cleanup_native:
+        try:
+            sys.path.insert(0, SCRIPT_DIR)
+            from ifr_automation_v10 import AsBuiltManager as _ABM
+            _acts = _ABM(project_path, dry_run=False).cleanup_ab_native()
+            emit({"type": "cleanup", "moved": len(_acts)})
+        except Exception as _e:
+            emit({"type": "cleanup", "moved": 0, "err": str(_e)})
 
     sources = list_sources(project_path)
     if terms:
@@ -199,26 +222,37 @@ def main():
     project = args[0] if args else "cole2"
     timeout = DEFAULT_TIMEOUT
     filt = ""
-    force_rev_1 = False
-    force_redo = False
+    force_rev_1 = True       # default: pin REV 1 (one live AB version per doc-ID)
+    force_redo = False       # default: QA-gated skip (skip only QA-clean output)
+    cleanup_native = True
     i = 1
     while i < len(args):
         if args[i] == '--timeout':
             timeout = int(args[i + 1]); i += 2
         elif args[i] == '--rev1':
             force_rev_1 = True; i += 1
+        elif args[i] == '--no-rev1':
+            force_rev_1 = False; i += 1
         elif args[i] == '--redo':
             force_redo = True; i += 1
+        elif args[i] == '--no-cleanup':
+            cleanup_native = False; i += 1
         else:
             filt = args[i]; i += 1
 
     project_path = PROJECTS.get(project, project)
     print(f"=== SAFE AS BUILT BATCH: {project} "
-          f"(per-file timeout={timeout}s, rev1={force_rev_1}) ===", flush=True)
+          f"(per-file timeout={timeout}s, rev1={force_rev_1}, redo={force_redo}) ===",
+          flush=True)
 
     def on_event(ev):
         if ev["type"] == "start":
             print(f"Sources to convert: {ev['total']}", flush=True)
+        elif ev["type"] == "cleanup":
+            if ev.get('err'):
+                print(f"[Native 清理] 跳过: {ev['err']}", flush=True)
+            else:
+                print(f"[Native 清理] {ev['moved']} 项移入 Superseded/", flush=True)
         elif ev["type"] == "file":
             if ev.get('skipped'):
                 tag = "SKIP"
@@ -241,7 +275,7 @@ def main():
                   flush=True)
 
     summary = run_safe_batch(project_path, filt or None, timeout,
-                             force_rev_1, force_redo, on_event)
+                             force_rev_1, force_redo, cleanup_native, on_event)
     for r in summary["results"]:
         if not r.get('ok'):
             print(f"  FAIL {r['doc_id']}: {r.get('err') or r.get('errs')}", flush=True)

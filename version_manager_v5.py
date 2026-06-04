@@ -493,6 +493,13 @@ _RE_IFR = re.compile(
     r'[_\s-](?:[Rr]ev|[Rr])([A-Z])(?=[_.\s]|$)',
     re.IGNORECASE
 )
+# AS BUILT marker: '_AB' / '-AB' / ' AB' (optionally '-exp') or 'AS BUILT'.
+# Checked BEFORE IFC/IFR so an AS BUILT file like '...Rev1...-AB.dwg' is NOT
+# misclassified as IFC and renamed to _IFC (brownfield LMS hazard).
+_RE_AB = re.compile(
+    r'(?:[_\s-]AB(?:[_\s-]?exp)?(?=[_.\s-]|$)|AS[_\s-]?BUILT)',
+    re.IGNORECASE
+)
 
 
 @dataclass
@@ -511,6 +518,8 @@ class DwgFile:
             return f"Rev{self.revision}"
         elif self.rev_type == 'IFC':
             return f"Rev{self.revision}_IFC"
+        elif self.rev_type == 'AB':
+            return f"Rev{self.revision}_AB" if self.revision else "AS BUILT"
         return "no-rev"
 
 
@@ -545,11 +554,21 @@ class NativeFolderResult:
     kept_ifc: Optional[DwgFile] = None
     kept_ifr_all: List[DwgFile] = field(default_factory=list)  # v5.0: 每种扩展名的最新 IFR
     kept_ifc_all: List[DwgFile] = field(default_factory=list)  # v5.0: 每种扩展名的最新 IFC
+    ab_files: List[DwgFile] = field(default_factory=list)      # v5.1: AS BUILT (never renamed)
 
 
 def _classify_dwg(filename: str) -> Tuple[str, str]:
-    """Classify a filename as IFR, IFC, or OTHER."""
+    """Classify a filename as AB (AS BUILT), IFR, IFC, or OTHER.
+
+    AB is checked FIRST: AS BUILT deliverables often carry a numeric 'Rev<n>'
+    that would otherwise match the IFC pattern, causing them to be renamed to
+    '_IFC' (corrupting the deliverable). AB files are kept out of the IFR/IFC
+    rename+supersede logic entirely.
+    """
     stem = Path(filename).stem
+    if _RE_AB.search(stem):
+        mr = re.search(r'[_\s-](?:[Rr]ev|[Rr])\s*(\d+)', stem)
+        return ('AB', mr.group(1) if mr else '')
     m = _RE_IFC.search(stem)
     if m:
         return ('IFC', m.group(1))
@@ -588,6 +607,22 @@ def _make_standard_dwg_name(doc_id: str, description: str, rev_type: str,
     return f"{doc_id}_{description}_Rev{revision.upper()}{ext}"
 
 
+def _belongs_to_doc(filename: str, doc_id: Optional[str]) -> bool:
+    """True if filename plausibly belongs to doc_id. Used to AVOID moving foreign
+    base/survey XREF drawings (e.g. 'BaseDrawings.dwg', '53666-...-SV-...dwg') out
+    of a doc folder — relocating an active XREF target breaks the host's xref link.
+    Conservative: unknown doc_id → treat as foreign (don't move)."""
+    if not doc_id:
+        return False
+    stem = Path(filename).stem.lower()
+    did = doc_id.lower()
+    if did in stem:
+        return True
+    # also accept the discipline-seq tail, e.g. 'ga-001' from '50023-ga-001'
+    m = re.search(r'([a-z]{1,3}-?\d{3})$', did)
+    return bool(m and m.group(1) in stem)
+
+
 def _to_long_path(path: Path) -> Path:
     """Convert path to long path format on Windows (>260 char support)."""
     if os.name == 'nt':
@@ -601,9 +636,14 @@ def _to_long_path(path: Path) -> Path:
 class NativeVersionManager:
     """Manage file versions across Native, Reports, and Schedule folders (v3.0)."""
 
-    def __init__(self, project_path: str, dry_run: bool = True):
+    def __init__(self, project_path: str, dry_run: bool = True,
+                 ifc_folder_mode: bool = False):
         self.project_path = Path(project_path)
         self.dry_run = dry_run
+        # v5.1 (SSOT mainv3 §4.1, 2026-06-04 milestone-folder convention):
+        # when True, older IFC versions go to a dedicated 'IFC/' subfolder
+        # (not 'SS/'), and AS BUILT files are routed to 'Rev.{N} - AB/'.
+        self.ifc_folder_mode = ifc_folder_mode
         self.results: List[Tuple[str, NativeFolderResult]] = []
 
     @property
@@ -765,8 +805,12 @@ class NativeVersionManager:
 
         ifr_files = [f for f in files if f.rev_type == 'IFR']
         ifc_files = [f for f in files if f.rev_type == 'IFC']
+        ab_files = [f for f in files if f.rev_type == 'AB']
         other_files = [f for f in files if f.rev_type == 'OTHER']
+        result.ab_files = ab_files
         ss_folder = self._find_or_create_ss_folder(folder)  # v3.0: 自动检测
+        # v5.1: in milestone-folder mode, older IFC → dedicated 'IFC/' subfolder
+        ifc_dest = (folder / 'IFC') if self.ifc_folder_mode else ss_folder
 
         # v5.0: IFR — 按扩展名分组，每组保留 mtime 最新的文件
         if ifr_files:
@@ -790,21 +834,33 @@ class NativeVersionManager:
                 group_sorted = sorted(group, key=lambda f: f.mtime, reverse=True)
                 result.kept_ifc_all.append(group_sorted[0])
                 for old in group_sorted[1:]:
-                    self._plan_move(result, old, ss_folder, "older IFC revision")
+                    action_type = 'move_to_ifc' if self.ifc_folder_mode else 'move_to_ss'
+                    self._plan_move(result, old, ifc_dest, "older IFC revision",
+                                    action_type=action_type)
             result.kept_ifc = max(result.kept_ifc_all, key=lambda f: f.mtime)
+
+        # v5.1: AS BUILT — never renamed/superseded. In milestone-folder mode,
+        # route to the per-drawing 'Rev.{N} - AB/' folder; otherwise leave in place.
+        if ab_files and self.ifc_folder_mode:
+            ab_folder = self._ab_folder_path(folder, ab_files)
+            for ab in ab_files:
+                self._plan_move(result, ab, ab_folder, "AS BUILT -> AB folder",
+                                action_type='move_to_ab')
 
         # v5.0: OTHER — 仅当存在同扩展名的版本化文件时才移到 SS
         # (保护唯一的辅助计算文件如 Calculation.xlsx)
+        # v5.1: 额外保护 — 不搬不属于本 doc-id 的文件 (base/survey XREF 底图，
+        #       搬走会断 xref 链接，如 'BaseDrawings.dwg' / '53666-...-SV-...dwg')
         for other in other_files:
             ext = other.path.suffix.lower()
             has_versioned_same_ext = any(
                 f.path.suffix.lower() == ext and f.rev_type != 'OTHER'
                 for f in files
             )
-            if has_versioned_same_ext:
+            if has_versioned_same_ext and _belongs_to_doc(other.filename, doc_id):
                 self._plan_move(result, other, ss_folder, "unversioned/legacy (versioned copy exists)")
 
-        # v5.0: 对所有保留的文件执行重命名（不只是主文件）
+        # v5.0: 对所有保留的文件执行重命名（不只是主文件）。AS BUILT 不在此列表，永不改名。
         if doc_id and description:
             for kept in result.kept_ifr_all:
                 self._plan_rename(result, kept, doc_id, description)
@@ -813,16 +869,30 @@ class NativeVersionManager:
 
         return result
 
+    @staticmethod
+    def _ab_folder_path(folder: Path, ab_files: List[DwgFile]) -> Path:
+        """Return the per-drawing AS BUILT folder: reuse an existing 'Rev.* - AB'
+        if present, else default to 'Rev.{N} - AB' (N = AS BUILT rev, default 1)."""
+        try:
+            for item in folder.iterdir():
+                if item.is_dir() and re.match(r'rev\.?\s*\d+\s*-\s*ab$', item.name, re.IGNORECASE):
+                    return item
+        except (OSError, PermissionError):
+            pass
+        revs = [f.revision for f in ab_files if f.revision]
+        n = revs[0] if revs else '1'
+        return folder / f"Rev.{n} - AB"
+
     def _plan_move(self, result: NativeFolderResult, dwg: DwgFile,
-                   ss_folder: Path, reason: str):
+                   dest_folder: Path, reason: str, action_type: str = 'move_to_ss'):
         result.actions.append(NativeFileAction(
-            source=dwg.path, dest=ss_folder / dwg.filename,
-            action='move_to_ss', reason=reason
+            source=dwg.path, dest=dest_folder / dwg.filename,
+            action=action_type, reason=reason
         ))
         if dwg.bak_path and dwg.bak_path.exists():
             result.actions.append(NativeFileAction(
-                source=dwg.bak_path, dest=ss_folder / dwg.bak_path.name,
-                action='move_to_ss', reason=f".bak follows {dwg.filename}"
+                source=dwg.bak_path, dest=dest_folder / dwg.bak_path.name,
+                action=action_type, reason=f".bak follows {dwg.filename}"
             ))
 
     def _plan_rename(self, result: NativeFolderResult, dwg: DwgFile,
@@ -881,6 +951,18 @@ class NativeVersionManager:
                 # Update move destinations to use the detected ss_folder
                 for action in moves:
                     action.dest = ss_folder / action.source.name
+
+            # v5.1: ensure IFC/ and Rev.N-AB/ destination dirs exist (not redirected)
+            for action in result.actions:
+                if action.action in ('move_to_ifc', 'move_to_ab'):
+                    try:
+                        _to_long_path(action.dest.parent).mkdir(parents=True, exist_ok=True)
+                    except (OSError, PermissionError):
+                        try:
+                            action.dest.parent.mkdir(parents=True, exist_ok=True)
+                        except Exception as e:
+                            print(f"      [!] 无法创建 {action.dest.parent.name}: {e}")
+                            stats['errors'] += 1
 
             for action in result.actions:
                 try:
@@ -1729,6 +1811,9 @@ def main():
     parser.add_argument('--scope', type=str, default='all',
                         choices=['native', 'reports', 'schedule', 'all'],
                         help='扫描范围 (默认 all)')
+    parser.add_argument('--ifc-folder', action='store_true',
+                        help='v5.1 milestone 分筐 (SSOT §4.1): 旧 IFC → IFC/ (而非 SS/), '
+                             'AS BUILT → Rev.N - AB/。默认关闭 (维持旧 SS/ 行为)')
 
     # If no args, run interactive mode
     if len(sys.argv) == 1:
@@ -1819,7 +1904,11 @@ def main():
         print(f"  项目: {project_path.name}")
         print(f"{'=' * 70}")
 
-        mgr = NativeVersionManager(str(project_path), dry_run=dry_run)
+        mgr = NativeVersionManager(str(project_path), dry_run=dry_run,
+                                   ifc_folder_mode=args.ifc_folder)
+        if args.ifc_folder:
+            print("  [v5.1] milestone 分筐模式: 旧 IFC → IFC/, AS BUILT → Rev.N - AB/, "
+                  "AS BUILT 永不改名, 跳过 xref 底图")
 
         results = mgr.process_all(folder_filter=args.folder, scope=args.scope)
         if not results:
@@ -1843,6 +1932,9 @@ def main():
                     print(f"      [保留 IFR] {kept.filename}")
                 for kept in result.kept_ifc_all:
                     print(f"      [保留 IFC] {kept.filename}")
+                if not mgr.ifc_folder_mode:
+                    for ab in result.ab_files:
+                        print(f"      [保留 AS BUILT] {ab.filename}")
                 for action in result.actions:
                     if action.action == 'rename':
                         print(f"      [重命名] {action.source.name} -> {action.dest.name}")
@@ -1850,8 +1942,10 @@ def main():
                         print(f"      [->{action.dest.parent.name}/] {action.source.name}")
 
         renames = sum(1 for _, r in results for a in r.actions if a.action == 'rename')
-        moves = sum(1 for _, r in results for a in r.actions if a.action == 'move_to_ss')
-        print(f"\n  汇总: {renames} 重命名, {moves} 移动到 SS/")
+        ss_n  = sum(1 for _, r in results for a in r.actions if a.action == 'move_to_ss')
+        ifc_n = sum(1 for _, r in results for a in r.actions if a.action == 'move_to_ifc')
+        ab_n  = sum(1 for _, r in results for a in r.actions if a.action == 'move_to_ab')
+        print(f"\n  汇总: {renames} 重命名, {ss_n} →SS/, {ifc_n} →IFC/, {ab_n} →Rev.N-AB/")
 
         if not dry_run and total_actions > 0:
             confirm = input("\n  确认执行? 输入 'YES': ").strip()

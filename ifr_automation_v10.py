@@ -5331,6 +5331,56 @@ class IFCStampMixin:
         mtext_x = (stamp_left_x + stamp_right_x) / 2.0
         mtext_y = (stamp_bottom_y + stamp_top_y) / 2.0
 
+        # --- P2a: content-aware placement (overlap avoidance) -------------
+        # The proportional position is correct on an EMPTY frame, but drawings
+        # whose bottom-right carries content (IP tables, legends — E-BLD-003,
+        # GAD-001) get the stamp drawn ON that content ("位置乱填跟现况重合").
+        # Detection uses _check_colour_overlap over the COLOUR-box rect — the
+        # discriminating area: empty on the 21 already-correct files (→ never
+        # shifts, no regression), occupied on the flagged ones. When it overlaps,
+        # search nearby positions (down toward the title strip, then right toward
+        # the frame edge, then up) and move the WHOLE stamp group to the first
+        # clear spot inside the frame. If none is clear, keep the original
+        # position (never worse). Caveat: content shown only through a viewport
+        # is invisible to this check — those need the viewport-aware path (TODO).
+        try:
+            _cz_h   = _ref_colour_rect_h * scale
+            _cz_gap = _ref_colour_gap * scale
+            def _ovl(sl, sr, sb, st):
+                # check the COLOUR-box rect at this candidate (cb..ct above main)
+                cb = sb + rect_h + _cz_gap
+                ct = cb + _cz_h
+                return self._check_colour_overlap(doc, sl, sr, cb, ct,
+                                                  layout_name=layout_name)
+            if _ovl(stamp_left_x, stamp_right_x, stamp_bottom_y, stamp_top_y):
+                _zone_h = rect_h + _cz_gap + _cz_h
+                _step = max(rect_h * 0.6, tb_height * 0.012)
+                _cands = []
+                for _k in range(1, 10):
+                    _cands += [(0.0, -_k*_step), (_k*_step, 0.0),
+                               (_k*_step, -_k*_step), (0.0, _k*_step)]
+                _moved = False
+                for _dx, _dy in _cands:
+                    nl, nr = stamp_left_x + _dx, stamp_right_x + _dx
+                    nb = stamp_bottom_y + _dy
+                    if (nl < tb_left_x or nr > tb_right_x or nb < tb_bottom_y
+                            or nb + _zone_h > tb_top_y):
+                        continue
+                    if not _ovl(nl, nr, nb, nb + rect_h):
+                        stamp_left_x, stamp_right_x = nl, nr
+                        stamp_bottom_y = nb
+                        stamp_top_y = nb + rect_h
+                        mtext_x = (stamp_left_x + stamp_right_x) / 2.0
+                        mtext_y = (stamp_bottom_y + stamp_top_y) / 2.0
+                        print(f"    印章: 与图面内容重叠 → 平移避让 "
+                              f"(dx={_dx:.0f}, dy={_dy:.0f})")
+                        _moved = True
+                        break
+                if not _moved:
+                    print(f"    印章: 检测到重叠但邻近无空位，保持原位 [需人工检查]")
+        except Exception as _e_ovl:
+            print(f"    印章: 重叠避让检查跳过 ({_e_ovl})")
+
         print(f"    印章: COM 绘制 (scale={scale:.3f}, tb={tb_width:.0f}x{tb_height:.0f}, "
               f"pos=({stamp_left_x:.1f},{stamp_bottom_y:.1f})->({stamp_right_x:.1f},{stamp_top_y:.1f}))")
 
@@ -9738,6 +9788,27 @@ class AsBuiltManager(IFCManager):
         "1. Drawings/6.AS Built",
     ]
 
+    # Extra roots scanned for AS BUILT IN ADDITION to native_root. Some native
+    # drawing DWGs (e.g. the Civil/Structure foundation plans) do NOT live in
+    # `1. Native/` — they sit inside their per-report doc-ID folder under
+    # `2. Calcs & Reports/Reports/...`. For these the doc-ID + description come
+    # from the DWG FILENAME, not the folder name: the folder is named by the
+    # REPORT doc-ID but the DWG by the DRAWING doc-ID and they differ
+    # (e.g. folder GG31-C-RPT-001 holds drawing GG31-C-PLN-006). Each entry is a
+    # project-relative path; missing paths are silently skipped (cross-project).
+    # Both folder layouts: `Design/Engineering/` prefix (Warnertown/LMS/Cole2) and
+    # flat `1. Drawings/`-style projects (Tatua) — mirrors _NATIVE_CANDIDATES.
+    # Non-existent paths are silently skipped, so listing both is safe and makes
+    # the rule universal for any future project created via /new_project (which,
+    # per SSOT mainv3.md rule 2b, files foundation/structural Civil drawings into
+    # Reports/Civil & Structure rather than 1. Native).
+    _EXTRA_DRAWING_SOURCES = [
+        "Design/Engineering/2. Calcs & Reports/Reports/Civil & Structure",
+        "Design/Engineering/2. Calcs & Reports/Reports/Electrical",
+        "2. Calcs & Reports/Reports/Civil & Structure",
+        "2. Calcs & Reports/Reports/Electrical",
+    ]
+
     _SAME_DIR_AB_OUTPUTS = {
         "Design/Engineering/1. Drawings/5. As Built",
     }
@@ -9836,6 +9907,75 @@ class AsBuiltManager(IFCManager):
                 'description': description,
             })
 
+        # Drawings that live inside report folders (Calcs & Reports) — not in
+        # 1. Native/. Appended AFTER the native scan; deduped against doc-IDs the
+        # native scan already produced so a drawing present in both is converted
+        # once (native wins).
+        seen = {r['doc_id'].upper() for r in results}
+        results.extend(self._scan_report_drawings_for_ab(existing_ab, seen))
+
+        return results
+
+    def _scan_report_drawings_for_ab(self, existing_ab: Dict[str, int],
+                                     seen_doc_ids: set) -> List[Dict]:
+        """Scan `_EXTRA_DRAWING_SOURCES` report folders for native drawing DWGs.
+
+        Unlike `1. Native/`, the folder here is named by the REPORT doc-ID while
+        the drawing DWG inside carries the DRAWING doc-ID (e.g. folder
+        GG31-C-RPT-001 holds GG31-C-PLN-006_..._Rev0_IFC.dwg). So doc-ID and
+        description are parsed from the DWG FILENAME, not the folder. One report
+        folder may hold drawings for >1 doc-ID → emitted as separate entries
+        (grouped by drawing doc-ID; same doc-ID across sheets stays one entry).
+        Output still routes through the normal subfolder-mode path: the AB DWG
+        lands in a `Rev.N - AB/` subfolder of the report folder, the PDF in the
+        shared AB output dir.
+        """
+        results: List[Dict] = []
+        for rel in self._EXTRA_DRAWING_SOURCES:
+            root = self.project_path / rel
+            if not root.exists():
+                continue
+            for item in sorted(root.iterdir()):
+                if not item.is_dir():
+                    continue
+                if item.name.lower() in ('ss', 'superseded', 'superceded',
+                                          'appendix', 'template', 'templates'):
+                    continue
+
+                ifc_source = self._find_latest_ifc_source(item)
+                if ifc_source is None:
+                    continue
+
+                # Group the chosen-rev DWGs by the DRAWING doc-ID (the folder's
+                # doc-ID is the report's, which differs from the drawing's).
+                groups: Dict[str, List[Path]] = {}
+                names: Dict[str, str] = {}
+                for p in ifc_source['dwg_paths']:
+                    did = _extract_doc_id_standalone(p.name)
+                    if not did:
+                        print(f"  ⚠ 报告图纸 doc-ID 无法识别，跳过: {p.name}")
+                        continue
+                    key = did.upper()
+                    groups.setdefault(key, []).append(p)
+                    names.setdefault(key, did)
+
+                for key, paths in groups.items():
+                    doc_id = names[key]
+                    if key in seen_doc_ids:
+                        continue  # already covered by 1. Native scan
+                    _, description = _parse_folder_name(paths[0].stem)
+                    sub_source = dict(ifc_source)
+                    sub_source['dwg_paths'] = sorted(paths, key=lambda p: p.name)
+                    sub_source['is_multi_page'] = len(paths) > 1
+                    results.append({
+                        'doc_id': doc_id,
+                        'folder': item,
+                        'ifc_source': sub_source,
+                        'existing_ab_rev': existing_ab.get(doc_id),
+                        'description': description,
+                    })
+                    seen_doc_ids.add(key)
+
         return results
 
     def _find_latest_ifc_source(self, doc_folder: Path) -> Optional[Dict]:
@@ -9853,8 +9993,21 @@ class AsBuiltManager(IFCManager):
         # numeric revisions without being IFC files (e.g. "Rev 5 - POWER STATION...").
         flat_ifc = {}  # rev_num -> [paths]
         try:
-            for f in doc_folder.iterdir():
-                if not f.is_file() or f.suffix.lower() != '.dwg':
+            # os.scandir (dirent-based is_file) instead of Path.iterdir()+is_file():
+            # Path.is_file() does a full os.stat() on the entry's FULL path, which
+            # FAILS (FileNotFoundError → is_file()==False) when that path exceeds
+            # Windows MAX_PATH (260). These report-folder DWGs sit at 260-290 chars
+            # (deep Dropbox tree + long RPT folder + long description), so
+            # iterdir()+is_file() silently HID them from the scan. scandir reads the
+            # directory entry (dirent) without re-stat'ing the long path, so is_file
+            # is correct regardless of length. (The long path is also why AutoCAD
+            # COM Open fails — handled by _shortpath_open_target.) Cross-project: any
+            # native DWG on a >260-char path used to be invisible to AS BUILT/IFC.
+            for _entry in os.scandir(doc_folder):
+                if not _entry.is_file():
+                    continue
+                f = Path(_entry.path)
+                if f.suffix.lower() != '.dwg':
                     continue
                 if f.name.startswith('~$'):
                     continue
@@ -9901,9 +10054,10 @@ class AsBuiltManager(IFCManager):
                     rev_num = ord(rev_str.upper()) - ord('A')
 
                 dwgs = []
-                for f in d.iterdir():
-                    if f.is_file() and f.suffix.lower() == '.dwg' and not f.name.startswith('~$'):
-                        dwgs.append(f)
+                for _e in os.scandir(d):  # dirent-based — see flat-scan note re: MAX_PATH
+                    if (_e.is_file() and _e.name.lower().endswith('.dwg')
+                            and not _e.name.startswith('~$')):
+                        dwgs.append(Path(_e.path))
                 if dwgs:
                     nested_ifc.append((d, rev_num, sorted(dwgs, key=lambda p: p.name)))
         except (OSError, PermissionError):
@@ -9960,6 +10114,163 @@ class AsBuiltManager(IFCManager):
                     ab_revs[doc_id] = rev_num
         return ab_revs
 
+    # ── AS BUILT native house-keeping ────────────────────────────────────
+
+    # An AS BUILT subfolder inside a doc-ID folder, e.g. 'Rev.1 - AB', 'Rev1 AB',
+    # 'Rev.A - AB'. The designated home for the converted AB DWG (subfolder mode).
+    _RE_AB_SUBFOLDER = re.compile(r'^Rev\.?\s*(\d+|[A-Z])\s*[-–]?\s*AB$',
+                                  re.IGNORECASE)
+
+    @staticmethod
+    def _is_ab_named(stem: str) -> bool:
+        """True if a filename stem looks like an AS BUILT export (not IFC/IFR).
+
+        Matches '..._AsBuilt', '..._AS BUILT', '..._AS_BUILT', or trailing '_AB'.
+        Used to spot loose AB files that escaped the designated Rev.N - AB/ home.
+        """
+        u = stem.upper()
+        return ('ASBUILT' in u or 'AS BUILT' in u or 'AS_BUILT' in u
+                or u.endswith('_AB'))
+
+    @staticmethod
+    def _ab_rev_key(rev_str: Optional[str]) -> int:
+        """Sort key for an AB rev token ('1','A',...). Lower = earlier/first."""
+        if not rev_str:
+            return 0
+        rev_str = rev_str.strip()
+        if rev_str.isdigit():
+            return int(rev_str)
+        return ord(rev_str.upper()) - ord('A')
+
+    def _ab_superseded_dir(self, doc_folder: Path) -> Path:
+        """Existing Superseded/SS folder inside a doc-ID folder, or default path."""
+        try:
+            for item in doc_folder.iterdir():
+                if item.is_dir() and item.name.lower() in (
+                        'superseded', 'superceded', 'ss'):
+                    return item
+        except (OSError, PermissionError):
+            pass
+        return doc_folder / 'Superseded'
+
+    def _move_to_ss(self, src: Path, ss_dir: Path) -> bool:
+        """Move a stray file/dir into ss_dir (reversible). Dropbox/long-path safe."""
+        try:
+            to_long_path(ss_dir).mkdir(parents=True, exist_ok=True)
+            dest = ss_dir / src.name
+            if to_long_path(dest).exists():
+                stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                dest = ss_dir / f"{src.stem}_{stamp}{src.suffix}"
+            shutil.move(str(to_long_path(src)), str(to_long_path(dest)))
+            return True
+        except Exception as e:
+            logging.warning(f"[AB-cleanup] 移动失败 {src.name}: {e}")
+            return False
+
+    def cleanup_ab_native(self, report_only: bool = False) -> List[Dict]:
+        """House-keep AS BUILT artefacts inside 1. Native/ doc-ID folders.
+
+        Cross-project rule: a doc-ID keeps ONE live AS BUILT version — the first
+        rev in its designated 'Rev.N - AB/' subfolder — and the doc-ID folder
+        carries no loose AB exports. This collects the junk left over while the
+        script was being refined:
+          1. MULTIPLE 'Rev.N - AB' subfolders → keep the lowest rev, move the
+             higher ones to the doc-ID folder's Superseded/.
+          2. Loose AS BUILT files ('..._AsBuilt.dwg', '..._AsBuilt.dwg.dxf',
+             '..._AB.dwg', etc.) sitting directly in the doc-ID folder (outside
+             any 'Rev.N - AB/') → move to Superseded/.
+
+        Deliberately conservative w.r.t. the user's "there may be special cases"
+        note: a LONE AB subfolder is kept as-is whatever its rev (a special-case
+        'For Construction' rev continuation is therefore never clobbered); only
+        DUPLICATES are collapsed. Everything is MOVED (reversible), never deleted.
+        Pure filesystem work — no AutoCAD/COM. Returns a list of action dicts.
+        """
+        actions: List[Dict] = []
+        native = self.native_root
+        if not native.exists():
+            return actions
+
+        for doc_folder in sorted(native.iterdir()):
+            if not doc_folder.is_dir():
+                continue
+            if doc_folder.name.lower() in ('ss', 'superseded', 'superceded'):
+                continue
+            doc_id, _ = _parse_folder_name(doc_folder.name)
+            if not doc_id or not re.search(r'-\d{2,3}', doc_id):
+                continue
+
+            try:
+                children = list(doc_folder.iterdir())
+            except (OSError, PermissionError):
+                continue
+
+            ss_dir = self._ab_superseded_dir(doc_folder)
+
+            # 1. Collapse multiple 'Rev.N - AB' subfolders → keep the lowest rev.
+            ab_subs = []  # (rev_key, path)
+            for child in children:
+                if not child.is_dir():
+                    continue
+                m = self._RE_AB_SUBFOLDER.match(child.name)
+                if m:
+                    ab_subs.append((self._ab_rev_key(m.group(1)), child))
+            if len(ab_subs) > 1:
+                ab_subs.sort(key=lambda t: t[0])
+                keep = ab_subs[0][1]
+                for _key, extra in ab_subs[1:]:
+                    moved = True if report_only else self._move_to_ss(extra, ss_dir)
+                    actions.append({'doc_id': doc_id, 'kind': 'extra_ab_rev',
+                                    'path': str(extra), 'kept': keep.name,
+                                    'moved': moved})
+
+            # 2. Move loose AS BUILT files (outside any Rev.N - AB/ subfolder).
+            for child in children:
+                if not child.is_file() or child.name.startswith('~$'):
+                    continue
+                if not self._is_ab_named(child.stem):
+                    continue
+                moved = True if report_only else self._move_to_ss(child, ss_dir)
+                actions.append({'doc_id': doc_id, 'kind': 'stray_ab_file',
+                                'path': str(child), 'moved': moved})
+
+        return actions
+
+    def _ab_existing_pdf_qa_clean(self, dwg_info: Dict) -> bool:
+        """Incremental-skip gate: True iff an existing AS BUILT PDF for this
+        doc-ID is present AND passes QA.
+
+        This is the 'skip only if QA-clean' policy: a clean prior export is NOT
+        re-converted, but a missing OR QA-faulty PDF returns False → the doc-ID
+        is re-exported and then re-QA'd. 'Export first, then QA' therefore still
+        holds for everything that actually needs producing.
+        """
+        doc_id = dwg_info['doc_id']
+        ab_dir = self.ab_output
+        if not ab_dir.exists():
+            return False
+        target = None
+        try:
+            for f in ab_dir.iterdir():
+                if not f.is_file() or f.suffix.lower() != '.pdf':
+                    continue
+                fid = _extract_doc_id_standalone(f.name)
+                if fid and fid.upper() == doc_id.upper():
+                    su = f.stem.upper()
+                    if ('_AS BUILT' in su or '_AS_BUILT' in su
+                            or '_ASBUILT' in su):
+                        target = f
+                        break
+        except (OSError, PermissionError):
+            return False
+        if target is None:
+            return False
+        # QA the existing PDF. _qa_validate_ab_pdf returns [] when fitz is
+        # unavailable; in that case we cannot verify, so this degrades to the
+        # plain presence check (old incremental behaviour) rather than blocking.
+        warnings = self._qa_validate_ab_pdf(target, doc_id, expected_pages=None)
+        return not warnings
+
     # ── Filename builders ────────────────────────────────────────────────
 
     def _build_ab_pdf_filename(self, doc_id: str, description: str, ab_rev: int) -> str:
@@ -9992,9 +10303,19 @@ class AsBuiltManager(IFCManager):
 
         all_suffixes = ['REV', 'DATE', 'DESCRIPTION'] + self.PERSONNEL_TAGS
 
+        # Detect the ACTUAL number of revision rows in THIS title block — do NOT
+        # trust self.REV_ROWS (a class default of 6). The Coleambally `Coleamablly`
+        # frame has only 4 rows; with the 6-default, a full 4-row TB computed
+        # target_row=5, the '5 > 6' full-check stayed False, and the write targeted
+        # nonexistent '5REV'/'5DESIGNED' tags → AS BUILT row SILENTLY not written
+        # (root cause of "四行版本占满后 title block 没更新"). Scan a generous range
+        # so we adapt whether the frame has 4, 6, or more rows.
+        tb_rows = max((n for n in range(1, 13) if f"{n}REV" in attrs),
+                      default=self.REV_ROWS)
+
         last_occupied_row = 0
         existing_ab_row = 0
-        for row_num in range(1, self.REV_ROWS + 1):
+        for row_num in range(1, tb_rows + 1):
             rev_tag = f"{row_num}REV"
             desc_tag = f"{row_num}DESCRIPTION"
             if rev_tag not in attrs:
@@ -10015,14 +10336,14 @@ class AsBuiltManager(IFCManager):
         else:
             target_row = last_occupied_row + 1
 
-        if target_row > self.REV_ROWS:
+        if target_row > tb_rows:
             # Revision rows FULL → rolling history (bottom-to-top = old-to-new):
             # drop the oldest (row 1), shift rows 2..N DOWN into 1..N-1, then write
-            # AS BUILT into the top row (REV_ROWS, newest). Preserves chronology;
+            # AS BUILT into the top row (tb_rows, newest). Preserves chronology;
             # only the oldest revision rolls off. (User-confirmed behavior.)
-            print(f"    版本行已满({self.REV_ROWS}行) → 滚动:丢弃最旧Rev行1,"
-                  f"行2..{self.REV_ROWS}整体下移,AS BUILT写入最上行{self.REV_ROWS}")
-            for dest in range(1, self.REV_ROWS):
+            print(f"    版本行已满({tb_rows}行) → 滚动:丢弃最旧Rev行1,"
+                  f"行2..{tb_rows}整体下移,AS BUILT写入最上行{tb_rows}")
+            for dest in range(1, tb_rows):
                 src = dest + 1
                 for suffix in all_suffixes:
                     d_tag = f"{dest}{suffix}"
@@ -10031,7 +10352,7 @@ class AsBuiltManager(IFCManager):
                         sval = (self._safe_get_text(attrs[s_tag]).strip()
                                 if s_tag in attrs else '')
                         self._safe_set_text(attrs[d_tag], sval)
-            target_row = self.REV_ROWS
+            target_row = tb_rows
 
         # Clean up duplicate AB rows above target_row (idempotent safety)
         for row_num in range(1, target_row):
@@ -10073,7 +10394,54 @@ class AsBuiltManager(IFCManager):
         # (the source had none, or _read_latest_ifr_row backfill regressed).
         if _personnel_written == 0:
             warnings.append("AS BUILT 行人员字段全空 (检查源版本行/回退)")
+
+        # Column alignment: some title-block definitions place the AS BUILT row's
+        # attribute slots at a slightly different X than the rows above (Warnertown
+        # PLN-010: row-5 PROJECT at X=286.6 vs rows 1-4 at X=281.8 → "GG31" sat
+        # crooked, shifted right). Copy each written attribute's horizontal
+        # position from the row directly below so every revision-table column
+        # stays vertically straight. No-op for already-aligned columns.
+        ref_row = target_row - 1
+        if ref_row >= 1:
+            for suffix in all_suffixes:
+                t_tag = f"{target_row}{suffix}"
+                r_tag = f"{ref_row}{suffix}"
+                if t_tag in attrs and r_tag in attrs:
+                    self._align_attr_x(attrs[t_tag], attrs[r_tag])
         return warnings
+
+    def _align_attr_x(self, target_attr, ref_attr):
+        """Copy ref_attr's horizontal position (InsertionPoint.X and
+        TextAlignmentPoint.X) onto target_attr, preserving target's own Y/Z.
+
+        Keeps a revision-table column visually straight when the block definition
+        placed a row's attribute slot at a different X than the rows above.
+        Best-effort + cosmetic: any COM failure is swallowed so it can never break
+        a conversion. Update() re-evaluates the attribute so the move renders.
+        """
+        import pythoncom as _pc
+        def _set_x(getter, setter):
+            try:
+                ref = self._com_retry(getter[0])
+                tgt = self._com_retry(getter[1])
+                if ref is None or tgt is None:
+                    return
+                if abs(float(ref[0]) - float(tgt[0])) < 1e-6:
+                    return  # already aligned — skip the COM write
+                v = win32com.client.VARIANT(
+                    _pc.VT_ARRAY | _pc.VT_R8,
+                    [float(ref[0]), float(tgt[1]), float(tgt[2])])
+                self._com_retry(lambda: setter(v))
+            except Exception:
+                pass
+        _set_x((lambda: ref_attr.InsertionPoint, lambda: target_attr.InsertionPoint),
+               lambda v: setattr(target_attr, 'InsertionPoint', v))
+        _set_x((lambda: ref_attr.TextAlignmentPoint, lambda: target_attr.TextAlignmentPoint),
+               lambda v: setattr(target_attr, 'TextAlignmentPoint', v))
+        try:
+            self._com_retry(lambda: target_attr.Update())
+        except Exception:
+            pass
 
     # ── Stamp removal (LMS-enhanced) ────────────────────────────────────
 
@@ -10373,6 +10741,55 @@ class AsBuiltManager(IFCManager):
 
     # ── Single DWG conversion ────────────────────────────────────────────
 
+    def _shortpath_open_target(self, dwg_path: Path):
+        r"""Return (open_path:str, cleanup:callable) for AutoCAD COM Open.
+
+        AutoCAD's COM `Documents.Open` cannot open paths longer than ~256 chars
+        and does NOT accept the `\\?\` extended-length prefix (it errors
+        "Invalid file name"). Report-folder DWGs routinely exceed MAX_PATH
+        (deep Dropbox tree + long RPT folder name + long descriptive filename →
+        260-290 chars), so 5 of 6 Civil drawings failed to open.
+
+        Fix: expose the DWG's PARENT directory through a SHORT directory
+        JUNCTION (`mklink /J`, no admin needed) in TEMP and open the DWG via the
+        junction. Because a junction is a transparent alias to the real folder,
+        relative XREF paths still resolve — unlike copying the lone DWG to a
+        temp dir, which would orphan its XREFs. `rmdir` on the junction removes
+        only the link, never the target files.
+
+        Short/ASCII paths are returned unchanged (no junction). Cross-project:
+        any project with a long native path benefits.
+        """
+        import subprocess, tempfile
+        p = str(dwg_path)
+        noop = (p, (lambda: None))
+        if len(p) <= 240 and p.isascii():
+            return noop
+        try:
+            link_root = (Path(tempfile.gettempdir())
+                         / f"abj_{int(time.time() * 1000) % 1_000_000}")
+            r = subprocess.run(
+                ['cmd', '/c', 'mklink', '/J', str(link_root), str(dwg_path.parent)],
+                capture_output=True, text=True, timeout=30)
+            if not link_root.exists():
+                print(f"    ⚠ 短路径 junction 创建失败: {r.stderr.strip() or r.stdout.strip()}")
+                return noop
+        except Exception as e:
+            print(f"    ⚠ 短路径 junction 异常: {e}")
+            return noop
+
+        short = str(link_root / dwg_path.name)
+
+        def _cleanup():
+            try:
+                subprocess.run(['cmd', '/c', 'rmdir', str(link_root)],
+                               capture_output=True, timeout=30)
+            except Exception:
+                pass
+
+        print(f"    长路径({len(p)}>256) → 经短 junction 打开: {link_root.name}")
+        return (short, _cleanup)
+
     def convert_to_ab(self, dwg_info: Dict) -> Dict:
         """Convert a single IFC DWG to AS BUILT.
 
@@ -10433,8 +10850,15 @@ class AsBuiltManager(IFCManager):
 
         # --- Actual AutoCAD operations ---
         doc = None
+        _jcleanup = lambda: None
         try:
             acad = self._get_acad()
+
+            # AutoCAD COM cannot open paths >~256 chars (and rejects the \\?\
+            # prefix). Long source paths — common for these report-folder DWGs
+            # (deep Dropbox path + long RPT folder + long description) — are
+            # opened through a short directory JUNCTION so XREFs still resolve.
+            open_path, _jcleanup = self._shortpath_open_target(dwg_path)
 
             # Handle lock files
             lock1 = dwg_path.with_suffix('.dwl')
@@ -10480,14 +10904,14 @@ class AsBuiltManager(IFCManager):
                             break
                     if doc is None:
                         doc = self._com_retry(
-                            lambda p=str(dwg_path): acad.Documents.Open(p))
+                            lambda p=open_path: acad.Documents.Open(p))
                 except Exception as e:
                     result['errors'].append(f"无法获取已打开的 DWG: {e}")
                     return result
             else:
                 try:
                     doc = self._com_retry(
-                        lambda p=str(dwg_path): acad.Documents.Open(p))
+                        lambda p=open_path: acad.Documents.Open(p))
                 except Exception as e:
                     result['errors'].append(f"无法打开 DWG: {e}")
                     return result
@@ -10743,6 +11167,8 @@ class AsBuiltManager(IFCManager):
                     doc.Close(False)
                 except Exception:
                     pass
+        finally:
+            _jcleanup()  # remove the short-path junction (link only, not target)
 
         return result
 
@@ -10827,12 +11253,16 @@ class AsBuiltManager(IFCManager):
             ab_dwg_path = ab_dwg_dir / ab_dwg_name
 
             doc = None
+            # Long source path → open via short junction (XREF-safe). See
+            # _shortpath_open_target. Cleaned up after the page is processed.
+            _open_path, _jcleanup = self._shortpath_open_target(page_dwg)
             try:
                 # Open page DWG
                 doc = self._com_retry(
-                    lambda p=str(page_dwg): acad.Documents.Open(p))
+                    lambda p=_open_path: acad.Documents.Open(p))
                 if doc is None:
                     result['errors'].append(f"无法打开 {page_dwg.name}")
+                    _jcleanup()
                     continue
 
                 # Wait for document ready
@@ -10964,6 +11394,8 @@ class AsBuiltManager(IFCManager):
                         doc.Close(False)
                     except Exception:
                         pass
+            finally:
+                _jcleanup()  # remove this page's short-path junction (link only)
 
         if not ok_pages:
             result['errors'].append("所有页面转换失败")
@@ -11373,17 +11805,27 @@ class AsBuiltManager(IFCManager):
                     continue
                 return result  # max retries exhausted on conversion failure
 
-            # QA check
+            # QA check (PDF-level: stamps, leftovers, phantom pages, alignment).
             pdf_path = Path(result['pdf_path'])
             qa_warns = self._qa_validate_ab_pdf(
                 pdf_path, doc_id, expected_pages=expected_pages)
-            # Fold in title-block QA (collected on the open doc during convert).
-            # Same closed loop: a bad title block (missing/blank AS BUILT row) is a
-            # QA failure → retry, then escalate, just like a bad stamp.
-            qa_warns = qa_warns + result.get('tb_qa_warnings', [])
+
+            # Title-block QA rides ALONGSIDE as a non-blocking WARN — it is
+            # DETERMINISTIC (re-converting re-reads the SAME source → an identical
+            # personnel/rev result), so it must NOT drive the retry/escalate loop.
+            # Retrying an empty-personnel source is futile thrash that would FAIL
+            # an otherwise gold-standard deliverable PDF (root cause of the mass
+            # Coleambally2 'personnel 全空' FAILs). Surface it for review; ship the
+            # PDF. Only the PDF-QA defects below are retryable/escalatable.
+            tb_qa = result.get('tb_qa_warnings', [])
+            if tb_qa:
+                _existing = result.setdefault('qa_warnings', [])
+                for _w in tb_qa:
+                    if _w not in _existing:
+                        _existing.append(_w)
 
             if not qa_warns:
-                return result  # ✅ QA PASS — return to caller
+                return result  # ✅ PDF QA PASS — return (tb_qa, if any, as WARN)
 
             # Categorise
             must_escalate = [w for w in qa_warns
@@ -11419,19 +11861,39 @@ class AsBuiltManager(IFCManager):
 
     def batch_convert(self, doc_ids: Optional[List[str]] = None,
                       force_doc_ids: Optional[set] = None,
-                      force_rev_1: bool = False) -> List[Dict]:
-        """Convert IFC DWGs to AS BUILT.
+                      force_rev_1: bool = True,
+                      cleanup_native: bool = True) -> List[Dict]:
+        """Convert IFC DWGs to AS BUILT (export FIRST, then QA — every project).
+
+        Policy:
+          - cleanup_native (default True): house-keep 1. Native/ FIRST — collapse
+            duplicate 'Rev.N - AB' subfolders to the first rev + move loose AB
+            exports to Superseded/. See cleanup_ab_native().
+          - force_rev_1 (default True): pin output to the FIRST AB rev and
+            OVERWRITE it — the default is one live AB version per doc-ID, never
+            an accumulating Rev.2/Rev.3. Pass force_rev_1=False for the
+            (caller-driven) special case where a genuine new AB rev must
+            continue the For-Construction numbering.
+          - Incremental skip is QA-GATED ('skip only if QA-clean'): a doc-ID is
+            skipped ONLY when its existing AB PDF passes QA. A missing OR
+            QA-faulty PDF is re-exported then re-QA'd — so 'export first, then
+            QA' holds for everything that actually needs producing.
 
         Args:
             doc_ids: If provided, only convert these doc-IDs.
-            force_doc_ids: Force re-conversion even if AB PDF exists.
-            force_rev_1: If True, always output REV 1 (overwrite existing).
-                Used during QA iteration before the user approves final output.
-                Bypasses incremental check for all files and resets existing_ab_rev to None.
+            force_doc_ids: Always re-convert these (bypass the QA-clean skip).
         """
         mode_label = "同目录" if self._save_in_source_dir else "子文件夹"
         print(f"  AS BUILT 模式: {mode_label} | Native: {self._detected_native} | "
               f"Output: {self._detected_ab_output}")
+
+        # Native house-keeping FIRST (filesystem only, reversible → Superseded/).
+        if cleanup_native and not self.dry_run:
+            acts = self.cleanup_ab_native()
+            if acts:
+                print(f"  [AB-清理] Native 整理: {len(acts)} 项移入 Superseded/")
+                for a in acts[:12]:
+                    print(f"    - {a['kind']}: {Path(a['path']).name}")
 
         scan = self.scan_native_for_ab()
         if doc_ids:
@@ -11440,11 +11902,11 @@ class AsBuiltManager(IFCManager):
         force_set = {d.upper() for d in (force_doc_ids or set())}
 
         if force_rev_1:
-            # Override all to REV 1 and bypass incremental check for all items
+            # Pin output to the FIRST AB rev (overwrite). Does NOT force-convert
+            # everything — the QA-clean gate below still skips clean output.
             for item in scan:
                 item['existing_ab_rev'] = None
-            force_set = {item['doc_id'].upper() for item in scan}
-            print("  [force_rev_1] 全部锁定 REV 1，已有 PDF 将被覆盖")
+            print("  [force_rev_1] 输出锁定 REV 1（已有 PDF 将被覆盖；QA 通过者仍跳过）")
 
         if not scan:
             print("  没有找到需要转换的 IFC 文件")
@@ -11459,9 +11921,10 @@ class AsBuiltManager(IFCManager):
             page_count = len(ifc_source['dwg_paths'])
             ab_rev = (dwg_info['existing_ab_rev'] or 0) + 1
 
-            # Incremental check
-            if doc_id.upper() not in force_set and self._check_ab_incremental(dwg_info):
-                print(f"  [{idx}/{total}] {doc_id} — 已有 AS BUILT PDF，跳过 (强制重转请用 force_doc_ids)")
+            # QA-gated incremental skip: skip ONLY when the existing AB PDF is
+            # already QA-clean. Missing/faulty → fall through to export + QA.
+            if doc_id.upper() not in force_set and self._ab_existing_pdf_qa_clean(dwg_info):
+                print(f"  [{idx}/{total}] {doc_id} — 已有 AS BUILT PDF 且 QA 通过，跳过")
                 continue
 
             type_label = f"multi({page_count}p)" if is_multi else "single"

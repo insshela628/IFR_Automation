@@ -77,6 +77,10 @@ for lname in layout_names:
 - `preserve_ifr=False`: Rev0 clears all IFR rows. Rev1+ keeps existing IFC rows. Use for clean IFC-only revision tables. Currently no project uses this.
 - **CRITICAL**: `_update_title_block()` must be idempotent — calling it multiple times on the same title block must produce the same result as calling it once. This prevents duplicate "FOR CONSTRUCTION" rows when `_find_all_title_blocks()` returns the same entity twice or when conversion is re-run.
 
+### Revision-Table Column Alignment (AS BUILT)
+- Some title-block definitions place a revision row's attribute slots at a slightly different X than the rows above (Warnertown `GPA`/`ACE-Wanertown_Siyuan`: row-5 PROJECT slot X=286.6 vs rows 1-4 X=281.8 → the AS BUILT row's `GG31` rendered crooked, shifted right). Prior conversions only filled rows 1-4 so it never showed; the bot's AS BUILT row lands on the misaligned slot.
+- `AsBuiltManager._update_title_block()` → `_align_attr_x()`: after writing the AS BUILT row, copy each attribute's `InsertionPoint.X` + `TextAlignmentPoint.X` from the row directly below (preserving own Y), then `Update()`. No-op for already-straight columns; keeps every revision-table column vertically aligned. Cosmetic + best-effort (COM failures swallowed, never breaks conversion).
+
 ### Multi-Sheet DWG Title Blocks
 - A single DWG can have MULTIPLE title block references — in ModelSpace AND/OR in separate PaperSpace layouts
 - **CRITICAL**: `SelectionSet.Select(5)` only searches the ACTIVE space, NOT all layouts
@@ -264,6 +268,14 @@ for lname in layout_names:
 - After XREF bind: `doc.Regen(1)` + 2s settle before SaveAs (binding changes document state)
 - **Failure mode if skipped**: first conversion in session fails because AutoCAD not fully ready; PLN-004 "Add.Select" error
 
+### Long SOURCE Path (>260 chars / MAX_PATH) — universal
+- A source DWG path > 260 chars breaks TWO things; both are now handled in code:
+  1. **Scan invisibility**: `pathlib.Path.is_file()`/`.exists()` do a full `os.stat` on the long path → `FileNotFoundError` → returns False → the DWG is silently dropped from the scan. Fix: `_find_latest_ifc_source` enumerates with `os.scandir` (dirent-based `is_file()`, never re-stats the long path). NEVER gate DWG enumeration on `Path.is_file()`.
+  2. **Open failure**: AutoCAD COM `Documents.Open` cannot open a >~256-char path and **rejects the `\\?\` prefix** ("Invalid file name"). Fix: `AsBuiltManager._shortpath_open_target()` exposes the DWG's PARENT folder via a short `mklink /J` directory **junction** in TEMP and opens through it — relative XREFs still resolve (unlike copying the lone DWG to temp). `rmdir` removes only the junction link, never the target. Cleaned up in `finally`.
+- **Not a Dropbox/online-only problem** — online-only placeholders open fine if the path is short (C-PLN-008, 253 chars, was online-only yet converted). The discriminator is purely path LENGTH. Don't chase cloud-hydration red herrings.
+- Output long paths (SaveAs) already handled separately via temp short path + `to_long_path` move (see below / >240 rule).
+- Surfaced 2026-06-04: 5 of 6 Warnertown Civil & Structure report-folder drawings (paths 262-287 chars) failed to open until the junction fix; the 6th (253) worked.
+
 ### SaveAs Resilience (backup plans — NEVER just abort)
 - **6 fallback strategies** in sequence if SaveAs fails:
   1. Normal `doc.SaveAs(path)` with `_com_retry`
@@ -305,6 +317,7 @@ for lname in layout_names:
   - No built-in IFR stamp block (stamps are standalone entities per drawing)
   - Stamp geometry: proportional scaling from 841×594 reference (verified 2026-03-19, same as Tatua)
   - AS BUILT: `AsBuiltManager` auto-detects paths. Native: `Design/Engineering/1. Drawings/1. Native`. AB output: `Design/Engineering/1. Drawings/5. As Built/3. As Built Client`. 13 doc-IDs detected, 11 existing AB Rev1.
+  - **AS BUILT also covers report-folder drawings** (`_EXTRA_DRAWING_SOURCES`): native DWGs that live inside `2. Calcs & Reports/Reports/Civil & Structure` (and `…/Electrical`) per-report folders, NOT in `1. Native/`. The folder is named by the REPORT doc-ID but the DWG carries the DRAWING doc-ID (e.g. folder `GG31-C-RPT-001` holds drawing `GG31-C-PLN-006`) → doc-ID/description parsed from the DWG filename, deduped against the main Native scan. 6 Civil drawings converted 2026-06-04 (C-PLN-006/008/009/010/013 + C-RPT-004), all REV 1, QA clean. Required the long-path junction fix (see "Long SOURCE Path").
   - AS BUILT stamp verified on real DWG (BLD-001, 1689×1192.9 = 2× standard frame): CW=3.16, text=11.07 — proportional scaling works
   - `preserve_ifr=True`
 - **Tatua Solar Farm** (NZ, Coleambally):
