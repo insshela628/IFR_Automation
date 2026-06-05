@@ -12280,18 +12280,38 @@ class AsBuiltManager(IFCManager):
 
                 # Stamp position — must be in bottom-right quadrant (>50% x, >50% y)
                 # Use fitz word extraction for bounding box of "AS BUILT" text
+                # Stamp PLACEMENT. Bottom-right is the DEFAULT, but a stamp that was
+                # RELOCATED to avoid overlapping design content (see overlap gate
+                # below) is legitimate wherever it lands clear AND against a sheet
+                # edge/corner — so do NOT hard-require the bottom-right quadrant
+                # (that false-flagged C-PLN-003/005 after they were correctly moved
+                # to the clear lower-LEFT). Flag only genuinely wrong placement: a
+                # box running OFF the sheet, or FLOATING mid-sheet (not adjacent to
+                # any page edge — a real reposition lands against an edge, a
+                # drifted/broken stamp floats in the drawing body). Mutual box
+                # alignment (#4) and content-overlap (#7) cover the rest.
+                # _EDGE_BAND is a project-tuneable number (kept here, NOT in the
+                # cross-project skill).
                 try:
-                    words = page.get_text("words")
-                    ab_boxes = [w for w in words if 'BUILT' in w[4].upper()]
-                    for wb in ab_boxes:
-                        wx_centre = (wb[0] + wb[2]) / 2
-                        wy_centre = (wb[1] + wb[3]) / 2
-                        if wx_centre < pw * 0.5 or wy_centre < ph * 0.5:
+                    sb = self._detect_stamp_boxes(page)
+                    if sb:
+                        _EDGE_BAND = 0.08
+                        gx0 = min(b.x0 for b in sb); gy0 = min(b.y0 for b in sb)
+                        gx1 = max(b.x1 for b in sb); gy1 = max(b.y1 for b in sb)
+                        off_sheet = (gx0 < -1 or gy0 < -1
+                                     or gx1 > pw + 1 or gy1 > ph + 1)
+                        near_edge = (gx0 <= pw * _EDGE_BAND
+                                     or gx1 >= pw * (1 - _EDGE_BAND)
+                                     or gy0 <= ph * _EDGE_BAND
+                                     or gy1 >= ph * (1 - _EDGE_BAND))
+                        if off_sheet:
                             warnings.append(
-                                f'Page {pi+1}: 印章位置异常 — 不在底右区域 '
-                                f'({wx_centre/pw:.0%} x, {wy_centre/ph:.0%} y) '
-                                f'[需人工检查]')
-                            break
+                                f'Page {pi+1}: 印章越出页面边界 [需人工检查]')
+                        elif not near_edge:
+                            warnings.append(
+                                f'Page {pi+1}: 印章漂浮在图面中部、未贴页边 '
+                                f'(x {gx0/pw:.0%}-{gx1/pw:.0%}, '
+                                f'y {gy0/ph:.0%}-{gy1/ph:.0%}) [需人工检查]')
                 except Exception:
                     pass
 
