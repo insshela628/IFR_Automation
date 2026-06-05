@@ -5125,6 +5125,73 @@ class IFCStampMixin:
                 except Exception:
                     pass
 
+        # Fix 1b: Remove dedicated "COLOUR note" BLOCK inserts (redraw mode only).
+        # Some frames carry the COLOUR note baked INSIDE a small block insert
+        # (e.g. a block literally named "DRAWING TO BE PRINTED IN COLOUR") instead
+        # of a standalone MText. The MText scan above misses these, so the bot would
+        # draw a 2nd COLOUR note → duplicate (E-BLD-001). Identify a COLOUR block by
+        # its BAKED text (PRINT + COLOUR/COLOR), NOT by name, and only delete
+        # dedicated small blocks (def ≤10 entities) so real title frames are never
+        # removed. Same identify-by-content pattern as _remove_ifc_stamp.
+        if redraw:
+            def _is_colour_note_block(blk_name):
+                try:
+                    bdef = doc.Blocks.Item(blk_name)
+                    if bdef.Count > 10:
+                        return False
+                    for j in range(bdef.Count):
+                        be = bdef.Item(j)
+                        if be.EntityName in ('AcDbMText', 'AcDbText'):
+                            bt = self._strip_mtext_formatting(
+                                self._com_retry(lambda ent=be: ent.TextString) or '').upper()
+                            if 'PRINT' in bt and ('COLOUR' in bt or 'COLOR' in bt):
+                                return True
+                except Exception:
+                    pass
+                return False
+
+            _ins_to_del = []
+            if layout_name and layout_name.lower() != 'model':
+                try:
+                    for layout in doc.Layouts:
+                        if layout.Name == layout_name:
+                            block = layout.Block
+                            for i in range(block.Count):
+                                try:
+                                    e = block.Item(i)
+                                    if e.EntityName == 'AcDbBlockReference' \
+                                       and _is_colour_note_block(e.Name):
+                                        _ins_to_del.append(e)
+                                except Exception:
+                                    continue
+                            break
+                except Exception:
+                    pass
+            else:
+                import pythoncom as _pycom2
+                try:
+                    ss_name = f"_ColBlk_{int(time.time()*1000) % 1_000_000}"
+                    ss = doc.SelectionSets.Add(ss_name)
+                    ft = win32com.client.VARIANT(_pycom2.VT_ARRAY | _pycom2.VT_I2, [0])
+                    fv = win32com.client.VARIANT(_pycom2.VT_ARRAY | _pycom2.VT_VARIANT, ["INSERT"])
+                    ss.Select(5, None, None, ft, fv)
+                    for i in range(ss.Count):
+                        try:
+                            e = ss.Item(i)
+                            if _is_colour_note_block(e.Name):
+                                _ins_to_del.append(e)
+                        except Exception:
+                            continue
+                    ss.Delete()
+                except Exception:
+                    pass
+            for e in _ins_to_del:
+                try:
+                    e.Delete()
+                    print(f"    印章: 删除图框自带 COLOUR 注释块 (重画前去重)")
+                except Exception:
+                    pass
+
         # Fix 2: Delete old border entities in the COLOUR+AS BUILT stamp zone.
         # Pre-bot stamps may use AcDb2dPolyline, AcDbSolid, etc. — handle all.
         # Use SelectionSet crossing window (safe for 400K+ entity DWGs — uses
@@ -10255,11 +10322,23 @@ class AsBuiltManager(IFCManager):
 
     # ── Title block update ───────────────────────────────────────────────
 
-    def _update_title_block(self, attrs: Dict, ab_rev: int, personnel: Dict, date_str: str):
+    def _update_title_block(self, attrs: Dict, ab_rev: int, personnel: Dict, date_str: str,
+                            space=None):
         """Update title block attributes for AS BUILT conversion.
 
         Keep all existing IFR + IFC revision rows, add AS BUILT row after them.
         Idempotent: if AS BUILT row already exists, overwrite in-place.
+
+        `space` (the ModelSpace/PaperSpace the title block lives in) enables the
+        MISSING-SLOT fallback: real-world hand-built title blocks often have an
+        INCONSISTENT attribute set per revision row — the AS BUILT target row may
+        simply LACK a `{n}DESIGNED` or `{n}PROJECT` attribute that earlier rows
+        have (Coleambally `Coleamablly`: row-4 has no `4DESIGNED`; `GPA`/Kerta
+        block: rows 2-4 have no `{n}PROJECT`, only stray `BPROJECT`/`CPROJECT`).
+        Writing only into attrs-that-exist then leaves that column BLANK. When a
+        slot is missing we DRAW the value as standalone text, positioned at the
+        reference row's column X and this row's Y — tag-agnostic, works for any
+        frame, no per-project config. (Root cause of "漏 DES / 漏 PROJECT".)
         """
         if 'REVISION' in attrs:
             self._safe_set_text(attrs['REVISION'], str(ab_rev))
@@ -10331,28 +10410,99 @@ class AsBuiltManager(IFCManager):
         # Write the AS BUILT row, tracking write outcomes for cheap QA (no COM
         # re-read — _safe_set_text returns success/failure). A non-empty value
         # that fails to write = a blank field in the output → QA warning.
+        # UNIFIED over all suffixes (REV/DATE/DESCRIPTION + personnel) so the
+        # missing-slot fallback applies to every column the same way.
         warnings = []
         tag_prefix = str(target_row)
-        if f'{tag_prefix}REV' in attrs:
-            if not self._safe_set_text(attrs[f'{tag_prefix}REV'], str(ab_rev)):
-                warnings.append("AS BUILT 行 REV 写入失败")
-        if f'{tag_prefix}DESCRIPTION' in attrs:
-            if not self._safe_set_text(attrs[f'{tag_prefix}DESCRIPTION'], 'AS BUILT'):
-                warnings.append("AS BUILT 行 DESCRIPTION 写入失败")
-        if f'{tag_prefix}DATE' in attrs:
-            if not self._safe_set_text(attrs[f'{tag_prefix}DATE'], date_str):
-                warnings.append("AS BUILT 行 DATE 写入失败")
+
+        def _cell_value(suffix):
+            if suffix == 'REV':
+                return str(ab_rev)
+            if suffix == 'DATE':
+                return date_str
+            if suffix == 'DESCRIPTION':
+                return 'AS BUILT'
+            return personnel.get(suffix.lower(), '')
+
+        # Row PITCH (Y change per +1 row-number), used to place fallback text for a
+        # missing slot EXACTLY one row above its same-column reference. Earlier code
+        # read a single global target_y from "any existing cell on this row" and
+        # reused it for every missing column — but a left-justified cell reports its
+        # baseline Y while a centre-justified cell is positioned by its middle Y, so
+        # mixing conventions floated the drawn cell half a line too high (the 'ACE'
+        # drift on C-PLN-007/GAD-001/GAD-004). PITCH is a pure spacing (a DIFFERENCE
+        # of like-for-like Ys), so it is convention-independent; anchoring on the
+        # SAME column's own reference cell keeps the baseline consistent. slope =
+        # dY / d(row-number), median over all consecutive same-column row pairs.
+        _slopes = []
+        for suffix in all_suffixes:
+            rows_y = []
+            for r in range(1, self.REV_ROWS + 1):
+                rt = f"{r}{suffix}"
+                if rt in attrs:
+                    y = self._attr_align_y(attrs[rt])
+                    if y is not None:
+                        rows_y.append((r, y))
+            for (r1, y1), (r2, y2) in zip(rows_y, rows_y[1:]):
+                if r2 != r1:
+                    _slopes.append((y2 - y1) / (r2 - r1))
+        _row_slope = None
+        if _slopes:
+            _slopes.sort()
+            _row_slope = _slopes[len(_slopes) // 2]  # median
+
+        # Legacy single-Y fallback only if pitch can't be derived (≤1 row total).
+        _legacy_target_y = None
+        for suffix in all_suffixes:
+            t_tag = f"{tag_prefix}{suffix}"
+            if t_tag in attrs:
+                _legacy_target_y = self._attr_align_y(attrs[t_tag])
+                if _legacy_target_y is not None:
+                    break
 
         _personnel_written = 0
-        for tag in self.PERSONNEL_TAGS:
-            full_tag = f"{tag_prefix}{tag}"
+        for suffix in all_suffixes:
+            full_tag = f"{tag_prefix}{suffix}"
+            val = _cell_value(suffix)
+            is_person = suffix in self.PERSONNEL_TAGS
             if full_tag in attrs:
-                val = personnel.get(tag.lower(), '')
                 ok = self._safe_set_text(attrs[full_tag], val)
                 if val and not ok:
-                    warnings.append(f"AS BUILT 行 {tag} 写入失败 (应为 '{val}')")
-                if val and ok:
+                    warnings.append(f"AS BUILT 行 {suffix} 写入失败 (应为 '{val}')")
+                if val and ok and is_person:
                     _personnel_written += 1
+            elif val and space is not None:
+                # MISSING SLOT — this row has no {n}{suffix} attribute. Draw the
+                # value as text at the nearest-below row's column X, with this row's
+                # Y derived by translating that reference cell up by the row pitch
+                # (same column, same justification → no baseline drift).
+                ref_attr = None
+                ref_row = None
+                for r in range(target_row - 1, 0, -1):
+                    rt = f"{r}{suffix}"
+                    if rt in attrs:
+                        ref_attr = attrs[rt]
+                        ref_row = r
+                        break
+                col_target_y = None
+                if ref_attr is not None:
+                    ref_y = self._attr_align_y(ref_attr)
+                    if ref_y is not None and _row_slope is not None:
+                        col_target_y = ref_y + _row_slope * (target_row - ref_row)
+                    elif ref_y is not None:
+                        col_target_y = ref_y  # degenerate: 1 row, no pitch
+                if col_target_y is None:
+                    col_target_y = _legacy_target_y
+                if ref_attr is not None and col_target_y is not None \
+                        and self._draw_cell_fallback(
+                            space, ref_attr, col_target_y, val):
+                    print(f"    [补绘] AS BUILT 行缺 {suffix} 槽 → 画文字 '{val}'")
+                    if is_person:
+                        _personnel_written += 1
+                elif ref_attr is None:
+                    warnings.append(f"AS BUILT 行 {suffix} 槽缺失,无参照行可补 (应为 '{val}')")
+                else:
+                    warnings.append(f"AS BUILT 行 {suffix} 槽缺失且补绘失败 (应为 '{val}')")
         # All-empty personnel on the AS BUILT row = likely a personnel-read failure
         # (the source had none, or _read_latest_ifr_row backfill regressed).
         if _personnel_written == 0:
@@ -10405,6 +10555,112 @@ class AsBuiltManager(IFCManager):
             self._com_retry(lambda: target_attr.Update())
         except Exception:
             pass
+
+    def _attr_point(self, attr):
+        """Return an attribute's InsertionPoint as a (x, y, z) tuple, or None.
+        Best-effort, COM-retry wrapped, never raises."""
+        try:
+            ip = self._com_retry(lambda: attr.InsertionPoint)
+            if ip is None:
+                return None
+            return (float(ip[0]), float(ip[1]), float(ip[2]))
+        except Exception:
+            return None
+
+    def _attr_align_y(self, attr):
+        """Return the attribute's visual-row Y: TextAlignmentPoint.Y when the
+        attribute is justified (Alignment != acAlignmentLeft/0), else
+        InsertionPoint.Y. Lets fallback text sit at the same height as the row's
+        real cells regardless of justification. Best-effort, returns None on COM
+        failure."""
+        try:
+            align = self._com_retry(lambda: attr.Alignment)
+            if align and int(align) != 0:
+                tap = self._com_retry(lambda: attr.TextAlignmentPoint)
+                if tap is not None:
+                    return float(tap[1])
+            ip = self._com_retry(lambda: attr.InsertionPoint)
+            if ip is not None:
+                return float(ip[1])
+        except Exception:
+            pass
+        return None
+
+    def _draw_cell_fallback(self, space, ref_attr, target_y, value):
+        """Draw `value` as standalone text for a revision-row cell whose attribute
+        slot is MISSING on the AS BUILT row.
+
+        Positioned at the reference cell's column X (so it lines up under that
+        column) and the AS BUILT row's Y, inheriting the reference attribute's
+        text height + layer. WCS coords (attribute InsertionPoint is WCS, same as
+        `_align_attr_x`), so standalone text drawn in the same space lands in the
+        right cell. Best-effort: any COM failure is swallowed and returns False.
+
+        Returns True if a text entity was created. (The source IFC DWG is always
+        re-opened fresh per conversion, so this never accumulates across runs.)
+        """
+        try:
+            ip = self._attr_point(ref_attr)
+            if ip is None:
+                return False
+            try:
+                height = float(self._com_retry(lambda: ref_attr.Height))
+            except Exception:
+                height = 2.5
+            if not height or height <= 0:
+                height = 2.5
+            pt = win32com.client.VARIANT(
+                pythoncom.VT_ARRAY | pythoncom.VT_R8,
+                [ip[0], float(target_y), ip[2]])
+            txt = self._com_retry(lambda: space.AddText(str(value), pt, height))
+            if txt is None:
+                return False
+            # Mirror the reference cell's JUSTIFICATION. Title-block columns are
+            # often centre/right-justified — for those the visual position is the
+            # TextAlignmentPoint, NOT the InsertionPoint. A plain (left-justified)
+            # AddText at InsertionPoint then drifts sideways and collides with the
+            # neighbouring column (C-PLN-007: centre-justified DES → 'ACE' slid
+            # right onto DRAWN 'DS'). Copy ref Alignment + TextAlignmentPoint.X so
+            # the drawn cell lines up exactly like the rest of that column.
+            try:
+                align = self._com_retry(lambda: ref_attr.Alignment)
+                if align and int(align) != 0:  # 0 = acAlignmentLeft (InsertionPoint OK)
+                    tap = self._com_retry(lambda: ref_attr.TextAlignmentPoint)
+                    if tap is not None:
+                        txt.Alignment = align
+                        # For justified text AutoCAD positions by TextAlignmentPoint;
+                        # set BOTH points to it (same as _align_attr_x) + Update() so
+                        # the glyph recomputes cleanly at the column centre.
+                        ap = win32com.client.VARIANT(
+                            pythoncom.VT_ARRAY | pythoncom.VT_R8,
+                            [float(tap[0]), float(target_y), float(tap[2])])
+                        txt.TextAlignmentPoint = ap
+                        try:
+                            txt.InsertionPoint = ap
+                        except Exception:
+                            pass
+                        try:
+                            self._com_retry(lambda: txt.Update())
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            try:
+                lyr = self._com_retry(lambda: ref_attr.Layer)
+                if lyr:
+                    txt.Layer = lyr
+            except Exception:
+                pass
+            # Force black so the drawn cell matches the surrounding attribute text
+            # (a coloured title-block layer would otherwise tint it, e.g. blue).
+            try:
+                txt.color = 7
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            logging.warning(f"_draw_cell_fallback failed: {e}")
+            return False
 
     # ── Stamp removal (LMS-enhanced) ────────────────────────────────────
 
@@ -10702,6 +10958,354 @@ class AsBuiltManager(IFCManager):
     # "AS BUILT", so the parent method prints the correct label.
     # COLOUR box also uses the same ratios → guaranteed alignment.
 
+    # ── Raster-based stamp overlap auto-fix (viewport-aware) ─────────────
+
+    # A stamp box is "clear" if foreign BLACK ink covers < this fraction of it.
+    _RASTER_CLEAR_FRAC = 0.004
+    # Render zoom for ink sampling (higher = more accurate, slower).
+    _RASTER_ZOOM = 3.0
+
+    def _detect_stamp_boxes(self, page):
+        """Return the stamp boxes [rect, ...] on a fitz page, sorted top→bottom.
+
+        COLOUR-AGNOSTIC: the AS BUILT/COLOUR boxes are drawn with a thick (cw=2.0)
+        border that fitz renders as a FILLED rect — regardless of whether the
+        plot-style table maps the colour to red (most sheets) or black (sheets
+        whose layout uses a monochrome CTB, e.g. C-PLN-003). Detecting by red
+        colour alone missed the black-rendered stamps → their overlaps were never
+        auto-fixed. A stamp box is therefore a FILLED rect of stamp proportions
+        that ENCLOSES a stamp word (AS BUILT / PRINTED IN COLOUR). Title-block
+        detail/revision-table cells share the zone+size but are thin-stroked
+        (fill=None) and so are correctly excluded. Tag- and project-agnostic."""
+        pw, ph = page.rect.width, page.rect.height
+        words = [w for w in page.get_text("words")
+                 if 'BUILT' in w[4].upper() or 'COLOUR' in w[4].upper()
+                 or 'COLOR' in w[4].upper()]
+
+        def _encloses(r):
+            for w in words:
+                cx, cy = (w[0] + w[2]) / 2, (w[1] + w[3]) / 2
+                if r.x0 <= cx <= r.x1 and r.y0 <= cy <= r.y1:
+                    return True
+            return False
+
+        boxes = []
+        for dr in page.get_drawings():
+            r = dr['rect']
+            if (dr.get('fill') is not None
+                    and r.width > pw * 0.04 and r.height > ph * 0.012
+                    and r.width < pw * 0.30 and r.height < ph * 0.12
+                    and _encloses(r)):
+                boxes.append(r)
+        boxes.sort(key=lambda r: r.y0)
+        # Dedup near-coincident rects (a thick border can yield inner+outer paths).
+        dedup = []
+        for r in boxes:
+            if not any(abs(r.y0 - d.y0) < ph * 0.01 and abs(r.x0 - d.x0) < pw * 0.01
+                       for d in dedup):
+                dedup.append(r)
+        return dedup
+
+    # Stamp's own words — excluded when looking for FOREIGN text inside a box.
+    _STAMP_OWN_WORDS = frozenset((
+        'AS', 'BUILT', 'AS-BUILT', 'DRAWINGS', 'DRAWING', 'TO', 'BE',
+        'PRINTED', 'IN', 'COLOUR', 'COLOR'))
+
+    def _stamp_overlaps_content(self, page, boxes):
+        """True if any stamp box overlaps FOREIGN drawing content (geometric, so
+        COLOUR-INDEPENDENT — unaffected by whether a sheet's CTB renders the stamp
+        red or black, which broke raster ink-counting on mono sheets like
+        C-PLN-003). Two signals: (1) a foreign text word whose centre lands inside
+        a box; (2) a foreign cell-like rect (fill=None, not a stamp box) whose
+        intersection with a box exceeds 15% of the box area. Catches the stamp
+        landing on a detail/dimension table (C-PLN-003 DOUBLE ACCESS GATES) or on
+        notes shown through a viewport (C-PLN-006). Tag-/project-agnostic."""
+        pw, ph = page.rect.width, page.rect.height
+        # (1) foreign words
+        for w in page.get_text("words"):
+            toks = w[4].upper().replace(',', ' ').split()
+            if toks and all(t in self._STAMP_OWN_WORDS for t in toks):
+                continue  # the stamp's own text
+            cx, cy = (w[0] + w[2]) / 2, (w[1] + w[3]) / 2
+            for b in boxes:
+                if b.x0 <= cx <= b.x1 and b.y0 <= cy <= b.y1:
+                    return True
+        # (2) foreign cell-like rects. Must be CELL-sized in BOTH dimensions: a
+        # sheet border / viewport frame is large in both (GAD-003's border rect is
+        # 90% w × 90% h and would otherwise 100%-intersect the stamp box → false
+        # overlap), whereas a real detail/dimension table cell is small (C-PLN-003
+        # cell ≈ 19% w × 14% h). Capping both dims excludes frames/viewports while
+        # keeping genuine table cells. Tag-/project-agnostic.
+        for dr in page.get_drawings():
+            if dr.get('fill') is not None:
+                continue  # filled = stamp box / solid, not a table cell
+            r = dr['rect']
+            if r.width < pw * 0.02 or r.height < ph * 0.01:
+                continue  # thin line, not a cell
+            if r.width > pw * 0.5 or r.height > ph * 0.35:
+                continue  # sheet border / viewport frame, not a cell
+            for b in boxes:
+                ix = min(b.x1, r.x1) - max(b.x0, r.x0)
+                iy = min(b.y1, r.y1) - max(b.y0, r.y0)
+                barea = (b.x1 - b.x0) * (b.y1 - b.y0)
+                if ix > 0 and iy > 0 and barea > 0 \
+                        and (ix * iy) > barea * 0.15:
+                    return True
+        return False
+
+    def _black_frac(self, page, rx0, ry0, rx1, ry1):
+        """Fraction of near-black pixels in a PDF-space rect (foreign ink)."""
+        import fitz as _fitz
+        if rx1 - rx0 < 1 or ry1 - ry0 < 1:
+            return 1.0
+        pm = page.get_pixmap(matrix=_fitz.Matrix(self._RASTER_ZOOM, self._RASTER_ZOOM),
+                             clip=_fitz.Rect(rx0, ry0, rx1, ry1))
+        px, n, tot = pm.samples, pm.n, pm.width * pm.height
+        if not tot:
+            return 1.0
+        b = 0
+        for i in range(0, len(px), n):
+            if px[i] < 100 and px[i + 1] < 100 and px[i + 2] < 100:
+                b += 1
+        return b / tot
+
+    def _scan_pdf_stamp_overlaps(self, pdf_path: Path):
+        """Per page, decide whether the stamp group overlaps foreign ink and, if
+        so, the 2-D PDF offset (dx,dy) that relocates the WHOLE group to the
+        nearest clear slot anywhere on the sheet.
+
+        Probabilistically a stamp-vs-content clash has only two cures: move the
+        viewport, or move the stamp. This handles the move-the-stamp case
+        GENERALLY. Earlier code only searched UP/DOWN along the current X — fine
+        when the notes sit directly above (C-PLN-006), but useless when the entire
+        right edge is occupied by detail/dimension tables (C-PLN-003: the COLOUR
+        box landed on the DOUBLE ACCESS GATES table and there was no vertical slot
+        on the right). Searching the full sheet lets the group relocate to the
+        empty lower-left area (the conventional clear zone on these frames), and
+        generalises to any project/frame — the only criterion is "lands on white".
+
+        Returns {page_index: {'dx','dy','scale_ref_h','boxes'}} for pages that
+        BOTH overlap AND have a reachable clear slot. Empty dict = nothing to do
+        (the normal case → caller no-ops). Works on the rendered raster, so it
+        sees content shown THROUGH a viewport that COM geometry can't.
+        """
+        import fitz as _fitz
+        out = {}
+        doc = _fitz.open(str(pdf_path))
+        try:
+            for pi in range(doc.page_count):
+                page = doc[pi]
+                pw, ph = page.rect.width, page.rect.height
+                boxes = self._detect_stamp_boxes(page)
+                if not boxes:
+                    continue
+                gx0 = min(b.x0 for b in boxes); gy0 = min(b.y0 for b in boxes)
+                gx1 = max(b.x1 for b in boxes); gy1 = max(b.y1 for b in boxes)
+                gw, gh = gx1 - gx0, gy1 - gy0
+                ins = 2.0
+
+                def _all_clear(dx, dy):
+                    for b in boxes:
+                        f = self._black_frac(page, b.x0 + dx + ins, b.y0 + dy + ins,
+                                             b.x1 + dx - ins, b.y1 + dy - ins)
+                        if f >= self._RASTER_CLEAR_FRAC:
+                            return False
+                    return True
+
+                # TRIGGER is geometric (colour-independent); the raster _all_clear
+                # is reused only to vet candidate TARGET areas (empty there → no
+                # stamp ink to confound the measurement).
+                if not self._stamp_overlaps_content(page, boxes):
+                    continue  # stamp sits on white — the common case, no-op
+
+                # Candidate top-left anchors over a coarse full-sheet grid. Ordered
+                # by proximity to the BOTTOM-LEFT corner: on these title-block
+                # frames the lower-left is the conventional empty zone (the user's
+                # explicit target — "move stamp to bottom-left"), and aiming there
+                # avoids dumping the group into a still-cluttered mid-sheet slot
+                # that merely happens to be the nearest clear pixel. First clear
+                # candidate in that order wins. Project-agnostic: it just resolves
+                # to "the clear area nearest the bottom-left".
+                margin = min(pw, ph) * 0.012
+                x_lo, x_hi = margin, pw - gw - margin
+                y_lo, y_hi = ph * 0.08, ph - gh - margin
+                xstep = max(gw * 0.5, pw * 0.03)
+                ystep = max(gh * 0.5, ph * 0.02)
+                cands = []
+                ty = y_lo
+                while ty <= y_hi:
+                    tx = x_lo
+                    while tx <= x_hi:
+                        dx, dy = tx - gx0, ty - gy0
+                        # cost: distance to the page's bottom-left corner (0, ph).
+                        bl = (tx * tx + (ph - (ty + gh)) ** 2) ** 0.5
+                        cands.append((bl, dx, dy))
+                        tx += xstep
+                    ty += ystep
+                cands.sort(key=lambda t: t[0])
+                best = None
+                for _bl, dx, dy in cands:
+                    if _all_clear(dx, dy):
+                        best = (dx, dy)
+                        break
+                if best is None:
+                    continue  # no clear slot anywhere → leave as-is (never worse)
+                # scale reference: the tallest stamp box (COLOUR) height in PDF pts.
+                scale_ref_h = max(b.height for b in boxes)
+                out[pi] = {'dx': best[0], 'dy': best[1],
+                           'scale_ref_h': scale_ref_h, 'boxes': tuple(boxes)}
+        finally:
+            doc.close()
+        return out
+
+    def _publish_layout_order(self, doc):
+        """Layout names in the same order _publish_single_pdf emits PDF pages:
+        non-Model layouts with real content + a plot config, sorted by TabOrder."""
+        li = []
+        for layout in doc.Layouts:
+            try:
+                if layout.Name.lower() == 'model':
+                    continue
+                if layout.Block.Count <= 1:
+                    continue
+                cfg = layout.ConfigName
+                if not cfg or cfg.strip().lower() in ('', 'none'):
+                    continue
+                li.append((layout.TabOrder, layout.Name))
+            except Exception:
+                continue
+        li.sort()
+        return [n for _, n in li]
+
+    def _raster_fix_stamp_overlaps(self, acad, dwg_path, pdf_path, max_iter=5):
+        """Detect (via the rendered PDF) stamp boxes covering foreign ink that the
+        COM overlap check missed (model content shown through a viewport), move the
+        affected layout's IFC_STAMP group to the nearest clear right-edge slot, and
+        republish. Returns the number of pages corrected (0 = no-op).
+
+        Closed-loop: re-scans after republishing, up to max_iter passes.
+        """
+        try:
+            import fitz  # noqa: F401
+        except ImportError:
+            return 0
+        dwg_path = Path(dwg_path)
+        pdf_path = Path(pdf_path)
+
+        total_fixed = 0
+        for _ in range(max_iter):
+            overlaps = self._scan_pdf_stamp_overlaps(pdf_path)
+            if not overlaps:
+                break
+
+            open_path, jcleanup = self._shortpath_open_target(dwg_path)
+            doc = None
+            try:
+                for _try in range(6):
+                    try:
+                        _ = acad.Documents.Count
+                        doc = self._com_retry(lambda p=open_path: acad.Documents.Open(p))
+                        break
+                    except Exception:
+                        time.sleep(4)
+                if doc is None:
+                    break
+                for _w in range(20):
+                    try:
+                        _ = doc.Layouts.Count; break
+                    except Exception:
+                        time.sleep(1)
+                time.sleep(2)
+
+                order = self._publish_layout_order(doc)
+                moved_any = False
+                for pi, info in overlaps.items():
+                    if pi >= len(order):
+                        continue
+                    lname = order[pi]
+                    try:
+                        lay = next(l for l in doc.Layouts if l.Name == lname)
+                    except StopIteration:
+                        continue
+                    blk = lay.Block
+                    ents = []
+                    rects = []  # (top_y, height) of IFC_STAMP polylines (paper)
+                    for i in range(blk.Count):
+                        e = blk.Item(i)
+                        try:
+                            if e.Layer != self.STAMP_LAYER:
+                                continue
+                        except Exception:
+                            continue
+                        ents.append(e)
+                        try:
+                            if e.EntityName in ('AcDbPolyline', 'AcDbLwPolyline'):
+                                mn, mx = e.GetBoundingBox()
+                                rects.append((float(mx[1]),
+                                              float(mx[1]) - float(mn[1])))
+                        except Exception:
+                            pass
+                    if not ents or not rects:
+                        continue
+                    # scale = pdf pts per paper unit, from the tallest stamp box
+                    # (COLOUR) height ↔ tallest IFC_STAMP polyline height (paper).
+                    rects.sort(key=lambda t: t[0])  # by top-y
+                    colour_paper_h = max(h for _t, h in rects)
+                    colour_pdf_h = info['scale_ref_h']
+                    if colour_paper_h <= 0:
+                        continue
+                    scale = colour_pdf_h / colour_paper_h
+                    # 2-D move. PDF +x = paper +x; PDF +y = DOWN, paper +y = UP →
+                    # negate dy. Divide PDF offsets by scale to get paper units.
+                    shift_px = info['dx'] / scale
+                    shift_py = -info['dy'] / scale
+                    for e in ents:
+                        try:
+                            pf = win32com.client.VARIANT(
+                                pythoncom.VT_ARRAY | pythoncom.VT_R8, [0.0, 0.0, 0.0])
+                            pt = win32com.client.VARIANT(
+                                pythoncom.VT_ARRAY | pythoncom.VT_R8,
+                                [shift_px, shift_py, 0.0])
+                            e.Move(pf, pt)
+                        except Exception:
+                            pass
+                    print(f"    印章避让[{lname}]: 移动 (Δx={shift_px:.1f}, "
+                          f"Δy={shift_py:.1f}) 图纸单位 ({len(ents)} 实体) 避开图面内容")
+                    moved_any = True
+                    total_fixed += 1
+
+                if not moved_any:
+                    break
+                try:
+                    self._com_retry(lambda: doc.Save())
+                    time.sleep(2)
+                except Exception:
+                    pass
+                # Republish from the OPEN doc's path (the short junction path),
+                # WHILE the junction is still alive — doc.FullName would be the
+                # junction alias; publishing after jcleanup() would fail on the
+                # removed link (and the real path is >256 → PUBLISH rejects it).
+                save_path = Path(doc.FullName)
+                try:
+                    doc.Close(False)
+                except Exception:
+                    pass
+                doc = None
+                time.sleep(1)
+                ok = self._publish_single_pdf(acad, save_path, pdf_path)
+            finally:
+                if doc is not None:
+                    try:
+                        doc.Close(False)
+                    except Exception:
+                        pass
+                jcleanup()
+
+            if not ok:
+                break
+
+        return total_fixed
+
     # ── Single DWG conversion ────────────────────────────────────────────
 
     def _shortpath_open_target(self, dwg_path: Path):
@@ -10946,7 +11550,7 @@ class AsBuiltManager(IFCManager):
                 space = tb_item[2]
                 layout_name = tb_item[3] if len(tb_item) > 3 else None
                 print(f"    Sheet {tb_idx}/{len(all_tbs)}: 更新 title block + AS BUILT...")
-                _tbw = self._update_title_block(attrs, ab_rev, personnel, date_str)
+                _tbw = self._update_title_block(attrs, ab_rev, personnel, date_str, space=space)
                 for _w in (_tbw or []):
                     _tb_qa_all.append(f"Sheet {tb_idx}: {_w}")
                 if block_ref and space:
@@ -11110,6 +11714,20 @@ class AsBuiltManager(IFCManager):
             if pdf_ok:
                 result['pdf_path'] = str(ab_pdf_path)
                 result['success'] = True
+                # Raster overlap auto-fix: the COM overlap check (_check_colour_
+                # overlap) cannot see ModelSpace content shown THROUGH a viewport,
+                # so a stamp can land on construction notes that are only visible
+                # in the published PDF. Render the PDF, detect any page whose
+                # COLOUR/AS BUILT box covers foreign ink, reposition that layout's
+                # stamp group to the nearest clear right-edge slot, and republish.
+                # No-op (early return) when every page is clean → zero regression.
+                try:
+                    _fixed = self._raster_fix_stamp_overlaps(
+                        acad, ab_dwg_path, ab_pdf_path)
+                    if _fixed:
+                        print(f"    印章: 栅格检测到 {_fixed} 页与图面重叠 → 已避让并重出 PDF")
+                except Exception as _e_rf:
+                    print(f"    印章: 栅格避让跳过 ({_e_rf})")
                 # QA validation (expected_pages=None: single DWG may have many
                 # layouts → many pages; phantom/missing-stamp checks cover defects)
                 qa_warnings = self._qa_validate_ab_pdf(
@@ -11276,7 +11894,7 @@ class AsBuiltManager(IFCManager):
                     for tb_idx, tb_item in enumerate(all_tbs, 1):
                         block_ref, attrs, space = tb_item[0], tb_item[1], tb_item[2]
                         layout_name = tb_item[3] if len(tb_item) > 3 else None
-                        self._update_title_block(attrs, ab_rev, personnel, date_str)
+                        self._update_title_block(attrs, ab_rev, personnel, date_str, space=space)
                         if block_ref and space:
                             self._stamp_via_com_draw(doc, block_ref, space,
                                                      has_colour=has_colour,
@@ -11689,34 +12307,34 @@ class AsBuiltManager(IFCManager):
                             f'vs 多数页 {majority_dim[0]}x{majority_dim[1]}) '
                             f'— 可能是 Model tab [需人工检查]')
 
-            # Stamp box alignment: COLOUR and AS BUILT rects must share same left edge
-            # Uses get_drawings() to detect large filled rects in the stamp zone.
-            # Misalignment is retryable — current code (4e010d2) should produce aligned output.
+            # Stamp box alignment + stamp-vs-content overlap.
+            # Boxes are detected by _detect_stamp_boxes (FILLED rect enclosing a
+            # stamp word) — this excludes thin-stroked title-block detail/revision
+            # table cells that share the zone+size and previously caused false
+            # "未对齐" failures (esp. when the stamp OVERLAPS a table so the cell
+            # encloses the stamp text — C-PLN-003).
             for pi in range(page_count):
                 page = pdf_doc[pi]
-                pw, ph = page.rect.width, page.rect.height
                 try:
-                    # Accept both filled and stroked (thin-border) rects — AS BUILT
-                    # boxes use cw=0 (thin stroke), so fill is None. Match by
-                    # zone + size + rectangularity instead of requiring fill.
-                    stamp_boxes = [
-                        p['rect'] for p in page.get_drawings()
-                        if p['rect'].x0 > pw * 0.60
-                        and p['rect'].y0 > ph * 0.60
-                        and p['rect'].width  > pw * 0.08
-                        and p['rect'].height > ph * 0.02
-                        and p['rect'].width  < pw * 0.30
-                        and p['rect'].height < ph * 0.10
-                    ]
+                    stamp_boxes = self._detect_stamp_boxes(page)
                     if len(stamp_boxes) >= 2:
                         lefts  = [r.x0 for r in stamp_boxes]
-                        rights = [r.x0 + r.width for r in stamp_boxes]
+                        rights = [r.x1 for r in stamp_boxes]
                         l_spread = max(lefts)  - min(lefts)
                         r_spread = max(rights) - min(rights)
                         if l_spread > 20 or r_spread > 20:
                             warnings.append(
                                 f'Page {pi+1}: 印章框未对齐 '
                                 f'(左边差={l_spread:.0f}pt, 右边差={r_spread:.0f}pt)')
+                    # Overlap gate: the auto-relocator (_raster_fix_stamp_overlaps)
+                    # already ran during conversion; if the stamp STILL overlaps
+                    # design content here, it could not find a clear slot → flag for
+                    # human placement instead of silently shipping (the recurring
+                    # complaint). Escalated (no retry) — re-converting reruns the
+                    # same relocator and would not help.
+                    if stamp_boxes and self._stamp_overlaps_content(page, stamp_boxes):
+                        warnings.append(
+                            f'Page {pi+1}: 印章压住图面内容 — 自动避让无空位 [需人工检查]')
                 except Exception:
                     pass
 
