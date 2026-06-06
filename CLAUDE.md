@@ -243,8 +243,24 @@ for lname in layout_names:
   4. No leftover IFR stamps ("ISSUED FOR REVIEW" text)
   5. No phantom pages (different dimensions from majority — indicates Model tab export)
   6. AS BUILT stamp present on every page
+  7. Stamp does NOT overlap design content (the headline cross-project invariant — see below)
 - Results stored in `result['qa_warnings']`, logged inline, summarized in `batch_convert`
 - **Critical**: QA must detect ALL issues that were previously found manually. If QA passes, the output is production-ready.
+
+#### Stamp detection — colour-/tag-/project-agnostic (mechanics + numbers)
+The cross-project INVARIANTS live in skill `asbuilt-ifr-stamp-standard` (QA criteria + "two cures"). This is the V6 implementation + the tuneable numbers (numbers stay HERE, never in the skill).
+- **`_detect_stamp_boxes(page)`**: a stamp box = a `get_drawings()` rect with `fill is not None` (the cw=2.0 border renders FILLED — red on colour CTBs, BLACK on mono CTBs like C-PLN-003) that ENCLOSES a stamp word (`BUILT`/`COLOUR`/`COLOR`). Size window `0.04–0.30·pw` × `0.012–0.12·ph`; dedup near-coincident rects. Replaces the old red-only `_detect_stamp_red_rects` (mono stamps were invisible to it) and the old zone+size guess (title-block detail/revision-table CELLS share the zone → false "未对齐", esp. when the stamp OVERLAPS a table so the cell encloses the stamp text; filled-only excludes thin-stroked cells).
+- **`_stamp_overlaps_content(page, boxes)`** (geometry, colour-independent — raster ink-counting breaks on mono CTBs where the stamp's own black text reads as "ink"): overlap = (a) a FOREIGN text word (not in `_STAMP_OWN_WORDS`) centred inside a box, OR (b) a foreign cell rect (`fill=None`) covering **>15%** of a box. Foreign rect must be CELL-sized in BOTH dims (`>0.02·pw & >0.01·ph`, but `<0.5·pw & <0.35·ph`) so sheet borders / viewport frames (large in both dims) don't 100%-intersect and false-flag (GAD-003).
+- **Check #7 (overlap gate)**: if `_stamp_overlaps_content` is true on the final PDF → warn `印章压住图面内容 — 自动避让无空位 [需人工检查]`. Contains `需人工检查` → escalates (no retry; re-converting reruns the same relocator). NEVER relax this to force a pass.
+- **Placement check (#6 rewritten)**: bottom-right is DEFAULT but NOT required — a content-avoiding relocation is legitimate. Flag only OFF-sheet, or FLOATING mid-sheet (no box edge within `_EDGE_BAND=0.08` of any page edge). `_EDGE_BAND` is the tuneable number.
+
+#### Stamp-vs-content auto-relocation (cure #2 "move the stamp")
+- **`_scan_pdf_stamp_overlaps`**: trigger = `_stamp_overlaps_content` (geometric). Then grid-search candidate group anchors, ordered by proximity to the BOTTOM-LEFT page corner (the conventional empty zone), first candidate whose every box is raster-clear wins. Clear = `_black_frac < _RASTER_CLEAR_FRAC` (0.004) measured on the empty target (no stamp there → no own-ink confound). Returns 2-D `{dx,dy}`.
+- **`_raster_fix_stamp_overlaps`** (single-page path, `max_iter=5`): translate the whole `IFC_STAMP` group by `(dx,dy)/scale` (scale = stamp-box PDF height ÷ paper polyline height; PDF +y is down → negate for paper), Save, republish, re-scan. 5 iters lets scale/landing error self-correct (each scan re-measures actual position).
+- **Verified (NSW153 Coleambally #2)**: C-PLN-003 / C-PLN-005 stamps relocated to clear lower-left, QA PASS; E-BLD-001 (dense block diagram, no on-edge clear slot) correctly FAILs `[需人工检查]`. Genuinely multi-source (`is_multi_page`, `len(dwgs)>1`) drawings go through `convert_multi_to_ab`, which currently does NOT call the relocator (publishes via `_publish_ab_group_pdf`) — relocation there is a known gap; QA still catches the overlap.
+
+#### Revision-row fallback cell — pitch-based vertical placement
+- A missing `{n}{suffix}` slot on the AS BUILT row is drawn as standalone text (`_draw_cell_fallback`). Its Y is the same-column reference cell's align-Y translated up by the row PITCH (median dY per row-number over all same-column pairs), NOT a single global `target_y` read off another column. Mixing a left-justified cell's baseline-Y with a centre-justified cell's middle-Y floated the drawn glyph half a line high (the 'ACE' drift on C-PLN-007 / GAD-001 / GAD-004). Pitch is a like-for-like difference → convention-independent; anchoring on the same column keeps the baseline consistent.
 
 ### PDF Layout Filtering (Phantom Page Prevention)
 - `_publish_single_pdf()` skips layouts with no plot configuration (`ConfigName` empty or 'None') — phantom layouts that gain entities after XREF bind but have no real content
