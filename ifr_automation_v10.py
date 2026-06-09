@@ -11158,16 +11158,42 @@ class AsBuiltManager(IFCManager):
                         tx += xstep
                     ty += ystep
                 cands.sort(key=lambda t: t[0])
-                best = None
+                best, forced = None, False
                 for _bl, dx, dy in cands:
                     if _all_clear(dx, dy):
                         best = (dx, dy)
                         break
                 if best is None:
-                    continue  # no clear slot anywhere → leave as-is (never worse)
+                    # LAST RESORT (user-approved): no fully-clear on-edge slot
+                    # exists anywhere (a dense sheet that fills every corner,
+                    # e.g. E-BLD-001). Rather than leave the stamp on whatever it
+                    # currently covers, move the WHOLE group to the LEAST-INK
+                    # position so it obstructs as little design content as
+                    # possible — least foreign-ink primary, bottom-left as the
+                    # tiebreak (the cands list is already bottom-left-first, so a
+                    # strict-improvement update naturally favours it). QA is NOT
+                    # relaxed: _stamp_overlaps_content still runs on the result
+                    # and still escalates [需人工检查] if the least-bad spot is
+                    # not actually clear — the stamp is merely in the least
+                    # obstructive place to make the human placement easier. Moves
+                    # ONLY if strictly better than the current position, so it is
+                    # never worse than as-is. This branch is unreachable for the
+                    # passing sheets (they find a clear slot or never overlap), so
+                    # their geometry is untouched.
+                    def _total_ink(dx, dy):
+                        return sum(self._black_frac(
+                            page, b.x0 + dx + ins, b.y0 + dy + ins,
+                            b.x1 + dx - ins, b.y1 + dy - ins) for b in boxes)
+                    best_ink = _total_ink(0.0, 0.0)  # current position
+                    for _bl, dx, dy in cands:
+                        ink = _total_ink(dx, dy)
+                        if ink < best_ink - 1e-6:
+                            best_ink, best, forced = ink, (dx, dy), True
+                    if best is None:
+                        continue  # current position already least-bad → leave as-is
                 # scale reference: the tallest stamp box (COLOUR) height in PDF pts.
                 scale_ref_h = max(b.height for b in boxes)
-                out[pi] = {'dx': best[0], 'dy': best[1],
+                out[pi] = {'dx': best[0], 'dy': best[1], 'forced': forced,
                            'scale_ref_h': scale_ref_h, 'boxes': tuple(boxes)}
         finally:
             doc.close()
@@ -11284,8 +11310,10 @@ class AsBuiltManager(IFCManager):
                             e.Move(pf, pt)
                         except Exception:
                             pass
+                    _tag = "最后手段:移到油墨最少角落" if info.get('forced') \
+                        else "避开图面内容"
                     print(f"    印章避让[{lname}]: 移动 (Δx={shift_px:.1f}, "
-                          f"Δy={shift_py:.1f}) 图纸单位 ({len(ents)} 实体) 避开图面内容")
+                          f"Δy={shift_py:.1f}) 图纸单位 ({len(ents)} 实体) {_tag}")
                     moved_any = True
                     total_fixed += 1
 
