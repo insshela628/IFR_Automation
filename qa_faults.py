@@ -80,7 +80,9 @@ def faults_from_result(result: dict) -> list:
     Sorts by severity then page."""
     doc_id = result.get("doc_id")
     seen, faults = set(), []
-    for key in ("qa_warnings", "tb_qa_warnings", "errors"):
+    # Accept both shapes: the engine result (qa_warnings/tb_qa_warnings) and the
+    # bot-mapped result (post_qa). Clean warning lists first, then errors.
+    for key in ("qa_warnings", "post_qa", "tb_qa_warnings", "errors"):
         for w in (result.get(key) or []):
             if not isinstance(w, str):
                 continue
