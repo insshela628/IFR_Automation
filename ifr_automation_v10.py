@@ -10529,6 +10529,18 @@ class AsBuiltManager(IFCManager):
         if _personnel_written == 0:
             warnings.append("AS BUILT 行人员字段全空 (检查源版本行/回退)")
 
+        # Row Y-normalisation: repair a block that mis-authored a slot onto the
+        # WRONG row's baseline (C-PLN-002 Equipment Scope: a row's DESIGNED slot
+        # sits at the AS BUILT row's Y → its 'ACE' floats up and doubles with the
+        # AS BUILT fallback 'ACE'). No-op for well-formed rows (passing drawings
+        # untouched). Run BEFORE the X-align so columns then straighten cleanly.
+        try:
+            _ymoved = self._normalise_revrow_y(attrs)
+            if _ymoved:
+                print(f"    [行对齐] 修正 {_ymoved} 个错位属性的 Y (回归本行)")
+        except Exception:
+            pass
+
         # Column alignment: some title-block definitions place the AS BUILT row's
         # attribute slots at a slightly different X than the rows above (Warnertown
         # PLN-010: row-5 PROJECT at X=286.6 vs rows 1-4 at X=281.8 → "GG31" sat
@@ -10542,6 +10554,36 @@ class AsBuiltManager(IFCManager):
                 r_tag = f"{ref_row}{suffix}"
                 if t_tag in attrs and r_tag in attrs:
                     self._align_attr_x(attrs[t_tag], attrs[r_tag])
+
+        # QA backstop (③ — closes the personnel-cell blind spot). Personnel cells
+        # in these frames are exploded vector, so PDF QA can't see a doubled /
+        # drifted designer. Here at COM level we have exact positions: after the
+        # Y-normalisation, assert NO foreign row's attribute still sits inside the
+        # AS BUILT row's Y band (an unresolved mis-authored slot would double the
+        # AS BUILT personnel). Surfaces [需人工检查] so it is never shipped
+        # silently. Deterministic → rides as a tb-QA warning (no futile retry);
+        # the bot's fault checklist renders it. NO-OP once the Y-fix resolves it.
+        try:
+            _t_pts = [self._attr_point(attrs[f"{target_row}{s}"])
+                      for s in all_suffixes if f"{target_row}{s}" in attrs]
+            _t_ys = [p[1] for p in _t_pts if p is not None]
+            if _t_ys:
+                import statistics as _st
+                _band = _st.median(_t_ys)
+                for tag, a in attrs.items():
+                    j = 0
+                    while j < len(tag) and tag[j].isdigit():
+                        j += 1
+                    if j == 0 or tag[:j] == str(target_row):
+                        continue  # the AS BUILT row itself
+                    ip = self._attr_point(a)
+                    if ip is not None and abs(ip[1] - _band) < 2.0:
+                        warnings.append(
+                            f"AS BUILT 行人员区有错位属性 {tag} 未能归位 "
+                            f"(可能与人员格重叠) [需人工检查]")
+                        break
+        except Exception:
+            pass
         return warnings
 
     def _align_attr_x(self, target_attr, ref_attr):
@@ -11308,6 +11350,137 @@ class AsBuiltManager(IFCManager):
         li.sort()
         return [n for _, n in li]
 
+    def _move_stamp_group_in_layout(self, doc, layout_name, info) -> bool:
+        """Translate the IFC_STAMP group on `layout_name` by the PDF-space offset
+        in `info` (converted to paper units via the stamp-box height ratio).
+
+        Shared by the single-DWG (`_raster_fix_stamp_overlaps`) and multi-DWG
+        (`_raster_fix_ab_group_overlaps`) relocators so both use identical,
+        proven move math. Returns True if the group was found and moved.
+        """
+        try:
+            lay = next(l for l in doc.Layouts if l.Name == layout_name)
+        except (StopIteration, Exception):
+            return False
+        blk = lay.Block
+        ents = []
+        rects = []  # (top_y, height) of IFC_STAMP polylines (paper)
+        for i in range(blk.Count):
+            e = blk.Item(i)
+            try:
+                if e.Layer != self.STAMP_LAYER:
+                    continue
+            except Exception:
+                continue
+            ents.append(e)
+            try:
+                if e.EntityName in ('AcDbPolyline', 'AcDbLwPolyline'):
+                    mn, mx = e.GetBoundingBox()
+                    rects.append((float(mx[1]), float(mx[1]) - float(mn[1])))
+            except Exception:
+                pass
+        if not ents or not rects:
+            return False
+        # scale = pdf pts per paper unit, from the tallest stamp box (COLOUR)
+        # height ↔ tallest IFC_STAMP polyline height (paper).
+        rects.sort(key=lambda t: t[0])  # by top-y
+        colour_paper_h = max(h for _t, h in rects)
+        colour_pdf_h = info['scale_ref_h']
+        if colour_paper_h <= 0:
+            return False
+        scale = colour_pdf_h / colour_paper_h
+        # 2-D move. PDF +x = paper +x; PDF +y = DOWN, paper +y = UP → negate dy.
+        # Divide PDF offsets by scale to get paper units.
+        shift_px = info['dx'] / scale
+        shift_py = -info['dy'] / scale
+        for e in ents:
+            try:
+                pf = win32com.client.VARIANT(
+                    pythoncom.VT_ARRAY | pythoncom.VT_R8, [0.0, 0.0, 0.0])
+                pt = win32com.client.VARIANT(
+                    pythoncom.VT_ARRAY | pythoncom.VT_R8,
+                    [shift_px, shift_py, 0.0])
+                e.Move(pf, pt)
+            except Exception:
+                pass
+        _tag = "最后手段:移到油墨最少角落" if info.get('forced') else "避开图面内容"
+        print(f"    印章避让[{layout_name}]: 移动 (Δx={shift_px:.1f}, "
+              f"Δy={shift_py:.1f}) 图纸单位 ({len(ents)} 实体) {_tag}")
+        return True
+
+    def _raster_fix_ab_group_overlaps(self, acad, doc_id, ab_rev, dwg_folder,
+                                      pages, pdf_path, layout_name, max_iter=5):
+        """Multi-DWG twin of `_raster_fix_stamp_overlaps` for `convert_multi_to_ab`.
+
+        The merged AB PDF has one page per page-DWG (the DSD emits one sheet per
+        `ab_path`, all on `layout_name`). So PDF page i ↔ `pages[i]['ab_path']`.
+        Re-scan the rendered PDF for stamp boxes covering foreign ink; for each
+        overlapping page open THAT page's own DWG, move its IFC_STAMP group clear,
+        save, then republish the WHOLE group and re-scan.
+
+        No-op (zero pages moved) when every page is clean → zero regression for
+        the common case. Returns the number of pages corrected.
+        """
+        try:
+            import fitz  # noqa: F401
+        except ImportError:
+            return 0
+        pdf_path = Path(pdf_path)
+        total_fixed = 0
+        for _ in range(max_iter):
+            overlaps = self._scan_pdf_stamp_overlaps(pdf_path)
+            if not overlaps:
+                break
+            moved_any = False
+            for pi, info in overlaps.items():
+                if pi >= len(pages):
+                    continue
+                dwg_path = Path(pages[pi]['ab_path'])
+                open_path, jcleanup = self._shortpath_open_target(dwg_path)
+                doc = None
+                try:
+                    for _try in range(6):
+                        try:
+                            _ = acad.Documents.Count
+                            doc = self._com_retry(
+                                lambda p=open_path: acad.Documents.Open(p))
+                            break
+                        except Exception:
+                            time.sleep(4)
+                    if doc is None:
+                        continue
+                    for _w in range(20):
+                        try:
+                            _ = doc.Layouts.Count; break
+                        except Exception:
+                            time.sleep(1)
+                    time.sleep(2)
+                    if self._move_stamp_group_in_layout(doc, layout_name, info):
+                        moved_any = True
+                        total_fixed += 1
+                        try:
+                            self._com_retry(lambda: doc.Save())
+                            time.sleep(2)
+                        except Exception:
+                            pass
+                finally:
+                    if doc is not None:
+                        try:
+                            doc.Close(False)
+                        except Exception:
+                            pass
+                    jcleanup()
+
+            if not moved_any:
+                break
+            # Republish the whole group; the loop then re-scans the new PDF.
+            rp = self._publish_ab_group_pdf(
+                doc_id, ab_rev, dwg_folder, pages, pdf_path)
+            if not rp.get('success'):
+                break
+
+        return total_fixed
+
     def _raster_fix_stamp_overlaps(self, acad, dwg_path, pdf_path, max_iter=5):
         """Detect (via the rendered PDF) stamp boxes covering foreign ink that the
         COM overlap check missed (model content shown through a viewport), move the
@@ -11353,59 +11526,9 @@ class AsBuiltManager(IFCManager):
                 for pi, info in overlaps.items():
                     if pi >= len(order):
                         continue
-                    lname = order[pi]
-                    try:
-                        lay = next(l for l in doc.Layouts if l.Name == lname)
-                    except StopIteration:
-                        continue
-                    blk = lay.Block
-                    ents = []
-                    rects = []  # (top_y, height) of IFC_STAMP polylines (paper)
-                    for i in range(blk.Count):
-                        e = blk.Item(i)
-                        try:
-                            if e.Layer != self.STAMP_LAYER:
-                                continue
-                        except Exception:
-                            continue
-                        ents.append(e)
-                        try:
-                            if e.EntityName in ('AcDbPolyline', 'AcDbLwPolyline'):
-                                mn, mx = e.GetBoundingBox()
-                                rects.append((float(mx[1]),
-                                              float(mx[1]) - float(mn[1])))
-                        except Exception:
-                            pass
-                    if not ents or not rects:
-                        continue
-                    # scale = pdf pts per paper unit, from the tallest stamp box
-                    # (COLOUR) height ↔ tallest IFC_STAMP polyline height (paper).
-                    rects.sort(key=lambda t: t[0])  # by top-y
-                    colour_paper_h = max(h for _t, h in rects)
-                    colour_pdf_h = info['scale_ref_h']
-                    if colour_paper_h <= 0:
-                        continue
-                    scale = colour_pdf_h / colour_paper_h
-                    # 2-D move. PDF +x = paper +x; PDF +y = DOWN, paper +y = UP →
-                    # negate dy. Divide PDF offsets by scale to get paper units.
-                    shift_px = info['dx'] / scale
-                    shift_py = -info['dy'] / scale
-                    for e in ents:
-                        try:
-                            pf = win32com.client.VARIANT(
-                                pythoncom.VT_ARRAY | pythoncom.VT_R8, [0.0, 0.0, 0.0])
-                            pt = win32com.client.VARIANT(
-                                pythoncom.VT_ARRAY | pythoncom.VT_R8,
-                                [shift_px, shift_py, 0.0])
-                            e.Move(pf, pt)
-                        except Exception:
-                            pass
-                    _tag = "最后手段:移到油墨最少角落" if info.get('forced') \
-                        else "避开图面内容"
-                    print(f"    印章避让[{lname}]: 移动 (Δx={shift_px:.1f}, "
-                          f"Δy={shift_py:.1f}) 图纸单位 ({len(ents)} 实体) {_tag}")
-                    moved_any = True
-                    total_fixed += 1
+                    if self._move_stamp_group_in_layout(doc, order[pi], info):
+                        moved_any = True
+                        total_fixed += 1
 
                 if not moved_any:
                     break
@@ -12111,6 +12234,21 @@ class AsBuiltManager(IFCManager):
         if pdf_result['success']:
             result['pdf_path'] = pdf_result['pdf_path']
             result['success'] = True
+            # Raster overlap auto-fix (multi-DWG): same cure as the single-DWG
+            # path — the COM overlap check can't see ModelSpace content shown
+            # THROUGH a viewport, so a stamp can land on notes only visible in the
+            # published PDF. Per overlapping page, move that page-DWG's stamp group
+            # clear and republish the group. No-op when every page is clean.
+            _ab_layout = pdf_result.get('layout_name') or self._detect_ab_layout_name(
+                ok_pages[0]['ab_path'])
+            try:
+                _fixed = self._raster_fix_ab_group_overlaps(
+                    acad, doc_id, ab_rev, ab_subfolder or ab_dwg_dir,
+                    ok_pages, ab_pdf_path, _ab_layout)
+                if _fixed:
+                    print(f"    印章: 栅格检测到 {_fixed} 页与图面重叠 → 已避让并重出 PDF")
+            except Exception as _e_rf:
+                print(f"    印章: 栅格避让跳过 ({_e_rf})")
             # QA validation
             qa_warnings = self._qa_validate_ab_pdf(
                 ab_pdf_path, doc_id,
@@ -12154,6 +12292,7 @@ class AsBuiltManager(IFCManager):
             # Detect layout name from first page
             first_dwg = pages[0]['ab_path']
             layout_name = self._detect_ab_layout_name(first_dwg)
+            result['layout_name'] = layout_name  # for the group stamp relocator
             print(f"    Layout 检测: '{layout_name}'")
 
             # Build DSD

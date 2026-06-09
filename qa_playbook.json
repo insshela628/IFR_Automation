@@ -120,6 +120,17 @@
         "自动重试通常可解决"
       ]
     },
+    "PERSONNEL_OVERLAP": {
+      "match": ["错位属性", "人员格重叠", "人员区有错位"],
+      "severity": "挡出图",
+      "title": "AS BUILT 行人员格有错位/重叠属性（源框畸形，自动归位未解）",
+      "auto_tried": ["按行中位数 Y 归位错位属性 (_normalise_revrow_y)"],
+      "fix_checklist": [
+        "在 AutoCAD 打开源 DWG，检查该修订行属性槽的 Y 是否被作者放错行",
+        "手动把错位属性拖回本行基线（与同行其它格对齐）",
+        "或在源框块定义里修正该属性槽位，重新转换"
+      ]
+    },
     "PERSONNEL_BLANK": {
       "match": ["人员字段全空", "人员"],
       "severity": "提示",
