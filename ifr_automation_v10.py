@@ -10343,6 +10343,63 @@ class AsBuiltManager(IFCManager):
 
     # ── Title block update ───────────────────────────────────────────────
 
+    def _count_loose_rev_dates(self, space, attrs):
+        """Detect a HYBRID title block — revision rows authored as LOOSE standalone
+        Text/MText (a date drawn into the layout) instead of block attributes. The
+        attribute-only updater can't see or roll them, so the AS BUILT row collides
+        with / sits beside them (E-PLN-003 rows C/D at a half-row Y offset). Returns
+        the count of loose revision-date texts inside the attribute revision band.
+
+        Call at the TOP of _update_title_block, BEFORE any fallback text is drawn,
+        so it never counts the bot's own _draw_cell_fallback output. Gold-safe: a
+        clean attribute table has NO standalone date in the revision band → 0.
+        Iteration is CAPPED (skips a huge ModelSpace rather than risk an O(n) COM
+        walk — detection simply doesn't run there; PaperSpace TBs are small)."""
+        if space is None:
+            return 0
+        import re as _re
+        xs, ys = [], []
+        for tag, a in attrs.items():
+            t = tag.upper()
+            base = t[:-3] if t.endswith('REV') else (t[:-4] if t.endswith('DATE') else None)
+            if base and base.isdigit():
+                p = self._attr_point(a)
+                if p:
+                    xs.append(p[0]); ys.append(p[1])
+        if len(ys) < 2:
+            return 0
+        ymin, ymax = min(ys), max(ys)
+        pitch = (ymax - ymin) / max(1, len({round(y, 1) for y in ys}) - 1)
+        yb0, yb1 = ymin - pitch, ymax + pitch
+        xb0, xb1 = min(xs) - pitch * 2, max(xs) + pitch * 30
+        attr_ys = {round(y, 0) for y in ys}
+        date_re = _re.compile(r'\b\d{1,2}/\d{1,2}/\d{2,4}\b')
+        try:
+            n = space.Count
+        except Exception:
+            return 0
+        if n > 4000:
+            return 0
+        count = 0
+        for i in range(n):
+            try:
+                e = space.Item(i)
+                if e.EntityName not in ('AcDbText', 'AcDbMText'):
+                    continue
+                ip = e.InsertionPoint
+                x, y = float(ip[0]), float(ip[1])
+                if not (yb0 <= y <= yb1 and xb0 <= x <= xb1):
+                    continue
+                if round(y, 0) in attr_ys:
+                    continue  # coincident with an attribute row → not a loose row
+                txt = self._strip_mtext_formatting(
+                    self._com_retry(lambda e=e: e.TextString) or '')
+                if date_re.search(txt):
+                    count += 1
+            except Exception:
+                continue
+        return count
+
     def _update_title_block(self, attrs: Dict, ab_rev: int, personnel: Dict, date_str: str,
                             space=None):
         """Update title block attributes for AS BUILT conversion.
@@ -10365,6 +10422,12 @@ class AsBuiltManager(IFCManager):
             self._safe_set_text(attrs['REVISION'], str(ab_rev))
 
         all_suffixes = ['REV', 'DATE', 'DESCRIPTION'] + self.PERSONNEL_TAGS
+
+        # HYBRID-TB detection — read NOW, before any fallback text is drawn, so the
+        # bot's own _draw_cell_fallback output is never miscounted. Surfaced at the
+        # end as a 需人工检查 WARN so the QA closed loop auto-catches this class
+        # (loose-MText revision rows) without a fresh manual investigation each time.
+        _loose_rev = self._count_loose_rev_dates(space, attrs)
 
         # Detect the ACTUAL number of revision rows in THIS title block — do NOT
         # trust self.REV_ROWS (a class default of 6). The Coleambally `Coleamablly`
@@ -10435,6 +10498,10 @@ class AsBuiltManager(IFCManager):
         # missing-slot fallback applies to every column the same way.
         warnings = []
         tag_prefix = str(target_row)
+        if _loose_rev:
+            warnings.append(
+                f"标题栏含 {_loose_rev} 处松散文字版本行(非属性) — AS BUILT 行可能与其"
+                f"重叠/未滚动；源图该版本行应改为属性行 [需人工检查]")
 
         def _cell_value(suffix):
             if suffix == 'REV':
