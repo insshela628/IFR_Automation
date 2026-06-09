@@ -10671,6 +10671,21 @@ class AsBuiltManager(IFCManager):
     _QA_STAMP_PHRASES = {'FOR CONSTRUCTION', 'ISSUED FOR REVIEW', 'FOR REVIEW',
                          'DRAWINGS TO BE PRINTED IN COLOUR', 'PRINTED IN COLO',
                          'AS BUILT', 'AS-BUILT'}
+    # Whitespace-stripped form of the phrases. Some pre-bot stamps render the
+    # status as a single run with NO space — e.g. C-PLN-005 'CROSS SECTION' had a
+    # QA-layer MText 'FORCONSTRUCTION' that the 'FOR CONSTRUCTION' substring match
+    # missed, so it survived BOTH removal and QA (leftover on page 5). Matching
+    # with all whitespace removed from BOTH sides is a strict SUPERSET of the
+    # spaced match (anything the spaced form caught, the stripped form still does).
+    _QA_STAMP_PHRASES_NOSPACE = frozenset(p.replace(' ', '') for p in _QA_STAMP_PHRASES)
+
+    def _plain_matches_stamp_phrase(self, plain):
+        """True if `plain` (already MText-stripped + upper) is a stamp phrase,
+        whitespace-insensitively. Callers restrict to QA-layer or the title-block
+        stamp zone, and to STANDALONE Text/MText (never title-block attributes —
+        so the live 'ISSUED FOR CONSTRUCTION' revision-row value is untouched)."""
+        nosp = ''.join((plain or '').split())
+        return any(p in nosp for p in self._QA_STAMP_PHRASES_NOSPACE)
 
     def _remove_ifc_stamp(self, doc):
         """Remove stamps from all spaces — parent + QA + geometry-based cleanup."""
@@ -10816,7 +10831,7 @@ class AsBuiltManager(IFCManager):
                     return
                 text = self._com_retry(lambda e=entity: e.TextString) or ''
                 plain = self._strip_mtext_formatting(text).upper().strip()
-                if any(phrase in plain for phrase in self._QA_STAMP_PHRASES):
+                if self._plain_matches_stamp_phrase(plain):
                     to_delete.append(entity)
             except Exception:
                 pass
@@ -10874,7 +10889,7 @@ class AsBuiltManager(IFCManager):
                 try:
                     plain = self._strip_mtext_formatting(
                         self._com_retry(lambda e=entity: e.TextString) or '').upper().strip()
-                    return any(p in plain for p in self._QA_STAMP_PHRASES)
+                    return self._plain_matches_stamp_phrase(plain)
                 except Exception:
                     return False
             if ename == 'AcDbBlockReference':
@@ -12263,8 +12278,12 @@ class AsBuiltManager(IFCManager):
                     warnings.append(
                         f'Page {pi+1}: AS BUILT 印章出现 {ab_count} 次 (重复)')
 
-                # Leftover IFC stamps
-                if _re_qa.search(r'FOR\s+CONSTRUCTION', page_text):
+                # Leftover IFC stamps. Whitespace-insensitive (\s* not \s+):
+                # some sheets render the old status stamp as 'FORCONSTRUCTION'
+                # (no space) — C-PLN-005 'CROSS SECTION'. Exclude the legitimate
+                # 'ISSUED FOR CONSTRUCTION' revision-row text via lookbehind.
+                if _re_qa.search(r'(?<!ISSUED\s)(?<!ISSUED)FOR\s*CONSTRUCTION',
+                                 page_text):
                     warnings.append(
                         f'Page {pi+1}: "FOR CONSTRUCTION" 残留 — IFC 印章未清除')
 
