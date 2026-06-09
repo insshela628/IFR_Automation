@@ -1,0 +1,165 @@
+{
+  "_doc": "SSOT DATA for AS BUILT QA fault remediation. Code reads this; markdown SSOT (V6 CLAUDE.md / asbuilt-ifr-stamp-standard skill) only POINTS here, never copies. Cross-project: NO project numbers/paths/ratios. `match` = substrings tested against a raw QA warning string (first code whose ANY substring hits wins, registry order). severity: 挡出图=blocks delivery/needs human, 可重试=engine auto-retries, 提示=non-blocking note, 基建=infra/transient. Add a new fault by adding an entry here only.",
+  "faults": {
+    "STAMP_OVERLAP_NO_SLOT": {
+      "match": ["印章压住图面内容"],
+      "severity": "挡出图",
+      "title": "印章压住图面内容，自动避让找不到贴边空位",
+      "auto_tried": ["2D 左下避让 ×5 迭代", "全页最近空白区网格搜索"],
+      "fix_checklist": [
+        "缩小印章 10–20% 后重跑（密集框图常因此腾出空位）",
+        "在 AutoCAD 手动把印章组拖到图面唯一空缝（贴页边）",
+        "确认确无空位 → 接受轻微重叠并人工签字放行"
+      ]
+    },
+    "STAMP_OFF_SHEET": {
+      "match": ["印章越出页面边界"],
+      "severity": "挡出图",
+      "title": "印章跑到页面边界外",
+      "auto_tried": [],
+      "fix_checklist": [
+        "检查 title block 比例参数是否匹配该框尺寸",
+        "在 AutoCAD 手动把印章移回图框内贴边位置",
+        "若该框为新型号 → 验证参考框尺寸后重跑"
+      ]
+    },
+    "STAMP_FLOATING": {
+      "match": ["印章漂浮在图面中部"],
+      "severity": "挡出图",
+      "title": "印章漂浮在图面中部、未贴任何页边",
+      "auto_tried": [],
+      "fix_checklist": [
+        "确认是真漂移而非合法避让（避让会贴边）",
+        "在 AutoCAD 把印章拖回贴边干净位",
+        "若反复发生 → 检查该框避让落点逻辑"
+      ]
+    },
+    "DIMENSION_ANOMALY": {
+      "match": ["尺寸异常", "Model tab"],
+      "severity": "挡出图",
+      "title": "某页尺寸与多数页不一致（疑似 Model tab 误导出）",
+      "auto_tried": [],
+      "fix_checklist": [
+        "打开 PDF 确认该页是否为 Model 空间误导出的幽灵页",
+        "检查该 layout 的 plot 配置（ConfigName 是否为空）",
+        "排除幽灵 layout 后重跑"
+      ]
+    },
+    "PAGE_COUNT_MISMATCH": {
+      "match": ["页数不匹配"],
+      "severity": "挡出图",
+      "title": "PDF 页数与预期不符",
+      "auto_tried": [],
+      "fix_checklist": [
+        "确认源 DWG 的 PaperSpace layout 数量",
+        "检查是否有空 layout 被跳过或幽灵页被多算",
+        "核对无误后重跑"
+      ]
+    },
+    "STAMP_MISALIGNED": {
+      "match": ["印章框未对齐"],
+      "severity": "可重试",
+      "title": "两个印章框左右边未对齐",
+      "auto_tried": ["重试转换（最多 3 次）"],
+      "fix_checklist": [
+        "通常自动重试即可解决；若 3 次仍失败再人工介入",
+        "检查是否有残留旧印章块（block-ref）未被清除",
+        "确认 _STAMP_CW 与对齐逻辑未被改动"
+      ]
+    },
+    "STAMP_DUPLICATE_COLOUR": {
+      "match": ["COLOUR 印章出现"],
+      "severity": "可重试",
+      "title": "COLOUR 印章在同一页出现多次",
+      "auto_tried": ["重试转换（最多 3 次）"],
+      "fix_checklist": [
+        "检查图框是否自带 COLOUR 注释块（bot 又画一个 → 重复）",
+        "确认 redraw 去重覆盖 ModelSpace 与所有 PaperSpace",
+        "自动重试通常可解决"
+      ]
+    },
+    "STAMP_DUPLICATE_AB": {
+      "match": ["AS BUILT 印章出现"],
+      "severity": "可重试",
+      "title": "AS BUILT 印章在同一页出现多次",
+      "auto_tried": ["重试转换（最多 3 次）"],
+      "fix_checklist": [
+        "检查是否有残留旧 AS BUILT 印章未清除",
+        "自动重试通常可解决"
+      ]
+    },
+    "IFC_LEFTOVER": {
+      "match": ["FOR CONSTRUCTION", "IFC 印章未清除"],
+      "severity": "可重试",
+      "title": "FOR CONSTRUCTION 旧 IFC 印章残留",
+      "auto_tried": ["重试转换（最多 3 次）"],
+      "fix_checklist": [
+        "确认 _remove_ifc_stamp 覆盖 ModelSpace + 所有 PaperSpace",
+        "检查印章是否在非标准图层（pre-bot IFC 转换）",
+        "自动重试通常可解决"
+      ]
+    },
+    "IFR_LEFTOVER": {
+      "match": ["ISSUED FOR REVIEW", "IFR 印章未清除"],
+      "severity": "可重试",
+      "title": "ISSUED FOR REVIEW 旧 IFR 印章残留",
+      "auto_tried": ["重试转换（最多 3 次）"],
+      "fix_checklist": [
+        "确认 IFR 印章块名识别覆盖该图框",
+        "自动重试通常可解决"
+      ]
+    },
+    "STAMP_MISSING": {
+      "match": ["缺少 AS BUILT 印章"],
+      "severity": "可重试",
+      "title": "该页缺少 AS BUILT 印章",
+      "auto_tried": ["重试转换（最多 3 次）"],
+      "fix_checklist": [
+        "确认该页 title block 被 _find_all_title_blocks 找到",
+        "检查 ModelSpace 印章是否被 viewport 冻结遮挡",
+        "自动重试通常可解决"
+      ]
+    },
+    "PERSONNEL_BLANK": {
+      "match": ["人员字段全空", "人员"],
+      "severity": "提示",
+      "title": "AS BUILT 行人员字段全空（非阻塞）",
+      "auto_tried": ["逐字段向上回填", "缺槽补绘"],
+      "fix_checklist": [
+        "确认源 DWG 修订行确实有人员数据（可能本就空）",
+        "人员全空是确定性结果，重跑不会改变 → 人工核对源",
+        "如源确无数据，属正常，可放行"
+      ]
+    },
+    "AUTOCAD_TIMEOUT": {
+      "match": ["超时", "timeout", "卡死"],
+      "severity": "基建",
+      "title": "AutoCAD 转换超时（偶发，非逻辑缺陷）",
+      "auto_tried": ["per-file 超时看门狗 + 强杀重启"],
+      "fix_checklist": [
+        "直接重跑该文件（偶发，大概率自愈）",
+        "重跑前看任务管理器：acad.exe CPU 平线=卡死，先 taskkill 清干净",
+        "连续 2 次超时 → 单独跑这一个，timeout 提到 600s",
+        "怀疑 DWG 超大/XREF 多 → 手动打开跑一次看是否弹窗卡住",
+        "仍失败 → 记入 known-hard 清单，人工出图"
+      ]
+    },
+    "QA_SCAN_ERROR": {
+      "match": ["QA 扫描异常"],
+      "severity": "基建",
+      "title": "QA 扫描自身异常（PyMuPDF/文件读取）",
+      "auto_tried": [],
+      "fix_checklist": [
+        "确认 PDF 文件存在且未被占用/损坏",
+        "确认 PyMuPDF (fitz) 已安装",
+        "重跑 QA"
+      ]
+    }
+  },
+  "unknown": {
+    "severity": "提示",
+    "title": "未分类的 QA 提示",
+    "auto_tried": [],
+    "fix_checklist": ["人工查看原始 warning 文本判断"]
+  }
+}
