@@ -1,0 +1,160 @@
+{
+  "NSW153-C-PLN-002 REV 1 Site Coordinates design Civil Scope_AS BUILT.pdf": {
+    "doc_id": "NSW153-C-PLN-002",
+    "size": 685659,
+    "warnings": [],
+    "verdict": "PASS"
+  },
+  "NSW153-C-PLN-002 REV 1 Site Coordinates design Equipment Scope_AS BUILT.pdf": {
+    "doc_id": "NSW153-C-PLN-002",
+    "size": 625735,
+    "warnings": [],
+    "verdict": "PASS"
+  },
+  "NSW153-C-PLN-003 REV 1 Fence Gate Layout Plan_AS BUILT.pdf": {
+    "doc_id": "NSW153-C-PLN-003",
+    "size": 440650,
+    "warnings": [],
+    "verdict": "PASS"
+  },
+  "NSW153-C-PLN-004 REV 1 External Road site entrance Internal Track Hardstands Layout Plan_AS BUILT.pdf": {
+    "doc_id": "NSW153-C-PLN-004",
+    "size": 547892,
+    "warnings": [],
+    "verdict": "PASS"
+  },
+  "NSW153-C-PLN-005 REV 1 Trench Alignment Layout Plan_AS BUILT.pdf": {
+    "doc_id": "NSW153-C-PLN-005",
+    "size": 3970157,
+    "warnings": [],
+    "verdict": "PASS"
+  },
+  "NSW153-C-PLN-006 REV 1 MVPS Foundation_AS BUILT.pdf": {
+    "doc_id": "NSW153-C-PLN-006",
+    "size": 699028,
+    "warnings": [],
+    "verdict": "PASS"
+  },
+  "NSW153-C-PLN-007 REV 1 DC Combiner Support_AS BUILT.pdf": {
+    "doc_id": "NSW153-C-PLN-007",
+    "size": 243595,
+    "warnings": [],
+    "verdict": "PASS"
+  },
+  "NSW153-C-PLN-008 REV 1 HVSB Foundation_AS BUILT.pdf": {
+    "doc_id": "NSW153-C-PLN-008",
+    "size": 933832,
+    "warnings": [],
+    "verdict": "PASS"
+  },
+  "NSW153-C-PLN-009 REV 1 BESS Foundation_AS BUILT.pdf": {
+    "doc_id": "NSW153-C-PLN-009",
+    "size": 951507,
+    "warnings": [],
+    "verdict": "PASS"
+  },
+  "NSW153-C-PLN-010 REV 1 LC Foundation_AS BUILT.pdf": {
+    "doc_id": "NSW153-C-PLN-010",
+    "size": 390815,
+    "warnings": [],
+    "verdict": "PASS"
+  },
+  "NSW153-C-PLN-011 REV 1 EIP Foundation_AS BUILT.pdf": {
+    "doc_id": "NSW153-C-PLN-011",
+    "size": 385858,
+    "warnings": [],
+    "verdict": "PASS"
+  },
+  "NSW153-C-PLN-013 REV 1 Light Pole Foundation_AS BUILT.pdf": {
+    "doc_id": "NSW153-C-PLN-013",
+    "size": 161961,
+    "warnings": [],
+    "verdict": "PASS"
+  },
+  "NSW153-C-SEC-02 REV 1 Surface Profile SectionConsolidated to Road Layout_AS BUILT.pdf": {
+    "doc_id": "NSW153-C-SEC-02",
+    "size": 3838209,
+    "warnings": [],
+    "verdict": "PASS"
+  },
+  "NSW153-E-BLD-001 REV 1 Auxiliary Cable Block Diagram_AS BUILT.pdf": {
+    "doc_id": "NSW153-E-BLD-001",
+    "size": 125640,
+    "warnings": [
+      "Page 1: 印章压住图面内容 — 自动避让无空位 [需人工检查]"
+    ],
+    "verdict": "ESCALATE"
+  },
+  "NSW153-E-BLD-002 REV 1 Earthing Block Diagram_AS BUILT.pdf": {
+    "doc_id": "NSW153-E-BLD-002",
+    "size": 418614,
+    "warnings": [],
+    "verdict": "PASS"
+  },
+  "NSW153-E-BLD-003 REV 1 Communication Block Diagram_AS BUILT.pdf": {
+    "doc_id": "NSW153-E-BLD-003",
+    "size": 330104,
+    "warnings": [],
+    "verdict": "PASS"
+  },
+  "NSW153-E-CFG-001 REV 1 String Configuration_AS BUILT.pdf": {
+    "doc_id": "NSW153-E-CFG-001",
+    "size": 345508,
+    "warnings": [],
+    "verdict": "PASS"
+  },
+  "NSW153-E-CFG-002 REV 1 DC Combiner Box Configuration_AS BUILT.pdf": {
+    "doc_id": "NSW153-E-CFG-002",
+    "size": 291092,
+    "warnings": [],
+    "verdict": "PASS"
+  },
+  "NSW153-E-PLN-001 REV 1 DC Cable Route Layout Plan_AS BUILT.pdf": {
+    "doc_id": "NSW153-E-PLN-001",
+    "size": 2490086,
+    "warnings": [],
+    "verdict": "PASS"
+  },
+  "NSW153-E-PLN-002 REV 1 Earth Cable Route Layout Plan_AS BUILT.pdf": {
+    "doc_id": "NSW153-E-PLN-002",
+    "size": 1300364,
+    "warnings": [],
+    "verdict": "PASS"
+  },
+  "NSW153-E-PLN-003 REV 1 Communication Cable Route Layout Plan_AS BUILT.pdf": {
+    "doc_id": "NSW153-E-PLN-003",
+    "size": 1570652,
+    "warnings": [],
+    "verdict": "PASS"
+  },
+  "NSW153-E-PLN-004 REV 1 HV Cable Route Layout Plan_AS BUILT.pdf": {
+    "doc_id": "NSW153-E-PLN-004",
+    "size": 889475,
+    "warnings": [],
+    "verdict": "PASS"
+  },
+  "NSW153-E-PLN-008 REV 1 CCTV Layout Plan_AS BUILT.pdf": {
+    "doc_id": "NSW153-E-PLN-008",
+    "size": 906329,
+    "warnings": [],
+    "verdict": "PASS"
+  },
+  "NSW153-GAD-001 REV 1 MVPS Cable Connection Details_AS BUILT.pdf": {
+    "doc_id": "NSW153-GAD-001",
+    "size": 911612,
+    "warnings": [],
+    "verdict": "PASS"
+  },
+  "NSW153-GAD-003 REV 1 HVSB Earth Connection Details_AS BUILT.pdf": {
+    "doc_id": "NSW153-GAD-003",
+    "size": 521143,
+    "warnings": [],
+    "verdict": "PASS"
+  },
+  "NSW153-GAD-004 REV 1 MVPS Earth Connection Details_AS BUILT.pdf": {
+    "doc_id": "NSW153-GAD-004",
+    "size": 436283,
+    "warnings": [],
+    "verdict": "PASS"
+  }
+}
