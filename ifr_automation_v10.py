@@ -10303,22 +10303,43 @@ class AsBuiltManager(IFCManager):
 
     # ── Filename builders ────────────────────────────────────────────────
 
+    @staticmethod
+    def _sanitize_ab_desc(description: str) -> str:
+        """Strip chars illegal in filenames AND chars that break AutoCAD -PUBLISH
+        ('()' and '&'), then collapse whitespace. Shared by the AB PDF and AB DWG
+        name builders so the native DWG and its PDF always carry the SAME
+        description (e.g. 'Fence & Gate' → 'Fence Gate' in both)."""
+        desc = re.sub(r'[<>:"/\\|?*()&]', '', description or '').strip()
+        return re.sub(r'\s+', ' ', desc)
+
     def _build_ab_pdf_filename(self, doc_id: str, description: str, ab_rev: int) -> str:
         """Build AS BUILT PDF filename: {doc_id} REV {N} {desc}_AS BUILT"""
-        desc = re.sub(r'[<>:"/\\|?*()&]', '', description).strip()
-        desc = re.sub(r'\s+', ' ', desc)
-        return f"{doc_id} REV {ab_rev} {desc}_AS BUILT"
+        return f"{doc_id} REV {ab_rev} {self._sanitize_ab_desc(description)}_AS BUILT"
 
-    def _build_ab_dwg_name(self, source_name: str, ab_rev: int) -> str:
-        """Build AB DWG filename from IFC source: replace _IFC→_AB, update rev number."""
-        stem = Path(source_name).stem
-        ext = Path(source_name).suffix
-        new_stem = re.sub(r'_IFC$', '_AB', stem, flags=re.IGNORECASE)
-        if new_stem == stem:
-            new_stem = stem + '_AB'
-        new_stem = re.sub(r'([Rr]ev\.?\s*)(\d+)',
-                         lambda m: m.group(1) + str(ab_rev), new_stem)
-        return new_stem + ext
+    @staticmethod
+    def _ab_page_suffix(idx: int, total: int) -> str:
+        """Per-page distinguisher that keeps a multi-DWG doc-ID's AB natives
+        unique ('-01', '-02', …); '' when the doc-ID is a single DWG."""
+        return f"-{idx:02d}" if total > 1 else ''
+
+    def _build_ab_dwg_name(self, doc_id: str, description: str, ab_rev: int,
+                           ext: str = '.dwg', page_suffix: str = '') -> str:
+        """Canonical AS BUILT native DWG filename — CROSS-PROJECT, universal.
+
+        Built from doc-ID + description + NUMERIC ab_rev — NOT transformed from
+        the source filename. This mirrors `_build_ab_pdf_filename`, so the native
+        DWG and its PDF always agree no matter how the source IFC/native DWG was
+        named (letter revs like '_RevB', a missing '_IFC' suffix, or a hand-edited
+        description by another engineer all normalise to the same standard name).
+
+        Standard: {doc_id}{page_suffix}_{desc}_Rev{N}_AB{ext}
+          e.g.  NSW153-C-PLN-003_Fence Gate Layout Plan_Rev1_AB.dwg
+        `page_suffix` ('-01', '-02', …) keeps multi-page doc-IDs unique.
+        """
+        desc = self._sanitize_ab_desc(description)
+        base = f"{doc_id}{page_suffix}"
+        stem = f"{base}_{desc}_Rev{ab_rev}_AB" if desc else f"{base}_Rev{ab_rev}_AB"
+        return stem + ext
 
     # ── Title block update ───────────────────────────────────────────────
 
@@ -10555,6 +10576,75 @@ class AsBuiltManager(IFCManager):
             self._com_retry(lambda: target_attr.Update())
         except Exception:
             pass
+
+    def _align_attr_y(self, target_attr, ref_attr):
+        """Copy ref_attr's VERTICAL position (InsertionPoint.Y and
+        TextAlignmentPoint.Y) onto target_attr, preserving target's own X/Z.
+
+        Y-analog of _align_attr_x. Snaps a single attribute whose slot the block
+        definition mis-authored onto the WRONG row's baseline back onto its true
+        row. Real defect it fixes — C-PLN-002 Equipment Scope: a revision row's
+        DESIGNED slot sits a full row UP at the AS BUILT row's Y, so its value
+        ('ACE') floats up and collides with the AS BUILT row's drawn fallback
+        'ACE' = doubled glyph, while that row's own DES cell shows blank. The
+        stamp QA never saw it (personnel cells are exploded vector → no PDF
+        text). Best-effort + cosmetic; any COM failure is swallowed.
+        """
+        import pythoncom as _pc
+        def _set_y(getter, setter):
+            try:
+                ref = self._com_retry(getter[0])
+                tgt = self._com_retry(getter[1])
+                if ref is None or tgt is None:
+                    return
+                if abs(float(ref[1]) - float(tgt[1])) < 1e-6:
+                    return  # already aligned — skip the COM write
+                v = win32com.client.VARIANT(
+                    _pc.VT_ARRAY | _pc.VT_R8,
+                    [float(tgt[0]), float(ref[1]), float(tgt[2])])
+                self._com_retry(lambda: setter(v))
+            except Exception:
+                pass
+        _set_y((lambda: ref_attr.InsertionPoint, lambda: target_attr.InsertionPoint),
+               lambda v: setattr(target_attr, 'InsertionPoint', v))
+        _set_y((lambda: ref_attr.TextAlignmentPoint, lambda: target_attr.TextAlignmentPoint),
+               lambda v: setattr(target_attr, 'TextAlignmentPoint', v))
+        try:
+            self._com_retry(lambda: target_attr.Update())
+        except Exception:
+            pass
+
+    def _normalise_revrow_y(self, attrs: Dict) -> int:
+        """Snap every revision-row attribute whose Y deviates from its row's
+        MEDIAN sibling Y back onto a same-row reference (fixes a block that
+        mis-authored one slot onto the wrong row — see _align_attr_y). Median is
+        robust to the single outlier; NO-OP for well-formed rows (deviation ≈ 0),
+        so passing drawings stay byte-identical. Returns #attributes moved (for
+        QA). Tag-/project-agnostic."""
+        import statistics as _stats
+        rows = {}
+        for tag, a in attrs.items():
+            j = 0
+            while j < len(tag) and tag[j].isdigit():
+                j += 1
+            if j > 0:
+                rows.setdefault(tag[:j], []).append(a)
+        moved = 0
+        for _rn, cells in rows.items():
+            pts = [(a, self._attr_point(a)) for a in cells]
+            ys = [ip[1] for _a, ip in pts if ip is not None]
+            if len(ys) < 3:
+                continue  # need a majority to trust the median
+            med = _stats.median(ys)
+            ref = next((a for a, ip in pts
+                        if ip is not None and abs(ip[1] - med) < 1.0), None)
+            if ref is None:
+                continue
+            for a, ip in pts:
+                if ip is not None and abs(ip[1] - med) > 2.0:
+                    self._align_attr_y(a, ref)
+                    moved += 1
+        return moved
 
     def _attr_point(self, attr):
         """Return an attribute's InsertionPoint as a (x, y, z) tuple, or None.
@@ -11435,22 +11525,19 @@ class AsBuiltManager(IFCManager):
             ab_rev = 1
         result['ab_rev'] = ab_rev
 
-        # Build output paths
+        # Build output paths — name canonically from doc-ID + description +
+        # NUMERIC ab_rev (NOT the source filename), identical in both SaveAs
+        # modes, so the native DWG and its PDF always agree cross-project.
+        ab_dwg_name = self._build_ab_dwg_name(doc_id, description, ab_rev,
+                                              ext=dwg_path.suffix)
+        ab_pdf_name = self._build_ab_pdf_filename(doc_id, description, ab_rev)
+        ab_pdf_path = self.ab_output / f"{ab_pdf_name}.pdf"
         if self._save_in_source_dir:
-            ab_dwg_stem = re.sub(r'\s*_?IFC$', '_AsBuilt', dwg_path.stem,
-                                 flags=re.IGNORECASE)
-            ab_dwg_name = ab_dwg_stem + dwg_path.suffix
             ab_dwg_path = ifc_source['source_dir'] / ab_dwg_name
-            ab_pdf_stem = re.sub(r'\s*_?IFC$', '_As Built', dwg_path.stem,
-                                 flags=re.IGNORECASE)
-            ab_pdf_path = self.ab_output / f"{ab_pdf_stem}.pdf"
             ab_subfolder = None
         else:
             ab_subfolder = dwg_info['folder'] / f"Rev.{ab_rev} - AB"
-            ab_dwg_name = self._build_ab_dwg_name(dwg_path.name, ab_rev)
             ab_dwg_path = ab_subfolder / ab_dwg_name
-            ab_pdf_name = self._build_ab_pdf_filename(doc_id, description, ab_rev)
-            ab_pdf_path = self.ab_output / f"{ab_pdf_name}.pdf"
 
         if self.dry_run:
             result['success'] = True
@@ -11827,29 +11914,23 @@ class AsBuiltManager(IFCManager):
             ab_rev = 1
         result['ab_rev'] = ab_rev
 
-        # Working folder for AB DWGs
+        # PDF + working folder — canonical names, identical in both SaveAs modes.
+        ab_pdf_name = self._build_ab_pdf_filename(doc_id, description, ab_rev)
+        ab_pdf_path = self.ab_output / f"{ab_pdf_name}.pdf"
         if self._save_in_source_dir:
             ab_subfolder = None
             ab_dwg_dir = ifc_source['source_dir']
-            first_stem = re.sub(r'\s*_?IFC$', '_As Built', page_dwgs[0].stem,
-                                flags=re.IGNORECASE)
-            ab_pdf_path = self.ab_output / f"{first_stem}.pdf"
         else:
             ab_subfolder = dwg_info['folder'] / f"Rev.{ab_rev} - AB"
             ab_dwg_dir = ab_subfolder
-            ab_pdf_name = self._build_ab_pdf_filename(doc_id, description, ab_rev)
-            ab_pdf_path = self.ab_output / f"{ab_pdf_name}.pdf"
 
         if self.dry_run:
             result['success'] = True
-            if self._save_in_source_dir:
-                result['dwg_paths'] = [
-                    str(ab_dwg_dir / (re.sub(r'\s*_?IFC$', '_AsBuilt', p.stem,
-                                             flags=re.IGNORECASE) + p.suffix))
-                    for p in page_dwgs]
-            else:
-                result['dwg_paths'] = [str(ab_dwg_dir / self._build_ab_dwg_name(p.name, ab_rev))
-                                       for p in page_dwgs]
+            result['dwg_paths'] = [
+                str(ab_dwg_dir / self._build_ab_dwg_name(
+                    doc_id, description, ab_rev, ext=p.suffix,
+                    page_suffix=self._ab_page_suffix(idx, len(page_dwgs))))
+                for idx, p in enumerate(page_dwgs, 1)]
             result['pdf_path'] = str(ab_pdf_path)
             return result
 
@@ -11868,12 +11949,9 @@ class AsBuiltManager(IFCManager):
             page_label = page_dwg.stem
             print(f"    [{page_idx}/{total_pages}] {page_label}")
 
-            if self._save_in_source_dir:
-                ab_dwg_stem = re.sub(r'\s*_?IFC$', '_AsBuilt', page_dwg.stem,
-                                     flags=re.IGNORECASE)
-                ab_dwg_name = ab_dwg_stem + page_dwg.suffix
-            else:
-                ab_dwg_name = self._build_ab_dwg_name(page_dwg.name, ab_rev)
+            ab_dwg_name = self._build_ab_dwg_name(
+                doc_id, description, ab_rev, ext=page_dwg.suffix,
+                page_suffix=self._ab_page_suffix(page_idx, total_pages))
             ab_dwg_path = ab_dwg_dir / ab_dwg_name
 
             doc = None
