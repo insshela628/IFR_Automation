@@ -1996,12 +1996,24 @@ class VersionManager:
                 continue
         return file_groups
 
+    @staticmethod
+    def _pdf_ver_key(item):
+        """PDF 组内版本新旧键 (越大越新): (阶段, 版本号, mtime)。版本号优先于 mtime
+        (Dropbox 同步会改 mtime, 见 CLAUDE.md「Incremental Check」)。item=(path, version_str, mtime);
+        version_str 已解析: 数字=IFC 阶段(更新)、字母=IFR 阶段、NO_VERSION 最旧。mtime 仅平手。"""
+        v = (item[1] or '').strip().upper()
+        if v.isdigit():
+            return (2, int(v), item[2])
+        if v[:1].isalpha() and v != 'NO_VERSION':
+            return (1, ord(v[0]) - ord('A') + 1, item[2])
+        return (0, -1, item[2])
+
     def identify_old_versions(self, file_groups: Dict, ss_folder: Path) -> List[Tuple[Path, Path, str]]:
         files_to_move = []
         for base_name, files in file_groups.items():
             if len(files) <= 1:
                 continue
-            files_sorted = sorted(files, key=lambda x: x[2], reverse=True)
+            files_sorted = sorted(files, key=self._pdf_ver_key, reverse=True)
             newest_file = files_sorted[0]
             for file_path, version, modified_time in files_sorted[1:]:
                 dest_path = ss_folder / file_path.name
@@ -2127,7 +2139,7 @@ class VersionManager:
         if multi_version_groups and show_details:
             print(f"    发现 {len(multi_version_groups)} 组多版本文件:")
             for base_name, files in multi_version_groups.items():
-                files_sorted = sorted(files, key=lambda x: x[2], reverse=True)
+                files_sorted = sorted(files, key=self._pdf_ver_key, reverse=True)  # 与决策同序
                 print(f"\n      基础文件: {base_name}")
                 for i, (file_path, version, modified_time) in enumerate(files_sorted):
                     status = "[保留]" if i == 0 else "[->SS]"
@@ -2240,6 +2252,28 @@ def _classify_dwg(filename: str) -> Tuple[str, str]:
     if m:
         return ('IFR', m.group(1).upper())
     return ('OTHER', '')
+
+
+def _rev_sort_key(f) -> Tuple[int, object]:
+    """版本新旧排序键 (越大越新): (版本号, mtime)。
+
+    版本号优先于 mtime —— Dropbox 同步会改 mtime (见本 CLAUDE.md「Incremental Check:
+    NO mtime comparison」), 纯 mtime 会把更新的修订误判为旧版、错降进 SS。
+    IFR=字母 A<B<C (A→1), IFC=数字 0<1<2; mtime 仅在版本号相同时做平手。
+    SSOT: mainv3 §4.3 + 记忆 feedback_current_version_by_mtime (跨 drag 分拣 / 本 version manager 通用)。
+    """
+    rev = (getattr(f, 'revision', '') or '')
+    rt = getattr(f, 'rev_type', '')
+    if rt == 'IFC':
+        try:
+            rank = int(re.sub(r'\D', '', rev) or -1)
+        except (ValueError, TypeError):
+            rank = -1
+    elif rt == 'IFR':
+        rank = (ord(rev[0].upper()) - ord('A') + 1) if rev[:1].isalpha() else 0
+    else:
+        rank = -1
+    return (rank, getattr(f, 'mtime', None))
 
 
 def _parse_folder_name(folder_name: str) -> Tuple[str, str]:
@@ -2383,29 +2417,29 @@ class NativeVersionManager:
         other_files = [f for f in files if f.rev_type == 'OTHER']
         ss_folder = self._find_or_create_ss_folder(folder)
 
-        # v10: IFR — 按扩展名分组，每组保留 mtime 最新的文件
+        # v10: IFR — 按扩展名分组，每组保留最新版 (版本号优先, mtime 仅平手; _rev_sort_key)
         if ifr_files:
             ifr_by_ext: dict[str, list] = {}
             for f in ifr_files:
                 ifr_by_ext.setdefault(f.path.suffix.lower(), []).append(f)
             for ext, group in ifr_by_ext.items():
-                group_sorted = sorted(group, key=lambda f: f.mtime, reverse=True)
+                group_sorted = sorted(group, key=_rev_sort_key, reverse=True)
                 result.kept_ifr_all.append(group_sorted[0])
                 for old in group_sorted[1:]:
                     self._plan_move(result, old, ss_folder, "older IFR revision")
-            result.kept_ifr = max(result.kept_ifr_all, key=lambda f: f.mtime)
+            result.kept_ifr = max(result.kept_ifr_all, key=_rev_sort_key)
 
-        # v10: IFC — 按扩展名分组，每组保留 mtime 最新的文件
+        # v10: IFC — 按扩展名分组，每组保留最新版 (版本号优先, mtime 仅平手; _rev_sort_key)
         if ifc_files:
             ifc_by_ext: dict[str, list] = {}
             for f in ifc_files:
                 ifc_by_ext.setdefault(f.path.suffix.lower(), []).append(f)
             for ext, group in ifc_by_ext.items():
-                group_sorted = sorted(group, key=lambda f: f.mtime, reverse=True)
+                group_sorted = sorted(group, key=_rev_sort_key, reverse=True)
                 result.kept_ifc_all.append(group_sorted[0])
                 for old in group_sorted[1:]:
                     self._plan_move(result, old, ss_folder, "older IFC revision")
-            result.kept_ifc = max(result.kept_ifc_all, key=lambda f: f.mtime)
+            result.kept_ifc = max(result.kept_ifc_all, key=_rev_sort_key)
 
         # v10: OTHER — 仅当存在同扩展名的版本化文件时才移到 SS
         for other in other_files:
@@ -2432,15 +2466,15 @@ class NativeVersionManager:
                 ifr_dwgs = [f for f in group if f.rev_type == 'IFR']
                 ifc_dwgs = [f for f in group if f.rev_type == 'IFC']
                 if ifc_dwgs:
-                    # 有 IFC DWG → 只保留最新 IFC，IFR 字母版本可移到 SS
-                    protected_paths.add(str(max(ifc_dwgs, key=lambda f: f.mtime).path))
+                    # 有 IFC DWG → 只保留最新 IFC (版本号优先), IFR 字母版本可移到 SS
+                    protected_paths.add(str(max(ifc_dwgs, key=_rev_sort_key).path))
                     for f in ifr_dwgs:
                         movable_paths.add(str(f.path))
                 elif ifr_dwgs:
-                    # 无 IFC → 保留最新 IFR
-                    protected_paths.add(str(max(ifr_dwgs, key=lambda f: f.mtime).path))
+                    # 无 IFC → 保留最新 IFR (版本号优先)
+                    protected_paths.add(str(max(ifr_dwgs, key=_rev_sort_key).path))
                 else:
-                    # 无 IFR/IFC 分类 → 保留最新
+                    # 无 IFR/IFC 分类 → 保留最新 (无版本号 → 回退 mtime)
                     protected_paths.add(str(max(group, key=lambda f: f.mtime).path))
             # 从移动列表中移除受保护的 DWG
             if protected_paths:

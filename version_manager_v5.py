@@ -216,6 +216,18 @@ class VersionManager:
 
         return file_groups
 
+    @staticmethod
+    def _pdf_ver_key(item):
+        """PDF 组内版本新旧键 (越大越新): (阶段, 版本号, mtime)。版本号优先于 mtime
+        (Dropbox 同步会改 mtime), item=(path, version_str, mtime); 数字=IFC 阶段(更新)、
+        字母=IFR 阶段、NO_VERSION 最旧; mtime 仅平手。SSOT: mainv3 §4.3。"""
+        v = (item[1] or '').strip().upper()
+        if v.isdigit():
+            return (2, int(v), item[2])
+        if v[:1].isalpha() and v != 'NO_VERSION':
+            return (1, ord(v[0]) - ord('A') + 1, item[2])
+        return (0, -1, item[2])
+
     def identify_old_versions(self, file_groups: Dict[str, List[Tuple[Path, str, datetime]]], ss_folder: Path) -> List[Tuple[Path, Path, str]]:
         """
         Identify files that should be moved to SS folder.
@@ -230,8 +242,8 @@ class VersionManager:
             if len(files) <= 1:
                 continue
 
-            # Sort by modified time, newest first
-            files_sorted = sorted(files, key=lambda x: x[2], reverse=True)
+            # 版本号优先, mtime 仅平手 (_pdf_ver_key) — 见 CLAUDE.md「Incremental Check: NO mtime」
+            files_sorted = sorted(files, key=self._pdf_ver_key, reverse=True)
 
             # Keep the newest file, mark others for moving
             newest_file = files_sorted[0]
@@ -401,7 +413,7 @@ class VersionManager:
 
                 # Display groups
                 for base_name, files in multi_version_groups.items():
-                    files_sorted = sorted(files, key=lambda x: x[2], reverse=True)
+                    files_sorted = sorted(files, key=self._pdf_ver_key, reverse=True)  # 与决策同序
                     print(f"\n      基础文件: {base_name}")
 
                     for i, (file_path, version, modified_time) in enumerate(files_sorted):
@@ -576,6 +588,24 @@ def _classify_dwg(filename: str) -> Tuple[str, str]:
     if m:
         return ('IFR', m.group(1).upper())
     return ('OTHER', '')
+
+
+def _rev_sort_key(f) -> Tuple[int, object]:
+    """版本新旧排序键 (越大越新): (版本号, mtime)。版本号优先于 mtime —— Dropbox 同步会改
+    mtime, 纯 mtime 会把更新的修订误判为旧版、错降进 SS。IFR=字母 A<B<C (A→1), IFC=数字 0<1<2;
+    mtime 仅在版本号相同时平手。SSOT: mainv3 §4.3 + 记忆 feedback_current_version_by_mtime。"""
+    rev = (getattr(f, 'revision', '') or '')
+    rt = getattr(f, 'rev_type', '')
+    if rt == 'IFC':
+        try:
+            rank = int(re.sub(r'\D', '', rev) or -1)
+        except (ValueError, TypeError):
+            rank = -1
+    elif rt == 'IFR':
+        rank = (ord(rev[0].upper()) - ord('A') + 1) if rev[:1].isalpha() else 0
+    else:
+        rank = -1
+    return (rank, getattr(f, 'mtime', None))
 
 
 def _parse_folder_name(folder_name: str) -> Tuple[str, str]:
@@ -812,32 +842,31 @@ class NativeVersionManager:
         # v5.1: in milestone-folder mode, older IFC → dedicated 'IFC/' subfolder
         ifc_dest = (folder / 'IFC') if self.ifc_folder_mode else ss_folder
 
-        # v5.0: IFR — 按扩展名分组，每组保留 mtime 最新的文件
+        # v5.0: IFR — 按扩展名分组，每组保留最新版 (版本号优先, mtime 仅平手; _rev_sort_key)
         if ifr_files:
             ifr_by_ext: dict[str, list] = {}
             for f in ifr_files:
                 ifr_by_ext.setdefault(f.path.suffix.lower(), []).append(f)
             for ext, group in ifr_by_ext.items():
-                group_sorted = sorted(group, key=lambda f: f.mtime, reverse=True)
+                group_sorted = sorted(group, key=_rev_sort_key, reverse=True)
                 result.kept_ifr_all.append(group_sorted[0])
                 for old in group_sorted[1:]:
                     self._plan_move(result, old, ss_folder, "older IFR revision")
-            # kept_ifr 保持向后兼容：指向 mtime 最新的那个文件
-            result.kept_ifr = max(result.kept_ifr_all, key=lambda f: f.mtime)
+            result.kept_ifr = max(result.kept_ifr_all, key=_rev_sort_key)
 
-        # v5.0: IFC — 按扩展名分组，每组保留 mtime 最新的文件
+        # v5.0: IFC — 按扩展名分组，每组保留最新版 (版本号优先, mtime 仅平手; _rev_sort_key)
         if ifc_files:
             ifc_by_ext: dict[str, list] = {}
             for f in ifc_files:
                 ifc_by_ext.setdefault(f.path.suffix.lower(), []).append(f)
             for ext, group in ifc_by_ext.items():
-                group_sorted = sorted(group, key=lambda f: f.mtime, reverse=True)
+                group_sorted = sorted(group, key=_rev_sort_key, reverse=True)
                 result.kept_ifc_all.append(group_sorted[0])
                 for old in group_sorted[1:]:
                     action_type = 'move_to_ifc' if self.ifc_folder_mode else 'move_to_ss'
                     self._plan_move(result, old, ifc_dest, "older IFC revision",
                                     action_type=action_type)
-            result.kept_ifc = max(result.kept_ifc_all, key=lambda f: f.mtime)
+            result.kept_ifc = max(result.kept_ifc_all, key=_rev_sort_key)
 
         # v5.1: AS BUILT — never renamed/superseded. In milestone-folder mode,
         # route to the per-drawing 'Rev.{N} - AB/' folder; otherwise leave in place.
@@ -1463,7 +1492,7 @@ class InteractiveUI:
 
                 # Show details of each group
                 for base_name, files in analysis['multi_version_groups'].items():
-                    files_sorted = sorted(files, key=lambda x: x[2], reverse=True)
+                    files_sorted = sorted(files, key=VersionManager._pdf_ver_key, reverse=True)  # 与决策同序
                     print(f"\n      基础文件: {base_name}")
                     for i, (file_path, version, modified_time) in enumerate(files_sorted):
                         status = "[保留]" if i == 0 else "[->SS]"
