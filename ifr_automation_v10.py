@@ -13021,6 +13021,7 @@ class PipelineOrchestrator:
             'health_check': None,
             'ifr_sync': None,
             'version_mgmt': None,
+            'approval_version': None,
             'ifc_transmittal': None,
             'sharepoint_sync': None,
             'deliverable': None,
@@ -13123,6 +13124,21 @@ class PipelineOrchestrator:
                 UIHelper.print_error(f"版本管理异常: {e}")
                 results['version_mgmt'] = {'error': str(e)}
                 results['success'] = False
+
+            # 顺带: SAPN 审批文档版本管理 (有 9.Approval/SAPN 才跑; 与图纸版本管理同阶段,
+            #       互不干扰 — 不同路径/版本语义。SSOT: mainv3 §4.3)
+            try:
+                import approval_version_manager as avm
+                amgr = avm.ApprovalVersionManager(project_path.parent, dry_run=self.dry_run)
+                appr = amgr.process_project_path(project_path, verbose=True)
+                if appr is not None:
+                    results['approval_version'] = appr
+                    UIHelper.print_success(
+                        f"SAPN 审批版本管理: {'将降' if self.dry_run else '已降'} SS {appr['moved']}"
+                        + (f", 失败 {appr['failed']}" if appr.get('failed') else ""))
+            except Exception as e:
+                UIHelper.print_error(f"SAPN 审批版本管理异常(不影响主流程): {e}")
+                results['approval_version'] = {'error': str(e)}
 
         # Stage 3: IFC Transmittal (scan + dedup, pass ifc_map to Stage 5)
         if 'ifc_transmittal' in self.stages:

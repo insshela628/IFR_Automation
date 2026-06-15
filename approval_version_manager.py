@@ -225,36 +225,58 @@ class ApprovalVersionManager:
                 time.sleep(2)
         return False
 
-    # ── 跑全部 ──────────────────────────────────────────────────
+    # ── 执行单个 SAPN (CLI 与 pipeline 共用) ────────────────────
+    def execute_sapn(self, sapn: Path, label: str = "", verbose: bool = True) -> dict:
+        """处理一个 SAPN: 规划 + (dry-run 打印 / apply 移动)。返回 {planned, moved, failed}。"""
+        plan = self.process_sapn(sapn)
+        n = sum(len(mv) for _, mv in plan)
+        stats = {"planned": n, "moved": 0, "failed": 0}
+        if not plan:
+            if verbose:
+                print(f"  {label}✓ SAPN 已最新, 无需移动" if label else "  ✓ SAPN 已最新")
+            return stats
+        if verbose:
+            print(f"  {label}SAPN 待降 SS: {n}")
+        for cat, moves in plan:
+            if verbose:
+                print(f"    {cat}:")
+            for src, dest, grp, _ in moves:
+                if verbose:
+                    print(f"      [{grp}] {src.name}")
+                if self.dry_run:
+                    stats["moved"] += 1
+                elif self._do_move(src, dest):
+                    stats["moved"] += 1
+                else:
+                    stats["failed"] += 1
+                    if verbose:
+                        print(f"          ⚠ 移动失败(占用?): {src.name}")
+        return stats
+
+    # ── 单项目入口 (pipeline 顺带调用) ──────────────────────────
+    def process_project_path(self, project_path: Path, verbose: bool = True) -> dict | None:
+        """给 pipeline 用: 找该项目的 9.Approval/SAPN, 有则做版本管理。无 SAPN → None。"""
+        for mid in ("Design/Engineering", "Engineering"):
+            sapn = Path(project_path) / mid / "9. Approval" / "SAPN"
+            if sapn.is_dir():
+                return self.execute_sapn(sapn, verbose=verbose)
+        return None
+
+    # ── 跑全部 SA 项目 (CLI 独立运行) ───────────────────────────
     def run(self, project_filter: str | None = None) -> dict:
         sapns = self.find_sapn_dirs(project_filter)
         tag = "DRY-RUN" if self.dry_run else "APPLY"
         print(f"\n=== Approval Version Manager [{tag}] — {len(sapns)} 个 SA 项目有 SAPN ===")
-        total = {"projects": 0, "moved": 0, "scanned_cats": 0}
+        total = {"projects": 0, "moved": 0, "failed": 0}
         for pname, sapn in sapns:
-            plan = self.process_sapn(sapn)
-            n = sum(len(mv) for _, mv in plan)
-            if not plan:
-                print(f"\n[{pname}] ✓ 已最新, 无需移动")
-                total["projects"] += 1
-                continue
-            print(f"\n[{pname}]  待降 SS: {n}")
-            for cat, moves in plan:
-                print(f"  {cat}:")
-                for src, dest, grp, _ in moves:
-                    print(f"    [{grp}] {src.name}")
-                    if not self.dry_run:
-                        ok = self._do_move(src, dest)
-                        if ok:
-                            total["moved"] += 1
-                        else:
-                            print(f"        ⚠ 移动失败(占用?): {src.name}")
-                    total["scanned_cats"] += 1
-            if self.dry_run:
-                total["moved"] += n
+            print(f"\n[{pname}]")
+            s = self.execute_sapn(sapn, verbose=True)
             total["projects"] += 1
+            total["moved"] += s["moved"]
+            total["failed"] += s["failed"]
         print(f"\n=== 汇总: {total['projects']} 项目, "
-              f"{'将降' if self.dry_run else '已降'} SS {total['moved']} 个 ===")
+              f"{'将降' if self.dry_run else '已降'} SS {total['moved']} 个"
+              f"{', 失败 ' + str(total['failed']) if total['failed'] else ''} ===")
         if self.dry_run:
             print("(预览, 未移动任何文件; 加 --apply 落盘)")
         return total
