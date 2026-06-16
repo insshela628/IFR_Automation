@@ -25,7 +25,8 @@ AutoCAD IFR sync and IFC conversion automation for solar farm engineering projec
 |-------|---------|
 | `IFRAutomation` | Core IFR file sync (drawings, reports, schedules) |
 | `DeliverableManager` | Deliverable Excel update, cross-check, highlight |
-| `VersionManager` | SS cleanup, file versioning |
+| `VersionManager` | SS cleanup, file versioning (图纸 IFR字母/IFC数字, 按 doc-ID)。当前版判定 `_rev_sort_key`/`_pdf_ver_key`: 版本号优先、mtime 仅平手 (Dropbox 改 mtime, 见 Incremental Check) |
+| `ApprovalVersionManager` (`approval_version_manager.py`) | **SAPN 审批文档**版本管理 (跨所有 SA 项目, 与图纸 VersionManager 不同路径/语义, 互不干扰)。扫 `2.SA/*/9.Approval/SAPN`, 类别文件夹从磁盘发现 (不硬编码; 类别 SSOT=mainv3 §4.3 + naming_schema by_state.SA), 每类内三级判定 (状态>Rev/Issue字母>mtime) 留当前、旧版进类别 SS。默认 dry-run。CLI 独立运行(agent 可单独触发) + pipeline Stage 2 顺带调 `process_project_path`。**SA/SAPN-scoped** (NSW=CA 不在此, 见 §4.3 by_state)。⚠ 子类型分组对 messy 真实数据可能误并不同文档/留批注版 — `--apply` 前看 dry-run |
 | `IFCStampMixin` | Shared IFC stamp logic (COM draw: MText + bold rect, proportional positioning) |
 | `IFCManager` | Single-page IFC conversion (inherits IFCStampMixin) |
 | `PanelIFCManager` | Multi-page panel IFC conversion + PUBLISH PDF (inherits IFCStampMixin) |

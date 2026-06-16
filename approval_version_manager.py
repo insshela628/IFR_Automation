@@ -37,11 +37,9 @@ from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
 
-# SAPN 类别文件夹 (mainv3 §4.3)。键=文件夹名前缀匹配, 值=该类别的子类型识别器。
-_SAPN_CATEGORIES = [
-    "1. Application", "2. Connection Offer (CO)", "3. Engineering Report (ER)",
-    "4. Protection", "5. XR Impedance", "6. Correspondence",
-]
+# 类别清单不在此硬编码 (铁律2): SAPN 标准类别由 SSOT (mainv3 §4.3 + naming_schema
+# by_state.SA.categories) 定义、kickoff 建好。本模块只对**磁盘上实际存在的类别文件夹**
+# 做版本管理 —— 故自动兼容将来按需加的非标准类 (Power Quality / Commissioning 等)。
 _SS_NAMES = {"ss", "superseded", "superceded"}
 
 
@@ -201,13 +199,17 @@ class ApprovalVersionManager:
     # ── 处理一个项目的整个 SAPN ─────────────────────────────────
     def process_sapn(self, sapn: Path):
         plan = []   # (category, moves)
-        for cat in _SAPN_CATEGORIES:
-            cat_dir = sapn / cat
-            if not cat_dir.is_dir():
-                continue
+        # 从磁盘发现类别文件夹 (不硬编码清单, 铁律2): SAPN 下每个非 SS 子目录 = 一个类别。
+        try:
+            cat_dirs = sorted((d for d in sapn.iterdir()
+                               if d.is_dir() and d.name.lower() not in _SS_NAMES),
+                              key=lambda d: d.name)
+        except OSError:
+            return plan
+        for cat_dir in cat_dirs:
             mv = self._process_category(cat_dir)
             if mv:
-                plan.append((cat, mv))
+                plan.append((cat_dir.name, mv))
         return plan
 
     def _do_move(self, src: Path, dest: Path) -> bool:
