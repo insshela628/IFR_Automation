@@ -18,7 +18,7 @@ import sys, re
 from pathlib import Path
 import fitz
 
-sys.path.insert(0, r"D:\1. SOP\SOP_Stage 2 IFR Sync√\V6√")
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # 仓自指: 自动定位, 迁移无需改
 from test_cole2_qa import analyze_pdf, _stamp_rects  # reuse verified core
 
 AB_DIR = Path(

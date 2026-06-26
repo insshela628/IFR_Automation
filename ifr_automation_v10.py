@@ -112,14 +112,14 @@ def send_telegram_notification(message: str, parse_mode: str = "HTML") -> bool:
     """Send a notification message to the configured Telegram chat.
 
     Reads TELEGRAM_TOKEN and TELEGRAM_CHAT_ID from the .env file at:
-      D:/1. SOP/SOP_Project Status&Tasks√/V3 Manul&Auto CSV to excel/Automatic Export√/.env
+      <GGE_DEV_ROOT|D:/1.dev>/work/L5-decision/project-status/V3 Manul&Auto CSV to excel/Automatic Export√/.env
 
     Returns True if sent successfully, False otherwise (silently fails).
     """
     if not REQUESTS_AVAILABLE:
         return False
 
-    env_path = Path(r"D:\1. SOP\SOP_Project Status&Tasks√\V3 Manul&Auto CSV to excel\Automatic Export√\.env")
+    env_path = Path(os.environ.get("GGE_DEV_ROOT", r"D:\1.dev")) / "work" / "L5-decision" / "project-status" / "V3 Manul&Auto CSV to excel" / "Automatic Export√" / ".env"
     if not env_path.exists():
         return False
 
@@ -9195,7 +9195,7 @@ class IssueRegisterManager:
 
     # Team allocation lookup root — D: drive private vault ONLY.
     # Dropbox is company-visible and MUST NOT contain Team-Allocation.md.
-    ALLOCATION_LOOKUP_ROOT = Path(r"D:\3.Career\obsidian-vault\04-Work-SOP\Projects")
+    ALLOCATION_LOOKUP_ROOT = Path(os.environ.get("GGE_DEV_ROOT", r"D:\1.dev")) / "me" / "vault" / "04-Work-SOP" / "Projects"
 
     # IFC folder for title-block ground truth
     IFC_FOLDER = "Design/Engineering/1. Drawings/4. IFC(Client)"
@@ -9804,6 +9804,48 @@ _RE_IFC_SUBFOLDER = re.compile(
 # Regex to extract REV N from AS BUILT PDF filename
 _RE_AB_REV_IN_FILENAME = re.compile(r'\bREV\s*(\d+)\b', re.IGNORECASE)
 
+# Separator-aware AB rev/marker parsing for the deliverable supersede grouper.
+# NOTE: `\b` is unusable here — '_' is a regex word char, so '_Rev1' has no
+# boundary before 'Rev' (the bug that made `_RE_AB_REV_IN_FILENAME` silently
+# miss every underscore-separated rev). These anchor on start/separator instead,
+# and are case-insensitive (REV / Rev / rev) and handle 'Rev.N' + decimal sub-revs.
+_RE_AB_REV_ANY = re.compile(r'(?:^|[\s_\-(])rev\.?\s*(\d+)(?:\.(\d+))?',
+                            re.IGNORECASE)
+_RE_AB_EXP_MARK = re.compile(r'[_\-\s]exp\b', re.IGNORECASE)
+# Markers stripped to form a title signature. Separator/edge-anchored on BOTH
+# sides so a bare 'AB'/'IFC' inside a real word ('CABLE', 'FABRIC') is NOT eaten.
+_RE_AB_SIG_STRIP = re.compile(
+    r'(?:^|[\s_\-(])(?:rev\.?\s*\d+(?:\.\d+)?|as[ _]?built|ab(?:-exp)?|ifc'
+    r'|sheet\s*\d+|exp)(?=$|[\s_\-).])', re.IGNORECASE)
+
+
+def _ab_rev_from_name(stem: str) -> Optional[float]:
+    """Numeric AS BUILT rev from a filename stem, or None.
+
+    Handles 'REV 6', '_Rev1', '-REV1_', 'Rev.2', decimal sub-rev 'Rev0.2'.
+    Returns a float so '0.2' sorts correctly between 0 and 1.
+    """
+    m = _RE_AB_REV_ANY.search(stem)
+    if not m:
+        return None
+    return float(f"{m.group(1)}.{m.group(2)}") if m.group(2) else float(m.group(1))
+
+
+def _ab_title_signature(stem: str, doc_id: Optional[str]) -> str:
+    """Normalized drawing-title signature: strip doc-id + rev + AB/IFC/exp/sheet
+    markers + all punctuation, uppercase. Two files sharing a signature are the
+    SAME drawing/document at different revisions; differing signatures are kept
+    apart (so two different drawings wrongly sharing a doc-id are never merged).
+    """
+    sig = stem
+    if doc_id:
+        sig = re.sub(re.escape(doc_id), ' ', sig, flags=re.IGNORECASE)
+    prev = None
+    while prev != sig:                       # collapse adjacent markers
+        prev = sig
+        sig = _RE_AB_SIG_STRIP.sub(' ', sig)
+    return re.sub(r'[^A-Za-z0-9]', '', sig).upper()
+
 
 class AsBuiltManager(IFCManager):
     """Convert IFC DWGs to AS BUILT: stamp, title block update, PDF export.
@@ -10238,8 +10280,8 @@ class AsBuiltManager(IFCManager):
         rev in its designated 'Rev.N - AB/' subfolder — and the doc-ID folder
         carries no loose AB exports. This collects the junk left over while the
         script was being refined:
-          1. MULTIPLE 'Rev.N - AB' subfolders → keep the lowest rev, move the
-             higher ones to the doc-ID folder's Superseded/.
+          1. MULTIPLE 'Rev.N - AB' subfolders → keep the HIGHEST (latest) rev,
+             move the older ones to the doc-ID folder's Superseded/.
           2. Loose AS BUILT files ('..._AsBuilt.dwg', '..._AsBuilt.dwg.dxf',
              '..._AB.dwg', etc.) sitting directly in the doc-ID folder (outside
              any 'Rev.N - AB/') → move to Superseded/.
@@ -10271,7 +10313,9 @@ class AsBuiltManager(IFCManager):
 
             ss_dir = self._ab_superseded_dir(doc_folder)
 
-            # 1. Collapse multiple 'Rev.N - AB' subfolders → keep the lowest rev.
+            # 1. Collapse multiple 'Rev.N - AB' subfolders → keep the HIGHEST rev
+            #    (latest AS BUILT is the live version; older revs → Superseded/),
+            #    aligned with the deliverable-PDF supersede policy.
             ab_subs = []  # (rev_key, path)
             for child in children:
                 if not child.is_dir():
@@ -10281,8 +10325,8 @@ class AsBuiltManager(IFCManager):
                     ab_subs.append((self._ab_rev_key(m.group(1)), child))
             if len(ab_subs) > 1:
                 ab_subs.sort(key=lambda t: t[0])
-                keep = ab_subs[0][1]
-                for _key, extra in ab_subs[1:]:
+                keep = ab_subs[-1][1]
+                for _key, extra in ab_subs[:-1]:
                     moved = True if report_only else self._move_to_ss(extra, ss_dir)
                     actions.append({'doc_id': doc_id, 'kind': 'extra_ab_rev',
                                     'path': str(extra), 'kept': keep.name,
@@ -10299,6 +10343,109 @@ class AsBuiltManager(IFCManager):
                                 'path': str(child), 'moved': moved})
 
         return actions
+
+    def supersede_ab_deliverables(self, report_only: bool = True) -> Dict[str, List[Dict]]:
+        """Version-control the AS BUILT *deliverable* folder (self.ab_output):
+        for each (doc-id, file-type, drawing-title, exp-variant) keep the NEWEST
+        file by mtime and move older exports to the folder's Superseded/. This is
+        the AS BUILT analogue of the IFC VersionManager step (old IFC PDFs → SS);
+        it was the missing half of AB version control (Native subfolders were
+        handled by cleanup_ab_native, the PDF deliverable folder had nothing).
+
+        SAFETY — tuned to messy real-world AB naming (validated on LMS):
+          - Recency = mtime, NOT rev number. The client acceptance cycle
+            re-numbers drawings on request (some forced to Rev1, some to Rev5),
+            so the rev is not a reliable recency signal — the latest-written
+            file wins. Rev is kept only for display / as a mtime tiebreak.
+          - Grouping key = doc-id + extension + normalized TITLE signature +
+            exp-flag. An 'exp' export variant never supersedes the real _AS BUILT
+            deliverable — both tracks are retained (user rule: keep both).
+          - A doc-id carrying >1 distinct title is deferred WHOLESALE to manual
+            review (surfaced under 'flagged' with 'variants') — nothing under it
+            is auto-moved, since a number clash may mean two real drawings.
+          - A file sharing the kept file's exact mtime is NOT auto-moved →
+            'flagged' (can't tell which is newer).
+          - Files with no extractable doc-id OR no rev are left untouched
+            (reports/lists/junk in the folder are not disturbed).
+          - Every move is reversible (_move_to_ss → Superseded/), long-path safe.
+
+        Returns {'moved': [...], 'flagged': [...]}. report_only=True plans only.
+        """
+        out: Dict[str, List[Dict]] = {'moved': [], 'flagged': []}
+        ab_dir = self.ab_output
+        if not ab_dir.exists():
+            return out
+        ss_dir = self._ab_superseded_dir(ab_dir)
+
+        groups: Dict[tuple, list] = {}
+        for f in sorted(ab_dir.iterdir()):
+            if not f.is_file() or f.name.startswith('~$'):
+                continue
+            doc_id = _extract_doc_id_standalone(f.name)
+            rev = _ab_rev_from_name(f.stem)
+            if not doc_id or rev is None:
+                continue
+            sig = _ab_title_signature(f.stem, doc_id)
+            is_exp = bool(_RE_AB_EXP_MARK.search(f.stem))
+            try:
+                mt = f.stat().st_mtime
+            except OSError:
+                mt = 0.0
+            key = (doc_id.upper(), f.suffix.lower(), sig, is_exp)
+            groups.setdefault(key, []).append((rev, mt, f))
+
+        # Distinct title signatures per doc-id → cross-title hazard flag.
+        titles_by_doc: Dict[str, set] = {}
+        for (doc, _ext, sig, _exp) in groups:
+            titles_by_doc.setdefault(doc, set()).add(sig)
+        # A doc-id that carries >1 distinct title is deferred WHOLESALE to manual
+        # review — not even its same-title subgroups are auto-moved. The client
+        # acceptance cycle re-numbers drawings (some forced to Rev1, some to Rev5),
+        # so a number clash under one doc-id may mean two real drawings; collapsing
+        # any part risks losing one. Surfaced under 'flagged' below, never moved.
+        multi_title = {d for d, sigs in titles_by_doc.items() if len(sigs) >= 2}
+
+        for key, items in groups.items():
+            doc, ext, sig, is_exp = key
+            if doc in multi_title or len(items) < 2:
+                continue
+            # Keep the physically NEWEST export (mtime), NOT the highest rev.
+            # AS BUILT deliverables pass through a client acceptance cycle that
+            # re-numbers drawings on request, so the rev number is not a reliable
+            # recency signal — the latest-written file is. Rev is retained only
+            # for display and as a mtime tiebreak.
+            items.sort(key=lambda t: (t[1], t[0]), reverse=True)  # mtime, rev
+            keep_rev, keep_mt, keep_f = items[0]
+            for rev, mt, f in items[1:]:
+                rec = {'doc_id': doc, 'ext': ext, 'rev': rev,
+                       'keep_rev': keep_rev, 'keep_name': keep_f.name,
+                       'path': str(f), 'name': f.name, 'exp': is_exp}
+                if mt == keep_mt:
+                    rec['reason'] = 'same mtime as kept file — cannot tell newer'
+                    out['flagged'].append(rec)
+                    continue
+                rec['moved'] = True if report_only else self._move_to_ss(f, ss_dir)
+                out['moved'].append(rec)
+
+        # Cross-title: same doc-id, >1 distinct title signature. Never auto-moved
+        # (could be one drawing whose title drifted, OR two drawings wrongly
+        # sharing a doc-id) — surfaced for a human to resolve.
+        for doc in sorted(titles_by_doc):
+            if len(titles_by_doc[doc]) < 2:
+                continue
+            variants = []
+            for key in sorted(groups):
+                d, ext, sig, is_exp = key
+                if d != doc:
+                    continue
+                revs = sorted(r for r, _, _ in groups[key])
+                variants.append({'ext': ext, 'title': sig, 'exp': is_exp,
+                                 'revs': [f"{r:g}" for r in revs]})
+            out['flagged'].append({
+                'doc_id': doc, 'reason': 'multiple titles under one doc-id — '
+                'verify same drawing before collapsing', 'variants': variants})
+
+        return out
 
     def _ab_existing_pdf_qa_clean(self, dwg_info: Dict) -> bool:
         """Incremental-skip gate: True iff an existing AS BUILT PDF for this
@@ -12925,6 +13072,24 @@ class AsBuiltManager(IFCManager):
         if qa_issues:
             print(f"  ⚠ QA 警告: {qa_issues} 个文件有质量问题，请检查日志")
 
+        # Deliverable version control: supersede older-rev AB files in the output
+        # folder (latest rev stays, older → Superseded/). AS BUILT analogue of the
+        # IFC VersionManager step. Runs BEFORE POST-QA so superseded PDFs aren't
+        # re-scanned. report_only follows dry_run.
+        sup = self.supersede_ab_deliverables(report_only=self.dry_run)
+        if sup['moved'] or sup['flagged']:
+            verb = "将收旧版" if self.dry_run else "已收旧版"
+            print(f"\n  [AB-版本] {verb} {len(sup['moved'])} 个 → Superseded/")
+            for a in sup['moved'][:12]:
+                print(f"    →SS  {a['doc_id']} Rev{a['rev']:g} (留最新, Rev{a['keep_rev']:g})  {a['name']}")
+            flagged = [f for f in sup['flagged'] if 'variants' in f]
+            ties = [f for f in sup['flagged'] if 'variants' not in f]
+            for t in ties:
+                print(f"    ⚠ 同时间戳[需人工]  {t['doc_id']} Rev{t['rev']:g}: {t['name']}")
+            for f in flagged:
+                titles = ", ".join(f"{v['title']}({'/'.join(v['revs'])})" for v in f['variants'])
+                print(f"    ⚠ 同号多图[需人工]  {f['doc_id']}: {titles}")
+
         # Post-batch self-check: scan ALL PDFs in output dir for stamp issues
         if not self.dry_run and ok > 0:
             print(f"\n  [POST-QA] 对 {self.ab_output.name}/ 做批量自检...")
@@ -13022,6 +13187,7 @@ class PipelineOrchestrator:
             'ifr_sync': None,
             'version_mgmt': None,
             'approval_version': None,
+            'asbuilt_version': None,
             'ifc_transmittal': None,
             'sharepoint_sync': None,
             'deliverable': None,
@@ -13139,6 +13305,29 @@ class PipelineOrchestrator:
             except Exception as e:
                 UIHelper.print_error(f"SAPN 审批版本管理异常(不影响主流程): {e}")
                 results['approval_version'] = {'error': str(e)}
+
+            # 顺带: AS BUILT 交付物版本管理 (5. As Built/3. As Built — 保留最新导出,
+            #       旧版 → Superseded/; 同号多图整组跳过待人工。与图纸/IFC 版本管理同阶段、
+            #       独立路径,互不干扰 — 让一次管线同时整理 IFR + IFC + AS BUILT 三套版本。
+            #       AsBuiltManager 构造很轻 (COM 懒加载),此步不触发 AutoCAD。
+            #       详见 AsBuiltManager.supersede_ab_deliverables)
+            try:
+                ab_mgr = AsBuiltManager(project_path, dry_run=self.dry_run)
+                if ab_mgr.ab_output.exists():
+                    sup = ab_mgr.supersede_ab_deliverables(report_only=self.dry_run)
+                    multi = [f for f in sup['flagged'] if 'variants' in f]
+                    if sup['moved'] or multi:
+                        results['asbuilt_version'] = {
+                            'moved': len(sup['moved']),
+                            'flagged_multi_title': len(multi),
+                        }
+                        UIHelper.print_success(
+                            f"AS BUILT 版本管理: {'将收' if self.dry_run else '已收'}旧版 "
+                            f"{len(sup['moved'])} → Superseded/"
+                            + (f", 同号多图跳过 {len(multi)} (需人工)" if multi else ""))
+            except Exception as e:
+                UIHelper.print_error(f"AS BUILT 版本管理异常(不影响主流程): {e}")
+                results['asbuilt_version'] = {'error': str(e)}
 
         # Stage 3: IFC Transmittal (scan + dedup, pass ifc_map to Stage 5)
         if 'ifc_transmittal' in self.stages:

@@ -31,7 +31,7 @@ except Exception:
 _CHILD_ENV = dict(os.environ, PYTHONIOENCODING='utf-8')
 
 PY = r"C:\Users\jilin\AppData\Local\Programs\Python\Python312\python.exe"
-SCRIPT_DIR = r"D:\1. SOP\SOP_Stage 2 IFR Sync√\V6√"
+SCRIPT_DIR = str(Path(__file__).resolve().parent)  # 仓自指: 自动定位, 迁移无需改
 
 # CLI convenience aliases only — run_safe_batch takes a full project_path.
 PROJECTS = {
