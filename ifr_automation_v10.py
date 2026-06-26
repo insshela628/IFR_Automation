@@ -112,14 +112,14 @@ def send_telegram_notification(message: str, parse_mode: str = "HTML") -> bool:
     """Send a notification message to the configured Telegram chat.
 
     Reads TELEGRAM_TOKEN and TELEGRAM_CHAT_ID from the .env file at:
-      <GGE_DEV_ROOT|D:/1.dev>/work/L5-decision/project-status/V3 Manul&Auto CSV to excel/Automatic Export√/.env
+      <GGE_DEV_ROOT|D:/1.dev>/work/L04-decision/project-status/V3 Manul&Auto CSV to excel/Automatic Export√/.env
 
     Returns True if sent successfully, False otherwise (silently fails).
     """
     if not REQUESTS_AVAILABLE:
         return False
 
-    env_path = Path(os.environ.get("GGE_DEV_ROOT", r"D:\1.dev")) / "work" / "L5-decision" / "project-status" / "V3 Manul&Auto CSV to excel" / "Automatic Export√" / ".env"
+    env_path = Path(os.environ.get("GGE_DEV_ROOT", r"D:\1.dev")) / "work" / "L04-decision" / "project-status" / "V3 Manul&Auto CSV to excel" / "Automatic Export√" / ".env"
     if not env_path.exists():
         return False
 
