@@ -10022,6 +10022,37 @@ class AsBuiltManager(IFCManager):
 
         return results
 
+    def report_missing_ab(self) -> List[Dict]:
+        """Read-only GAP report: native IFC drawings that have NO AS BUILT PDF yet.
+
+        A 'missing AB' = a doc-ID `scan_native_for_ab` found an IFC source for (so
+        it CAN be converted) whose CLIENT AS BUILT PDF does not exist
+        (`existing_ab_rev is None` — `_scan_existing_ab` found no `..._AS BUILT.pdf`
+        carrying a rev). This is the blind spot of Stage 4 version-management:
+        cleanup_ab_native + supersede_ab_deliverables only MANAGE AB files that
+        already exist, so a drawing whose AB was never created passes silently
+        (root cause of the ES-302 漏网之鱼, 2026-06). Pure reporting — never opens
+        AutoCAD, never moves/converts anything; fill a gap with convert_multi_to_ab.
+        Returns sorted list of {doc_id, ifc_rev, pages, source, folder, description}.
+        """
+        native_root = self.native_root
+        gaps = []
+        for info in self.scan_native_for_ab():
+            if info.get('existing_ab_rev') is not None:
+                continue
+            src = info['ifc_source']
+            gaps.append({
+                'doc_id': info['doc_id'],
+                'ifc_rev': src.get('ifc_rev'),
+                'pages': len(src.get('dwg_paths', [])),
+                'source': 'native' if info['folder'].parent == native_root
+                          else 'report',
+                'folder': info['folder'],
+                'description': info.get('description', ''),
+            })
+        gaps.sort(key=lambda g: g['doc_id'])
+        return gaps
+
     def _scan_report_drawings_for_ab(self, existing_ab: Dict[str, int],
                                      seen_doc_ids: set) -> List[Dict]:
         """Scan `_EXTRA_DRAWING_SOURCES` report folders for native drawing DWGs.
@@ -13176,7 +13207,7 @@ class PipelineOrchestrator:
                  filter_doc_ids: Optional[Set[str]] = None):
         self.config = config
         self.dry_run = dry_run
-        self.stages = stages or ['health_check', 'ifr_sync', 'version_mgmt', 'ifc_transmittal', 'sharepoint_sync', 'deliverable']
+        self.stages = stages or ['health_check', 'ifr_sync', 'version_mgmt', 'ifc_transmittal', 'asbuilt_version', 'sharepoint_sync', 'deliverable']
         self.filter_doc_ids = filter_doc_ids
 
     def run_pipeline(self, project_path: Path, project_validation: ProjectValidation) -> Dict:
@@ -13212,7 +13243,7 @@ class PipelineOrchestrator:
 
         # Stage 0: File Health Check
         if 'health_check' in self.stages:
-            print(f"\n  [Stage 0/6] 文件健康检查...")
+            print(f"\n  [Stage 0/7] 文件健康检查...")
             try:
                 checker = FileHealthChecker(project_path, dry_run=self.dry_run)
                 check_result = checker.scan_anomalies()
@@ -13249,7 +13280,7 @@ class PipelineOrchestrator:
 
         # Stage 1: IFR Sync
         if 'ifr_sync' in self.stages:
-            print(f"\n  [Stage 1/6] IFR 同步...")
+            print(f"\n  [Stage 1/7] IFR 同步...")
             try:
                 automation = IFRAutomation(
                     root_path=str(project_path.parent),
@@ -13279,7 +13310,7 @@ class PipelineOrchestrator:
 
         # Stage 2: Version Management
         if 'version_mgmt' in self.stages:
-            print(f"\n  [Stage 2/6] 版本管理...")
+            print(f"\n  [Stage 2/7] 版本管理...")
             try:
                 vm = VersionManager(str(project_path.parent), dry_run=self.dry_run)
                 vm_stats = vm.process_project(project_path, show_details=True)
@@ -13306,34 +13337,11 @@ class PipelineOrchestrator:
                 UIHelper.print_error(f"SAPN 审批版本管理异常(不影响主流程): {e}")
                 results['approval_version'] = {'error': str(e)}
 
-            # 顺带: AS BUILT 交付物版本管理 (5. As Built/3. As Built — 保留最新导出,
-            #       旧版 → Superseded/; 同号多图整组跳过待人工。与图纸/IFC 版本管理同阶段、
-            #       独立路径,互不干扰 — 让一次管线同时整理 IFR + IFC + AS BUILT 三套版本。
-            #       AsBuiltManager 构造很轻 (COM 懒加载),此步不触发 AutoCAD。
-            #       详见 AsBuiltManager.supersede_ab_deliverables)
-            try:
-                ab_mgr = AsBuiltManager(project_path, dry_run=self.dry_run)
-                if ab_mgr.ab_output.exists():
-                    sup = ab_mgr.supersede_ab_deliverables(report_only=self.dry_run)
-                    multi = [f for f in sup['flagged'] if 'variants' in f]
-                    if sup['moved'] or multi:
-                        results['asbuilt_version'] = {
-                            'moved': len(sup['moved']),
-                            'flagged_multi_title': len(multi),
-                        }
-                        UIHelper.print_success(
-                            f"AS BUILT 版本管理: {'将收' if self.dry_run else '已收'}旧版 "
-                            f"{len(sup['moved'])} → Superseded/"
-                            + (f", 同号多图跳过 {len(multi)} (需人工)" if multi else ""))
-            except Exception as e:
-                UIHelper.print_error(f"AS BUILT 版本管理异常(不影响主流程): {e}")
-                results['asbuilt_version'] = {'error': str(e)}
-
-        # Stage 3: IFC Transmittal (scan + dedup, pass ifc_map to Stage 5)
+        # Stage 3: IFC Transmittal (scan + dedup, pass ifc_map to Stage 6)
         if 'ifc_transmittal' in self.stages:
             ifc_dir = project_path / "Design/Engineering/1. Drawings/4. IFC(Client)"
             if ifc_dir.exists():
-                print(f"\n  [Stage 3/6] IFC Transmittal 管理...")
+                print(f"\n  [Stage 3/7] IFC Transmittal 管理...")
                 try:
                     ifc_cfg = self.config.config if hasattr(self.config, 'config') else {}
                     mgr = IFCTransmittalManager(project_path, config=ifc_cfg, dry_run=self.dry_run)
@@ -13350,9 +13358,64 @@ class PipelineOrchestrator:
             else:
                 results['ifc_transmittal'] = {'skipped': True, 'reason': 'IFC(Client)不存在'}
 
-        # Stage 4: Sharepoint Sync (archive approved + sync to Client Sharepoint)
+        # Stage 4: AS BUILT 版本管理 (placed AFTER IFC — AS BUILT is derived from
+        # IFC, so IFC version control settles first). ONE unified AS BUILT version
+        # rule over BOTH tracks (user: "统一放到 AS BUILT 规则", run once does it all):
+        #   - cleanup_ab_native: 1. Native/ doc-ID 文件夹 → 每个 doc-ID 留最新
+        #     Rev.N - AB/ 子夹 (bot 生成、版本号干净) + 散落 AB 文件 → Superseded/
+        #   - supersede_ab_deliverables: 5. As Built/ 交付物 PDF → 留最新导出 (按
+        #     mtime, 客户改号导致版本号不可靠); 同号多图整组跳过待人工。
+        # AsBuiltManager 构造很轻 (COM 懒加载),此步绝不触发 AutoCAD。让一次管线
+        # 同时整理 IFR + IFC + AS BUILT 三套版本。
+        if 'asbuilt_version' in self.stages:
+            print(f"\n  [Stage 4/7] AS BUILT 版本管理...")
+            try:
+                ab_mgr = AsBuiltManager(project_path, dry_run=self.dry_run)
+                native_actions = ab_mgr.cleanup_ab_native(report_only=self.dry_run)
+                sup = {'moved': [], 'flagged': []}
+                if ab_mgr.ab_output.exists():
+                    sup = ab_mgr.supersede_ab_deliverables(report_only=self.dry_run)
+                multi = [f for f in sup['flagged'] if 'variants' in f]
+                results['asbuilt_version'] = {
+                    'native_cleaned': len(native_actions),
+                    'deliverable_moved': len(sup['moved']),
+                    'flagged_multi_title': len(multi),
+                }
+                verb = '将收' if self.dry_run else '已收'
+                parts = []
+                if native_actions:
+                    parts.append(f"Native 整理 {len(native_actions)}")
+                parts.append(f"交付物{verb}旧版 {len(sup['moved'])} → Superseded/")
+                if multi:
+                    parts.append(f"同号多图跳过 {len(multi)} (需人工)")
+                UIHelper.print_success("AS BUILT 版本管理: " + ", ".join(parts))
+
+                # Read-only GAP report — the eye Stage 4 was missing. Version
+                # management above only TOUCHES AB files that already exist; a
+                # drawing whose AB was never created (no client AB PDF) slips
+                # through silently (the ES-302 漏网之鱼). Surface every such gap so
+                # the operator can fill it with convert_multi_to_ab. Filesystem
+                # only — never triggers AutoCAD, never converts here.
+                gaps = ab_mgr.report_missing_ab()
+                results['asbuilt_version']['missing_ab'] = [
+                    {'doc_id': g['doc_id'], 'ifc_rev': g['ifc_rev'],
+                     'pages': g['pages']} for g in gaps]
+                if gaps:
+                    print(f"    ⚠ 缺 AS BUILT ({len(gaps)}) — 有 IFC 源但无客户 AB PDF:")
+                    for g in gaps:
+                        _desc = f"  {g['description']}" if g['description'] else ""
+                        print(f"        {g['doc_id']}  (IFC Rev.{g['ifc_rev']}, "
+                              f"{g['pages']} 页){_desc}")
+                    print(f"      → 用 convert_multi_to_ab 逐个补做")
+                else:
+                    print(f"    缺 AS BUILT: 无 (所有 IFC 图纸都已有 AB PDF)")
+            except Exception as e:
+                UIHelper.print_error(f"AS BUILT 版本管理异常(不影响主流程): {e}")
+                results['asbuilt_version'] = {'error': str(e)}
+
+        # Stage 5: Sharepoint Sync (archive approved + sync to Client Sharepoint)
         if 'sharepoint_sync' in self.stages:
-            print(f"\n  [Stage 4/6] Client Sharepoint 同步...")
+            print(f"\n  [Stage 5/7] Client Sharepoint 同步...")
             try:
                 automation = IFRAutomation(
                     root_path=str(project_path.parent),
@@ -13373,9 +13436,9 @@ class PipelineOrchestrator:
                 results['sharepoint_sync'] = {'error': str(e)}
                 results['success'] = False
 
-        # Stage 5: Deliverable Cross-Check
+        # Stage 6: Deliverable Cross-Check
         if 'deliverable' in self.stages:
-            print(f"\n  [Stage 5/6] 交付物检查...")
+            print(f"\n  [Stage 6/7] 交付物检查...")
             try:
                 dm = DeliverableManager(project_path, dry_run=self.dry_run)
                 excel_path = dm.find_deliverable_excel()
@@ -15259,7 +15322,7 @@ Examples:
 
     # V7: Pipeline mode
     if args.pipeline or args.stages:
-        stages = args.stages or ['ifr_sync', 'version_mgmt', 'sharepoint_sync', 'deliverable']
+        stages = args.stages or ['ifr_sync', 'version_mgmt', 'asbuilt_version', 'sharepoint_sync', 'deliverable']
         automation = IFRAutomation(root_path=root_path, config=config, interactive=True)
         projects_by_region = automation.scan_projects()
         all_projects = [p for projects in projects_by_region.values() for p in projects]

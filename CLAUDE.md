@@ -189,6 +189,19 @@ for lname in layout_names:
 - Applied in both `ifr_automation_v10.py` and standalone `version_manager_v5.py`
 - **Failure mode if ignored**: old IFC revisions accumulate, deliverable Excel may show stale revision numbers
 
+### AS BUILT Deliverable Version Control — `supersede_ab_deliverables()`
+The AS BUILT analogue of the IFC VersionManager step — the missing half of AB version control (Native subfolders were handled by `cleanup_ab_native`; the PDF *deliverable* folder `5. As Built/3. As Built` had nothing). So one run now version-manages **IFR + IFC + AS BUILT** together.
+- **Pipeline = its OWN stage, placed AFTER IFC** (`/pipeline` Stage 4/7, between IFC Transmittal Stage 3 and Sharepoint Stage 5) — AS BUILT is derived from IFC, so IFC version control settles first. The stage runs BOTH AB tracks under one unified rule:
+  - `cleanup_ab_native` — `1. Native/` doc-ID folders: keep the highest-rev `Rev.N - AB/` subfolder (bot-generated revs are clean/monotonic, so rev-number is the right signal here), stray loose AB files + `.bak` → `Superseded/`.
+  - `supersede_ab_deliverables` — `5. As Built/` deliverable PDFs: keep latest by **mtime** (client renumbers).
+- **Two entry points**, both `report_only`/`dry_run`-gated, all moves reversible (`_move_to_ss` → `Superseded/`, long-path safe):
+  1. `/pipeline` Stage 4 — `AsBuiltManager(project_path)` (construct is light, COM is lazy via `_get_acad`, so this step never launches AutoCAD); runs both tracks above.
+  2. `AsBuiltManager.batch_convert` — runs `supersede_ab_deliverables` after conversion, before POST-QA, so superseded PDFs aren't re-scanned.
+- **Recency = mtime, NOT rev number.** The client acceptance cycle re-numbers drawings on request (some forced to Rev1, some to Rev5), so the rev is not a reliable recency signal — the latest-written file wins. Rev kept only for display / as mtime tiebreak. (Contrast `VersionManager`, which is rev-primary because IFC/IFR revs are clean/monotonic.)
+- **Grouping key** = doc-id + extension + normalized TITLE signature + exp-flag. An `exp` export variant never supersedes the real `_AS BUILT` deliverable — **both tracks retained** (user rule: when an exp exists, keep both).
+- **Multi-title doc-id → deferred WHOLESALE to manual** (`flagged` with `variants`, nothing under it auto-moved): a number clash under one doc-id may mean two real drawings (e.g. LMS `CA-001` = Cable Route GA + Trench Alignment; `EL-001`/`EL-002` = title drift). Same-mtime collisions also flagged, never moved. Files with no doc-id or no rev untouched.
+- **LMS 2026-06-26**: 6 reversible moves applied (CA-011/EA-300/EA-301/ES-010/GA-001/GA-051 Rev1 → `Superseded/`); 3 multi-title (CA-001/EL-001/EL-002) skipped for manual review.
+
 ### IFR Report Sync — Latest Version Only
 - `_mirror_reports()` must only sync the **latest version** per doc-ID to `IFR(Client)/2.Reports`
 - Source folders (`Reports/Electrical/`, `Reports/Civil & Structure/`, etc.) may contain multiple revisions of the same document in subfolders (e.g. `RevA.pdf` + `RevB.pdf` in the same folder, old version not yet in SS/)
