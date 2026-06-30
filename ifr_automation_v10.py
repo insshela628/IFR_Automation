@@ -10375,6 +10375,202 @@ class AsBuiltManager(IFCManager):
 
         return actions
 
+    # ── Native doc-folder loose-file version control ─────────────────────
+    # Junk/stray extensions that NEVER belong loose in a 1. Native/ doc folder.
+    _NATIVE_JUNK_EXT = {'.bak', '.dwl', '.dwl2', '.tmp', '.log', '.err', '.sv$'}
+
+    def _native_folder_for(self, doc_id: str) -> Optional[Path]:
+        """The 1. Native/ doc-ID folder matching doc_id (flat or 1-level nested),
+        or None. AsBuiltManager analogue of _find_native_folder (which lives on
+        another manager) — used to route a stray deliverable DWG back home."""
+        du = doc_id.upper()
+        skip = ('ss', 'superseded', 'superceded')
+        try:
+            level1 = [d for d in self.native_root.iterdir()
+                      if d.is_dir() and d.name.lower() not in skip]
+        except (OSError, PermissionError):
+            return None
+        for d in level1:                                  # flat
+            fid, _ = _parse_folder_name(d.name)
+            if fid and fid.upper() == du:
+                return d
+        for cat in level1:                                # one level nested
+            try:
+                for d in cat.iterdir():
+                    if not d.is_dir() or d.name.lower() in skip:
+                        continue
+                    fid, _ = _parse_folder_name(d.name)
+                    if fid and fid.upper() == du:
+                        return d
+            except (OSError, PermissionError):
+                continue
+        return None
+
+    def cleanup_native_loose(self, report_only: bool = True) -> List[Dict]:
+        """Tidy files sitting LOOSE at a 1. Native/ doc-ID folder root.
+
+        The doc folder's clean shape is: the bare working DWG master(s) +
+        'Rev.N - <STAGE>/' issue snapshots + 'Superseded/'. Over a project's
+        life the root accumulates AutoCAD backups (.bak/.dwl), and PDF exports
+        that escaped their stage folder (e.g. a 'Rev.A …pdf' left at root) —
+        the '很多 pdf/dwg 散落在外面' mess. This routes them, conservatively:
+
+          - .bak/.dwl/.dwl2/.tmp/.log/.err + '~$' editor temps → Superseded/
+          - any PDF at root → FLAGGED only (an escaped stage export, OR a
+                deliberately-filed vendor/reference doc — e.g. an _APPROVED
+                shop drawing; never auto-moved, a human decides)
+          - a DWG carrying a rev/stage marker (escaped a Rev folder)
+                → FLAGGED only (we don't guess which Rev.N it belongs to)
+          - a BARE working DWG (doc-id, no rev marker)      → KEPT (master)
+
+        Only the AutoCAD junk auto-moves (reversible, _move_to_ss → Superseded/).
+        report_only=True (default) plans without moving. Pure filesystem — no
+        AutoCAD. Returns a list of action dicts ({doc_id, kind, path, moved}).
+        kind ∈ {stray_bak, stray_pdf(flag), loose_rev_dwg(flag)}.
+        """
+        actions: List[Dict] = []
+        native = self.native_root
+        if not native.exists():
+            return actions
+
+        for doc_folder in sorted(native.iterdir()):
+            if not doc_folder.is_dir():
+                continue
+            if doc_folder.name.lower() in ('ss', 'superseded', 'superceded'):
+                continue
+            doc_id, _ = _parse_folder_name(doc_folder.name)
+            if not doc_id or not re.search(r'-\d{2,3}', doc_id):
+                continue
+            ss_dir = self._ab_superseded_dir(doc_folder)
+            try:
+                children = list(doc_folder.iterdir())
+            except (OSError, PermissionError):
+                continue
+
+            for child in children:
+                if not child.is_file() or child.name.startswith('~$'):
+                    # '~$' editor temp → junk; other dirs/files handled below
+                    if child.is_file() and child.name.startswith('~$'):
+                        moved = True if report_only else self._move_to_ss(child, ss_dir)
+                        actions.append({'doc_id': doc_id, 'kind': 'stray_bak',
+                                        'path': str(child), 'moved': moved})
+                    continue
+                ext = child.suffix.lower()
+                if ext in self._NATIVE_JUNK_EXT:
+                    moved = True if report_only else self._move_to_ss(child, ss_dir)
+                    actions.append({'doc_id': doc_id, 'kind': 'stray_bak',
+                                    'path': str(child), 'moved': moved})
+                elif ext == '.pdf':
+                    # A PDF at Native root escaped its stage folder OR is a
+                    # deliberately-filed vendor/reference doc (_APPROVED shop
+                    # drawing). FLAG — never auto-move; a human decides.
+                    actions.append({'doc_id': doc_id, 'kind': 'stray_pdf',
+                                    'path': str(child), 'moved': False, 'flag': True})
+                elif ext == '.dwg':
+                    # Bare master (no rev/stage token) is the live editable → KEEP.
+                    # A DWG carrying a rev/IFC/AB marker escaped its Rev.N folder →
+                    # FLAG (don't auto-pick a destination Rev folder).
+                    has_marker = (_ab_rev_from_name(child.stem) is not None
+                                  or self._is_ab_named(child.stem)
+                                  or re.search(r'(?:^|[\s_\-])IF[CR](?=$|[\s_\-.])',
+                                               child.stem, re.IGNORECASE) is not None)
+                    if has_marker:
+                        actions.append({'doc_id': doc_id, 'kind': 'loose_rev_dwg',
+                                        'path': str(child), 'moved': False,
+                                        'flag': True})
+                # any other extension (rare) is left untouched — conservative
+        return actions
+
+    # ── AS BUILT deliverable folder type hygiene ─────────────────────────
+    def audit_ab_deliverable_hygiene(self, report_only: bool = True) -> Dict[str, List[Dict]]:
+        """Enforce the '5. As Built/3. As Built' contract: PDF-only client
+        deliverables (one current rev per doc-id; reports are PDF too). The
+        rev-dedup half is `supersede_ab_deliverables`; THIS is the *type* half
+        — the missing guard that let .dwg, .bak, IFC-stage exports, registers
+        and even a foreign-project file pile into the client folder.
+
+        It is a CLIENT-FACING folder, so the only AUTO action is disposing of
+        unambiguous machine junk; everything with deliverable value is FLAGGED
+        for a human (the client's As Built register is the oracle that resolves
+        each flag — e.g. report/spec/relay-setting docs and a differently-
+        numbered drawing like 75032-ES-001 are all legitimate deliverables on
+        the list, NOT to be moved).
+
+        Per file at the folder root (Superseded/ skipped):
+          AUTO (only on apply, reversible):
+            - .bak/.dwl/.log/.tmp/.err + '~$'  → this folder's Superseded/
+          FLAG only (KEEP — human decides, cross-check the client register):
+            - .dwg/.dxf  → misfiled_dwg (native_home given) / orphan_dwg
+            - non-AS BUILT PDF that is IFC-stage (…_IFC, no _AS BUILT)  → ifc_stage_pdf
+            - other non-AS BUILT PDF (report/spec/no stage marker)      → non_asbuilt_pdf
+            - .docx/.doc/.csv/.xlsx/.jpg/.png (registers, redlines)     → foreign_type
+            - a doc-id whose project prefix ≠ this folder's home prefix → foreign_project
+          KEEP silently: conforming '…_AS BUILT.pdf'.
+
+        report_only=True (default) plans only; nothing in the client folder is
+        touched until apply. Returns {'moved': [...], 'flagged': [...]}.
+        """
+        out: Dict[str, List[Dict]] = {'moved': [], 'flagged': []}
+        ab_dir = self.ab_output
+        if not ab_dir.exists():
+            return out
+        ss_dir = self._ab_superseded_dir(ab_dir)
+
+        # Home project prefix = modal leading doc-id token (schema-free, robust).
+        prefixes: Dict[str, int] = {}
+        for f in ab_dir.iterdir():
+            if not f.is_file():
+                continue
+            did = _extract_doc_id_standalone(f.name)
+            if did:
+                tok = did.split('-')[0].upper()
+                prefixes[tok] = prefixes.get(tok, 0) + 1
+        home_prefix = max(prefixes, key=prefixes.get) if prefixes else None
+
+        for f in ab_dir.iterdir():
+            if not f.is_file():
+                continue
+            ext = f.suffix.lower()
+            name = f.name
+            stem_u = f.stem.upper()
+            doc_id = _extract_doc_id_standalone(name)
+            is_ab = self._is_ab_named(f.stem)
+
+            # foreign project — wrong-project file misfiled here
+            if doc_id and home_prefix and doc_id.split('-')[0].upper() != home_prefix:
+                out['flagged'].append({'doc_id': doc_id, 'kind': 'foreign_project',
+                                       'path': str(f), 'home_prefix': home_prefix})
+                continue
+
+            if ext in ('.dwg', '.dxf'):
+                # A DWG in the client PDF folder is misfiled, BUT the client list
+                # often says 'Native file needed' — it may be the very native the
+                # client wants, and whether it's current vs old can't be told from
+                # here. NEVER auto-move in the client folder: FLAG with the natural
+                # home so a human routes it (live → Rev.N - AB/, old → Superseded/).
+                nf = self._native_folder_for(doc_id) if doc_id else None
+                out['flagged'].append({
+                    'doc_id': doc_id or '?',
+                    'kind': 'misfiled_dwg' if nf else 'orphan_dwg',
+                    'path': str(f),
+                    'native_home': str(nf) if nf else None})
+            elif ext in self._NATIVE_JUNK_EXT or name.startswith('~$'):
+                moved = True if report_only else self._move_to_ss(f, ss_dir)
+                out['moved'].append({'doc_id': doc_id, 'kind': 'junk',
+                                     'path': str(f), 'moved': moved})
+            elif ext == '.pdf':
+                if is_ab:
+                    continue  # conforming deliverable (rev dups → supersede_ab_*)
+                is_ifc = (re.search(r'(?:^|[\s_\-])IFC(?=$|[\s_\-.])', stem_u)
+                          is not None)
+                kind = 'ifc_stage_pdf' if is_ifc else 'non_asbuilt_pdf'
+                out['flagged'].append({'doc_id': doc_id or '?', 'kind': kind,
+                                       'path': str(f)})
+            else:
+                out['flagged'].append({'doc_id': doc_id or '?', 'kind': 'foreign_type',
+                                       'path': str(f), 'ext': ext})
+        return out
+
     def supersede_ab_deliverables(self, report_only: bool = True) -> Dict[str, List[Dict]]:
         """Version-control the AS BUILT *deliverable* folder (self.ab_output):
         for each (doc-id, file-type, drawing-title, exp-variant) keep the NEWEST
@@ -13372,23 +13568,48 @@ class PipelineOrchestrator:
             try:
                 ab_mgr = AsBuiltManager(project_path, dry_run=self.dry_run)
                 native_actions = ab_mgr.cleanup_ab_native(report_only=self.dry_run)
+                # Native loose-file VC (.bak/stray-pdf → Superseded/, escaped-rev
+                # DWG → flag; bare working DWG master kept). Reversible, no COM.
+                loose = ab_mgr.cleanup_native_loose(report_only=self.dry_run)
+                loose_moved = [a for a in loose if not a.get('flag')]
+                loose_flag = [a for a in loose if a.get('flag')]
                 sup = {'moved': [], 'flagged': []}
+                hyg = {'moved': [], 'flagged': []}
                 if ab_mgr.ab_output.exists():
                     sup = ab_mgr.supersede_ab_deliverables(report_only=self.dry_run)
+                    # Deliverable TYPE hygiene: PDF-only-current contract. Client
+                    # folder → only junk auto-moves; misfiled DWG / non-AB PDF /
+                    # foreign all FLAGGED (cross-check the client As Built register).
+                    hyg = ab_mgr.audit_ab_deliverable_hygiene(report_only=self.dry_run)
                 multi = [f for f in sup['flagged'] if 'variants' in f]
                 results['asbuilt_version'] = {
                     'native_cleaned': len(native_actions),
+                    'native_loose_moved': len(loose_moved),
+                    'native_loose_flagged': len(loose_flag),
                     'deliverable_moved': len(sup['moved']),
+                    'deliverable_type_moved': len(hyg['moved']),
+                    'deliverable_type_flagged': len(hyg['flagged']),
                     'flagged_multi_title': len(multi),
                 }
                 verb = '将收' if self.dry_run else '已收'
                 parts = []
-                if native_actions:
-                    parts.append(f"Native 整理 {len(native_actions)}")
+                if native_actions or loose_moved:
+                    parts.append(f"Native 整理 {len(native_actions) + len(loose_moved)}")
                 parts.append(f"交付物{verb}旧版 {len(sup['moved'])} → Superseded/")
+                if hyg['moved']:
+                    parts.append(f"交付物清 junk {len(hyg['moved'])} → SS")
                 if multi:
                     parts.append(f"同号多图跳过 {len(multi)} (需人工)")
                 UIHelper.print_success("AS BUILT 版本管理: " + ", ".join(parts))
+
+                # Type-hygiene flags + loose-DWG flags: KEEP, surface for human.
+                _flags = (hyg['flagged']
+                          + [{'doc_id': a['doc_id'], 'kind': a['kind'],
+                              'path': a['path']} for a in loose_flag])
+                if _flags:
+                    print(f"    ⚠ 交付物/Native 需人工确认 ({len(_flags)}) — 默认保留不动:")
+                    for fl in _flags[:15]:
+                        print(f"        [{fl['kind']}] {Path(fl['path']).name}")
 
                 # Read-only GAP report — the eye Stage 4 was missing. Version
                 # management above only TOUCHES AB files that already exist; a
