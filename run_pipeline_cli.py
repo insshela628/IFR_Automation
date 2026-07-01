@@ -21,6 +21,18 @@ import sys
 import json
 from pathlib import Path
 
+# UTF-8 stdio BEFORE importing the engine: importing ifr_automation_v10 triggers
+# colorama.init(), which wraps stdout and writes through the original stream. On
+# Windows that stream defaults to cp1252 → printing '—'/'✓'/中文 (the preview /
+# result output) raises UnicodeEncodeError and kills the child. Reconfiguring the
+# underlying stream to UTF-8 first means colorama wraps an already-UTF-8 stream.
+# (drag_window reads the pipe as UTF-8, so both ends agree.)
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 _HERE = Path(__file__).parent.resolve()
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
@@ -117,7 +129,10 @@ def main(argv):
         return 1
 
     try:
-        print(format_pipeline_result(result))
+        # format_pipeline_result emits Telegram-HTML (<b>/<code>…); the GUI Text
+        # pane renders no HTML, so strip tags at this GUI-only boundary.
+        import re as _re
+        print(_re.sub(r"</?[a-zA-Z][^>]*>", "", format_pipeline_result(result)))
     except Exception:
         print(json.dumps(result, ensure_ascii=False, default=str, indent=2))
 
