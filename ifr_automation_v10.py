@@ -50,6 +50,7 @@ Version: 7.0
 
 import os
 import sys
+import uuid
 import argparse
 import logging
 import json
@@ -9812,6 +9813,19 @@ _RE_AB_REV_IN_FILENAME = re.compile(r'\bREV\s*(\d+)\b', re.IGNORECASE)
 _RE_AB_REV_ANY = re.compile(r'(?:^|[\s_\-(])rev\.?\s*(\d+)(?:\.(\d+))?',
                             re.IGNORECASE)
 _RE_AB_EXP_MARK = re.compile(r'[_\-\s]exp\b', re.IGNORECASE)
+# Dead-versions folder name recogniser (canonical = 'Superseded'). Matches every
+# drift seen across projects so we reuse ONE archive, never spawn a second.
+_RE_DEAD_DIR = re.compile(
+    r'^(superseded|superceded|ss|old\s*revision|old\s*version|archive|previous|prev)\b',
+    re.IGNORECASE)
+# Loose-DWG version-control classifier support (asbuilt-native-folder-standard):
+_RE_DOC_ID_ANY = re.compile(r'((?:\d{5}|GG\d{2})-[A-Z]{1,2}-[A-Z]{0,3}-?\d{3})',
+                            re.IGNORECASE)
+_RE_SHEET_SUFFIX = re.compile(r'_(\d{3}[A-Z]?)(?:_rev|\b|\.)', re.IGNORECASE)
+_RE_MERGE_MARK = re.compile(r'2b\s*merged|merge\s*into|2bmerged', re.IGNORECASE)
+_RE_RECOVER_MARK = re.compile(r'_recover\b|IN\s*DESIGN', re.IGNORECASE)
+_RE_REV_LETTER = re.compile(r'rev\.?\s*([A-Z])\b', re.IGNORECASE)
+_RE_REV_NUMTAG = re.compile(r'rev\.?\s*\d|\b_?r\d', re.IGNORECASE)
 # Markers stripped to form a title signature. Separator/edge-anchored on BOTH
 # sides so a bare 'AB'/'IFC' inside a real word ('CABLE', 'FABRIC') is NOT eaten.
 _RE_AB_SIG_STRIP = re.compile(
@@ -10365,15 +10379,174 @@ class AsBuiltManager(IFCManager):
         return ord(rev_str.upper()) - ord('A')
 
     def _ab_superseded_dir(self, doc_folder: Path) -> Path:
-        """Existing Superseded/SS folder inside a doc-ID folder, or default path."""
+        """Existing dead-versions folder inside a doc-ID folder, or default path.
+
+        Per asbuilt-native-folder-standard there is EXACTLY ONE dead-versions
+        folder, canonically named 'Superseded'. Real folders drift (SS / SUPERSEDED
+        / Superceded / 'OLD REVISION' / 'old version'); this recognises ALL of them
+        so we never create a SECOND archive beside an existing one (the EA-017
+        double-archive defect). The first match wins; naming is normalised to the
+        canonical 'Superseded' by canonicalize_dead_dirs()."""
         try:
             for item in doc_folder.iterdir():
-                if item.is_dir() and item.name.lower() in (
-                        'superseded', 'superceded', 'ss'):
+                if item.is_dir() and _RE_DEAD_DIR.match(item.name):
                     return item
         except (OSError, PermissionError):
             pass
         return doc_folder / 'Superseded'
+
+    def canonicalize_dead_dirs(self, report_only: bool = True) -> List[Dict]:
+        """Normalise every doc-folder's dead-versions folder to 'Superseded'.
+
+        asbuilt-native-folder-standard: exactly ONE dead-versions folder, named
+        'Superseded'. Recognised drifts (SS / SUPERSEDED / 'OLD REVISION' / …) are
+        renamed; a redundant second archive is MERGED into the canonical one (the
+        EA-017 'OLD REVISION beside Superseded' defect). Folder-rename only — zero
+        file content moved, fully reversible. Returns action dicts."""
+        actions: List[Dict] = []
+        native = self.native_root
+        if not native.exists():
+            return actions
+        for doc_folder in sorted(native.iterdir()):
+            if not doc_folder.is_dir():
+                continue
+            try:
+                dead = [d for d in doc_folder.iterdir()
+                        if d.is_dir() and _RE_DEAD_DIR.match(d.name)]
+            except (OSError, PermissionError):
+                continue
+            for d in dead:
+                if d.name == 'Superseded':
+                    continue
+                canon = doc_folder / 'Superseded'
+                doc_id, _ = _parse_folder_name(doc_folder.name)
+                if report_only:
+                    actions.append({'doc_id': doc_id, 'kind': 'canon_dead_dir',
+                                    'path': str(d), 'to': 'Superseded', 'moved': False})
+                    continue
+                try:
+                    if d.name.lower() == 'superseded':          # case-only rename
+                        tmp = doc_folder / f'__canon_{uuid.uuid4().hex[:6]}'
+                        to_long_path(d).rename(to_long_path(tmp))
+                        to_long_path(tmp).rename(to_long_path(canon))
+                    elif to_long_path(canon).is_dir():          # merge into existing
+                        for ch in list(to_long_path(d).iterdir()):
+                            self._move_to_ss(ch, canon)
+                        to_long_path(d).rmdir()
+                    else:
+                        to_long_path(d).rename(to_long_path(canon))
+                    actions.append({'doc_id': doc_id, 'kind': 'canon_dead_dir',
+                                    'path': str(d), 'to': 'Superseded', 'moved': True})
+                except Exception as e:
+                    logging.warning(f"[Native-canon] {d.name} 归一失败: {e}")
+        return actions
+
+    @staticmethod
+    def _loose_sort_key(stem: str) -> Tuple[int, float]:
+        """Order loose native DWGs: stage rank (AB>IFC>IFR>numbered>letter), then rev.
+        Mirror of the validated classifier — used only for RELATIVE ordering."""
+        s = stem.lower()
+        if re.search(r'_ab\b|asbuilt|as[\s_]built|-ab\b', s):
+            rank = 4
+        elif 'ifc' in s:
+            rank = 3
+        elif 'ifr' in s:
+            rank = 2
+        elif re.search(r'rev\s*\d', s):
+            rank = 1
+        else:
+            rank = 0
+        m = re.search(r'rev\.?\s*(\d+)(?:\.(\d+))?', stem, re.IGNORECASE)
+        if m:
+            rev = 100 + int(m.group(1)) + (int(m.group(2)) / 10 if m.group(2) else 0)
+        else:
+            m = re.search(r'\b_?r(\d+)\b', stem, re.IGNORECASE)
+            if m:
+                rev = 100 + int(m.group(1))
+            else:
+                m = _RE_REV_LETTER.search(stem)
+                rev = (ord(m.group(1).upper()) - ord('A')) if m else -1.0
+        return (rank, rev)
+
+    def classify_loose_dwgs(self, doc_folder: Path) -> List[Tuple[str, str, str]]:
+        """Classify loose DWGs at a Native doc-folder root vs the standard.
+
+        Returns [(filename, category, why)] where category ∈ {KEEP-MASTER,
+        KEEP-SHEETSET, KEEP-RESOURCE, SUPERSEDE, FLAG-MISFILED, FLAG-AMBIGUOUS}.
+        SAFETY: only SUPERSEDE the unambiguous (export scratch, files below an
+        AS-BUILT terminal master, or pure single-scheme older revs). Any mixed
+        letter+number lineage w/o an AB master, tie, mis-filed doc-id, '2bMerged'
+        marker, recover/in-design draft, or no-doc-id stray → FLAG, never move.
+        This guard is what prevents the letter/number recency inversion."""
+        fid_m = _RE_DOC_ID_ANY.search(doc_folder.name)
+        fid = fid_m.group(1).upper() if fid_m else None
+        try:
+            loose = [e.name for e in os.scandir(doc_folder)
+                     if e.is_file() and e.name.lower().endswith('.dwg')
+                     and not e.name.startswith('~$')]
+        except OSError:
+            return []
+        if len(loose) <= 1:
+            return [(n, 'KEEP-MASTER', 'sole loose master') for n in loose]
+        out: List[Tuple[str, str, str]] = []
+        own: List[Tuple[str, Tuple[int, float]]] = []
+        for n in loose:
+            stem = n[:-4]
+            low = n.lower()
+            if low.startswith('basedrawings') or low.startswith('titleblock'):
+                out.append((n, 'KEEP-RESOURCE', 'xref/titleblock')); continue
+            nid_m = _RE_DOC_ID_ANY.search(n)
+            nid = nid_m.group(1).upper() if nid_m else None
+            if _RE_MERGE_MARK.search(stem):
+                out.append((n, 'FLAG-MISFILED', '2bMerged/Merge-into (human decision)')); continue
+            if nid and fid and nid != fid:
+                out.append((n, 'FLAG-MISFILED', f'different doc-id {nid} in {fid} folder')); continue
+            if _RE_RECOVER_MARK.search(stem):
+                out.append((n, 'FLAG-AMBIGUOUS', 'recover/in-design working draft')); continue
+            if not nid and not _RE_AB_EXP_MARK.search(stem):
+                out.append((n, 'FLAG-AMBIGUOUS', 'no doc-id, non-resource stray draft')); continue
+            own.append((n, self._loose_sort_key(stem)))
+        if not own:
+            return out
+        sheet_named = [n for n, _ in own if _RE_SHEET_SUFFIX.search(n)]
+        if len(sheet_named) >= 3 and len(sheet_named) >= len(own) - 1:
+            for n, _ in own:
+                out.append((n, 'KEEP-SHEETSET', 'numeric multi-sheet master set'))
+            return out
+
+        def scheme(nm: str) -> str:
+            s = nm[:-4]
+            if _RE_REV_NUMTAG.search(s):
+                return 'num'
+            if _RE_REV_LETTER.search(s):
+                return 'let'
+            return 'none'
+        non_exp = [(n, k) for n, k in own if not _RE_AB_EXP_MARK.search(n[:-4])]
+        schemes = {scheme(n) for n, _ in non_exp} - {'none'}
+        maxk = max(k for _, k in own)
+        winners = [n for n, k in own if k == maxk]
+        master_is_ab = maxk[0] == 4
+        if len(schemes) > 1 and not master_is_ab:
+            for n, k in own:
+                if _RE_AB_EXP_MARK.search(n[:-4]):
+                    out.append((n, 'SUPERSEDE', 'export intermediate (_exp)'))
+                else:
+                    out.append((n, 'FLAG-AMBIGUOUS',
+                                f'mixed letter+number revs, no AB master ({schemes})'))
+            return out
+        for n, k in own:
+            if _RE_AB_EXP_MARK.search(n[:-4]):
+                out.append((n, 'SUPERSEDE', 'export intermediate (_exp)')); continue
+            if k == maxk:
+                if len(winners) == 1:
+                    out.append((n, 'KEEP-MASTER', f'highest stage/rev key={k}'))
+                else:
+                    out.append((n, 'FLAG-AMBIGUOUS', f'tie at top key={k} ({len(winners)} files)'))
+            else:
+                reason = ('below AB-terminal master' if master_is_ab
+                          else f'older key={k} < master {maxk}')
+                out.append((n, 'SUPERSEDE', reason))
+        return out
 
     def _move_to_ss(self, src: Path, ss_dir: Path) -> bool:
         """Move a stray file/dir into ss_dir (reversible). Dropbox/long-path safe."""
@@ -10544,6 +10717,11 @@ class AsBuiltManager(IFCManager):
             if not doc_id or not re.search(r'-\d{2,3}', doc_id):
                 continue
             ss_dir = self._ab_superseded_dir(doc_folder)
+            # Version-control verdict for the loose DWGs (asbuilt-native-folder-
+            # standard): who is master vs a safe-to-supersede older rev vs an
+            # ambiguous/mis-filed file that must be FLAGGED, not moved.
+            verdicts = {n: (cat, why)
+                        for n, cat, why in self.classify_loose_dwgs(doc_folder)}
             try:
                 children = list(doc_folder.iterdir())
             except (OSError, PermissionError):
@@ -10569,17 +10747,19 @@ class AsBuiltManager(IFCManager):
                     actions.append({'doc_id': doc_id, 'kind': 'stray_pdf',
                                     'path': str(child), 'moved': False, 'flag': True})
                 elif ext == '.dwg':
-                    # Bare master (no rev/stage token) is the live editable → KEEP.
-                    # A DWG carrying a rev/IFC/AB marker escaped its Rev.N folder →
-                    # FLAG (don't auto-pick a destination Rev folder).
-                    has_marker = (_ab_rev_from_name(child.stem) is not None
-                                  or self._is_ab_named(child.stem)
-                                  or re.search(r'(?:^|[\s_\-])IF[CR](?=$|[\s_\-.])',
-                                               child.stem, re.IGNORECASE) is not None)
-                    if has_marker:
+                    # Consult the version-control verdict. KEEP-* = master / sheet /
+                    # resource → leave. SUPERSEDE = unambiguous older rev or export
+                    # scratch → move to Superseded/ (reversible). FLAG-* = ambiguous
+                    # / mis-filed / '2bMerged' → flag only, a human decides.
+                    cat, why = verdicts.get(child.name, ('KEEP-MASTER', ''))
+                    if cat == 'SUPERSEDE':
+                        moved = True if report_only else self._move_to_ss(child, ss_dir)
+                        actions.append({'doc_id': doc_id, 'kind': 'superseded_rev',
+                                        'path': str(child), 'moved': moved, 'why': why})
+                    elif cat.startswith('FLAG'):
                         actions.append({'doc_id': doc_id, 'kind': 'loose_rev_dwg',
                                         'path': str(child), 'moved': False,
-                                        'flag': True})
+                                        'flag': True, 'why': why})
                 # any other extension (rare) is left untouched — conservative
         return actions
 
@@ -13754,9 +13934,13 @@ class PipelineOrchestrator:
             print(f"\n  [Stage 4/7] AS BUILT 版本管理...")
             try:
                 ab_mgr = AsBuiltManager(project_path, dry_run=self.dry_run)
+                # Normalise dead-versions folders to ONE 'Superseded' FIRST, so the
+                # cleanups below reuse it and never spawn a second archive.
+                canon = ab_mgr.canonicalize_dead_dirs(report_only=self.dry_run)
                 native_actions = ab_mgr.cleanup_ab_native(report_only=self.dry_run)
-                # Native loose-file VC (.bak/stray-pdf → Superseded/, escaped-rev
-                # DWG → flag; bare working DWG master kept). Reversible, no COM.
+                # Native loose-file VC: junk → Superseded/; older revs (below an AB
+                # master / pure-scheme / export scratch) → Superseded/; mixed-scheme,
+                # tie, mis-filed, '2bMerged' → FLAG only. Bare master kept. No COM.
                 loose = ab_mgr.cleanup_native_loose(report_only=self.dry_run)
                 loose_moved = [a for a in loose if not a.get('flag')]
                 loose_flag = [a for a in loose if a.get('flag')]
@@ -13771,6 +13955,7 @@ class PipelineOrchestrator:
                 multi = [f for f in sup['flagged'] if 'variants' in f]
                 results['asbuilt_version'] = {
                     'native_cleaned': len(native_actions),
+                    'dead_dirs_canon': len(canon),
                     'native_loose_moved': len(loose_moved),
                     'native_loose_flagged': len(loose_flag),
                     'deliverable_moved': len(sup['moved']),
