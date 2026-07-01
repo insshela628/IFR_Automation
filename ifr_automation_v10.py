@@ -8154,13 +8154,20 @@ _RE_DOC_ID_GENERIC = re.compile(r'^([A-Z0-9][\w]+-[A-Z]+-[A-Z]*-?\d{3})', re.IGN
 _RE_DOC_ID_TSF = re.compile(r'^(TSF-[A-Z]{2}-[A-Z]{3}-\w+-\d{2})', re.IGNORECASE)
 
 
-def _extract_doc_id_standalone(filename: str) -> Optional[str]:
+def _extract_doc_id_standalone(filename: str, allow_fallback: bool = True) -> Optional[str]:
     """Extract doc-ID from a filename without needing a class instance.
 
     Two-pass strategy:
       1. match() — doc-ID at start of filename (standard naming)
       2. search() — doc-ID anywhere in filename (non-standard naming)
     This ensures files with inaccurate names are still matched by FILE NO.
+
+    `allow_fallback` gates the greedy last-resort ("everything before _Rev").
+    That fallback is right for lenient doc-ID MATCHING (never miss a file), but
+    WRONG where a None answer is meaningful — e.g. the loose-DWG classifier uses
+    None to mean "this is a stray with no structured doc-ID, do not treat as
+    lineage" (a `Site Plan_hay#2_revM.dwg` must stay a stray, not become an own
+    revision). Such callers pass allow_fallback=False for the structured-only IDs.
     """
     stem = Path(filename).stem
     # Strip -Approved suffix first for cleaner matching
@@ -8172,10 +8179,12 @@ def _extract_doc_id_standalone(filename: str) -> Optional[str]:
             return m.group(1)
     # Pass 2: non-standard — doc-ID anywhere in filename
     # Handles files where FILE NAME is inaccurate but FILE NO is present somewhere
-    for pat in [_RE_DOC_ID_GG, _RE_DOC_ID_LMS, _RE_DOC_ID_TSF]:
+    for pat in [_RE_DOC_ID_GG, _RE_DOC_ID_LMS, _RE_DOC_ID_TSF, _RE_DOC_ID_GENERIC]:
         m = pat.search(stem_clean)
         if m:
             return m.group(1)
+    if not allow_fallback:
+        return None
     # Fallback: take everything before first _Rev or _rev
     m = re.match(r'^(.+?)(?:[_\s]-?[Rr]ev)', stem_clean)
     if m:
@@ -9818,10 +9827,14 @@ _RE_AB_EXP_MARK = re.compile(r'[_\-\s]exp\b', re.IGNORECASE)
 _RE_DEAD_DIR = re.compile(
     r'^(superseded|superceded|ss|old\s*revision|old\s*version|archive|previous|prev)\b',
     re.IGNORECASE)
-# Loose-DWG version-control classifier support (asbuilt-native-folder-standard):
-_RE_DOC_ID_ANY = re.compile(r'((?:\d{5}|GG\d{2})-[A-Z]{1,2}-[A-Z]{0,3}-?\d{3})',
-                            re.IGNORECASE)
-_RE_SHEET_SUFFIX = re.compile(r'_(\d{3}[A-Z]?)(?:_rev|\b|\.)', re.IGNORECASE)
+# Loose-DWG version-control classifier support (asbuilt-native-folder-standard).
+# Doc-ID recognition delegates to _extract_doc_id_standalone(allow_fallback=False)
+# — ONE canonical extractor (covers GG/LMS/TSF/generic incl. NSW###), never a
+# second parallel regex (the LMS-only regex that blinded the classifier on NSW).
+# Sheet-member suffix: LMS uses `_NNN`, Coleambally uses `-NN` — accept BOTH so
+# multi-sheet SETS are KEPT, never mistaken for old revisions and superseded.
+_RE_SHEET_SUFFIX = re.compile(r'(?:_(\d{3}[A-Z]?)|-(\d{2,3}))(?:_rev|\b|\.)',
+                              re.IGNORECASE)
 _RE_MERGE_MARK = re.compile(r'2b\s*merged|merge\s*into|2bmerged', re.IGNORECASE)
 _RE_RECOVER_MARK = re.compile(r'_recover\b|IN\s*DESIGN', re.IGNORECASE)
 _RE_REV_LETTER = re.compile(r'rev\.?\s*([A-Z])\b', re.IGNORECASE)
@@ -10478,8 +10491,8 @@ class AsBuiltManager(IFCManager):
         letter+number lineage w/o an AB master, tie, mis-filed doc-id, '2bMerged'
         marker, recover/in-design draft, or no-doc-id stray → FLAG, never move.
         This guard is what prevents the letter/number recency inversion."""
-        fid_m = _RE_DOC_ID_ANY.search(doc_folder.name)
-        fid = fid_m.group(1).upper() if fid_m else None
+        fid_raw = _extract_doc_id_standalone(doc_folder.name, allow_fallback=False)
+        fid = fid_raw.upper() if fid_raw else None
         try:
             loose = [e.name for e in os.scandir(doc_folder)
                      if e.is_file() and e.name.lower().endswith('.dwg')
@@ -10495,8 +10508,8 @@ class AsBuiltManager(IFCManager):
             low = n.lower()
             if low.startswith('basedrawings') or low.startswith('titleblock'):
                 out.append((n, 'KEEP-RESOURCE', 'xref/titleblock')); continue
-            nid_m = _RE_DOC_ID_ANY.search(n)
-            nid = nid_m.group(1).upper() if nid_m else None
+            nid_raw = _extract_doc_id_standalone(n, allow_fallback=False)
+            nid = nid_raw.upper() if nid_raw else None
             if _RE_MERGE_MARK.search(stem):
                 out.append((n, 'FLAG-MISFILED', '2bMerged/Merge-into (human decision)')); continue
             if nid and fid and nid != fid:
@@ -10512,6 +10525,23 @@ class AsBuiltManager(IFCManager):
         if len(sheet_named) >= 3 and len(sheet_named) >= len(own) - 1:
             for n, _ in own:
                 out.append((n, 'KEEP-SHEETSET', 'numeric multi-sheet master set'))
+            return out
+
+        # Cross-title guard — mirror supersede_ab_deliverables doctrine: files
+        # sharing a doc-id but carrying DIFFERENT drawing titles are DISTINCT
+        # deliverables, NOT revisions of one another (Coleambally C-PLN-002
+        # "(Equipment)" vs "(Fencing)"; LMS EL-001↔EL-002 title drift). Grouping
+        # by doc-id alone would collapse them and supersede all-but-one → data
+        # loss. >1 distinct title signature → defer the whole doc-id to manual;
+        # only an _exp export intermediate is still safe to move.
+        sigs = {_ab_title_signature(n[:-4], fid) for n, _ in own}
+        if len(sigs) > 1:
+            for n, k in own:
+                if _RE_AB_EXP_MARK.search(n[:-4]):
+                    out.append((n, 'SUPERSEDE', 'export intermediate (_exp)'))
+                else:
+                    out.append((n, 'FLAG-AMBIGUOUS',
+                                f'cross-title: {len(sigs)} distinct titles share doc-id (manual)'))
             return out
 
         def scheme(nm: str) -> str:
@@ -12042,6 +12072,72 @@ class AsBuiltManager(IFCManager):
                             return True
         return False
 
+    def _detect_tb_box(self, page):
+        """(x0,y0,x1,y1) title-block no-go box anchored to the sheet BOTTOM, or
+        None. The title block is the band of WIDE horizontal rules contiguous with
+        the bottom border: walk up from the bottom through wide rules while the gap
+        between successive rules stays small (a TB row band), and STOP at the first
+        big gap — so a detached table border floating above the TB (e.g. a Bill-of-
+        Materials table's bottom rule, ES-302 p6) is NOT absorbed into the TB box.
+
+        Purpose: the stamp's HOME position sits just ABOVE this strip on every
+        project verified (Coleambally, LMS: gold refs, CA-001, EA-013, ES-302 all
+        clear it), so a stamp landing INSIDE this box = it dropped onto the title
+        block (a defect the user called out). Geometric + project-agnostic: keys
+        only on the wide bottom-anchored rule cluster, no block-name assumptions."""
+        pw, ph = page.rect.width, page.rect.height
+        rules = []  # (y, x0, x1) wide horizontal rules
+        for dr in page.get_drawings():
+            for it in dr['items']:
+                seg = None
+                if it[0] == 'l' and abs(it[1].y - it[2].y) < 1.0:
+                    seg = (it[1].y, min(it[1].x, it[2].x), max(it[1].x, it[2].x))
+                elif it[0] == 're':
+                    r = it[1]
+                    if r.width > pw * 0.40:
+                        rules.append((r.y0, r.x0, r.x1))
+                        rules.append((r.y1, r.x0, r.x1))
+                        continue
+                if seg and (seg[2] - seg[1]) > pw * 0.40:
+                    rules.append(seg)
+        rules = [r for r in rules if r[0] > ph * 0.66]
+        if not rules:
+            return None
+        rules.sort(key=lambda r: -r[0])          # bottom-up
+        gap_max = ph * 0.12                        # a TB row band is small
+        cluster = [rules[0]]
+        for y, x0, x1 in rules[1:]:
+            if cluster[-1][0] - y <= gap_max:
+                cluster.append((y, x0, x1))
+            elif y < cluster[-1][0] - gap_max:
+                break                              # first big gap above the TB band
+        # The full-width SHEET BORDER (≈100% width) is contiguous with the TB rows
+        # but is NOT the title block — its left edge is the sheet edge, which would
+        # stretch the no-go box across the whole bottom strip and false-flag a stamp
+        # correctly parked in the empty bottom-LEFT corner (NSW153 E-BLD-001: stamp
+        # left of the rev-table, in white space, was wrongly read as on-TB). So take
+        # the horizontal extent from the NARROWER title-block row rules only; the
+        # empty bottom-left thus stays OUTSIDE the TB box. Fall back to the whole
+        # cluster if no narrow row rule exists.
+        rows = [r for r in cluster if (r[2] - r[1]) < pw * 0.90]
+        span = rows if rows else cluster
+        top_y = min(r[0] for r in span)
+        left_x = min(r[1] for r in span)
+        right_x = max(r[2] for r in span)
+        return (left_x - 6, top_y - 8, max(right_x, pw), ph)
+
+    def _rect_hits_tb(self, boxes, tb_box):
+        """True if any stamp box intersects the title-block no-go box."""
+        if not tb_box:
+            return False
+        for b in boxes:
+            bx0, by0, bx1, by1 = (b.x0, b.y0, b.x1, b.y1) if hasattr(b, 'x0') \
+                else (b[0], b[1], b[2], b[3])
+            if (min(bx1, tb_box[2]) - max(bx0, tb_box[0]) > 0
+                    and min(by1, tb_box[3]) - max(by0, tb_box[1]) > 0):
+                return True
+        return False
+
     def _black_frac(self, page, rx0, ry0, rx1, ry1):
         """Fraction of near-black pixels in a PDF-space rect (foreign ink)."""
         import fitz as _fitz
@@ -12107,35 +12203,60 @@ class AsBuiltManager(IFCManager):
                 if not self._stamp_overlaps_content(page, boxes):
                     continue  # stamp sits on white — the common case, no-op
 
-                # Candidate top-left anchors over a coarse full-sheet grid. Ordered
-                # by proximity to the BOTTOM-LEFT corner: on these title-block
-                # frames the lower-left is the conventional empty zone (the user's
-                # explicit target — "move stamp to bottom-left"), and aiming there
-                # avoids dumping the group into a still-cluttered mid-sheet slot
-                # that merely happens to be the nearest clear pixel. First clear
-                # candidate in that order wins. Project-agnostic: it just resolves
-                # to "the clear area nearest the bottom-left".
+                # Candidate top-left anchors over a coarse full-sheet grid. The
+                # title block is a hard NO-GO (user: the relocated stamp "不能挡住
+                # titleblock"), and the preferred landing is the LOWER-RIGHT, with
+                # the LOWER-LEFT as backup (user: "右下（优先）左下（备选）"). So we
+                # search in two ordered passes — right-anchored first, then left-
+                # anchored — each favouring LOW placement (near the TB top edge),
+                # and take the first slot that is clear by BOTH the raster vet AND
+                # the geometric QA detector AND fully outside the title block. Using
+                # the same geometric detector the QA gate uses guarantees the
+                # relocator never picks a slot QA would later reject (the earlier
+                # bug: raster said "clear" on a slot whose stamp border sat on the
+                # TB rule, which the geometric linework signal then flagged).
+                # Project-agnostic: right/left corners + TB-clear + content-clear.
                 margin = min(pw, ph) * 0.012
+                tb_box = self._detect_tb_box(page)
+                # keep a clearance gap so the stamp never sits ON the TB top rule
+                gap = min(pw, ph) * 0.008
                 x_lo, x_hi = margin, pw - gw - margin
-                y_lo, y_hi = ph * 0.08, ph - gh - margin
+                y_lo = ph * 0.08
+                y_hi = (tb_box[1] - gap if tb_box else ph - margin) - gh
                 xstep = max(gw * 0.5, pw * 0.03)
                 ystep = max(gh * 0.5, ph * 0.02)
+
+                def _slot_ok(dx, dy):
+                    grp = (gx0 + dx, gy0 + dy, gx1 + dx, gy1 + dy)
+                    if self._rect_hits_tb([grp], tb_box):
+                        return False
+                    if not _all_clear(dx, dy):
+                        return False  # cheap raster pre-filter
+                    tr = [_fitz.Rect(b.x0 + dx, b.y0 + dy, b.x1 + dx, b.y1 + dy)
+                          for b in boxes]
+                    return not self._stamp_overlaps_content(page, tr)
+
                 cands = []
                 ty = y_lo
                 while ty <= y_hi:
                     tx = x_lo
                     while tx <= x_hi:
                         dx, dy = tx - gx0, ty - gy0
-                        # cost: distance to the page's bottom-left corner (0, ph).
-                        bl = (tx * tx + (ph - (ty + gh)) ** 2) ** 0.5
-                        cands.append((bl, dx, dy))
+                        # two costs: proximity to bottom-RIGHT and to bottom-LEFT.
+                        low = (ph - (ty + gh)) ** 2
+                        c_right = ((pw - (tx + gw)) ** 2 + low) ** 0.5
+                        c_left = (tx * tx + low) ** 0.5
+                        cands.append((c_right, c_left, dx, dy))
                         tx += xstep
                     ty += ystep
-                cands.sort(key=lambda t: t[0])
                 best, forced = None, False
-                for _bl, dx, dy in cands:
-                    if _all_clear(dx, dy):
-                        best = (dx, dy)
+                for key in (0, 1):  # 0 = right-preferred, 1 = left-backup
+                    for cand in sorted(cands, key=lambda t: t[key]):
+                        dx, dy = cand[2], cand[3]
+                        if _slot_ok(dx, dy):
+                            best = (dx, dy)
+                            break
+                    if best is not None:
                         break
                 if best is None:
                     # LAST RESORT (user-approved): no fully-clear on-edge slot
@@ -12143,9 +12264,9 @@ class AsBuiltManager(IFCManager):
                     # e.g. E-BLD-001). Rather than leave the stamp on whatever it
                     # currently covers, move the WHOLE group to the LEAST-INK
                     # position so it obstructs as little design content as
-                    # possible — least foreign-ink primary, bottom-left as the
-                    # tiebreak (the cands list is already bottom-left-first, so a
-                    # strict-improvement update naturally favours it). QA is NOT
+                    # possible — least foreign-ink primary, right-then-left as the
+                    # tiebreak. Title-block slots are still excluded (never dump the
+                    # stamp onto the title block even as a last resort). QA is NOT
                     # relaxed: _stamp_overlaps_content still runs on the result
                     # and still escalates [需人工检查] if the least-bad spot is
                     # not actually clear — the stamp is merely in the least
@@ -12159,7 +12280,12 @@ class AsBuiltManager(IFCManager):
                             page, b.x0 + dx + ins, b.y0 + dy + ins,
                             b.x1 + dx - ins, b.y1 + dy - ins) for b in boxes)
                     best_ink = _total_ink(0.0, 0.0)  # current position
-                    for _bl, dx, dy in cands:
+                    # right-preferred order; skip title-block slots
+                    for cand in sorted(cands, key=lambda t: t[0]):
+                        dx, dy = cand[2], cand[3]
+                        grp = (gx0 + dx, gy0 + dy, gx1 + dx, gy1 + dy)
+                        if self._rect_hits_tb([grp], tb_box):
+                            continue
                         ink = _total_ink(dx, dy)
                         if ink < best_ink - 1e-6:
                             best_ink, best, forced = ink, (dx, dy), True
@@ -13461,6 +13587,19 @@ class AsBuiltManager(IFCManager):
                     if stamp_boxes and self._stamp_overlaps_content(page, stamp_boxes):
                         warnings.append(
                             f'Page {pi+1}: 印章压住图面内容 — 自动避让无空位 [需人工检查]')
+                    # Title-block overlap gate. The stamp's home sits just ABOVE the
+                    # TB strip on every verified project, so a stamp landing INSIDE
+                    # the TB box = it dropped onto the title block (user: "不能挡住
+                    # titleblock"). The content-overlap signal above can MISS this —
+                    # a TB is sparse (short row rules + text), so a stamp on it may
+                    # trigger no foreign-word/cell/through-line. Verified no false
+                    # positive on the gold corpus (stamps clear the TB). Escalated.
+                    if stamp_boxes:
+                        _tb = self._detect_tb_box(page)
+                        if self._rect_hits_tb(stamp_boxes, _tb):
+                            warnings.append(
+                                f'Page {pi+1}: 印章压住标题栏 (title block) — '
+                                f'自动避让无空位 [需人工检查]')
                 except Exception:
                     pass
 
