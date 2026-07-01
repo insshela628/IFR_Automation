@@ -10448,11 +10448,28 @@ class AsBuiltManager(IFCManager):
                                     'path': str(extra), 'kept': keep.name,
                                     'moved': moved})
 
-            # 2. Move loose AS BUILT files (outside any Rev.N - AB/ subfolder).
+            # 2. Loose AS BUILT files. Per the cross-project standard
+            #    (Warnertown/Coleambally): the loose AB DWG sitting at the
+            #    doc-folder ROOT *is* the live master and MUST stay there — the
+            #    root is the master's home, not a 'Rev.N - AB/' subfolder. Only
+            #    supersede a loose AB that is a genuine DUPLICATE, i.e. its rev is
+            #    <= an AB already frozen in a 'Rev.N - AB/' snapshot folder. Never
+            #    evict the sole/highest AB (that bug kicked masters into SS,
+            #    leaving 'SS-only, no AB' folders).
+            highest_ab_folder = max((k for k, _ in ab_subs), default=None)
             for child in children:
                 if not child.is_file() or child.name.startswith('~$'):
                     continue
                 if not self._is_ab_named(child.stem):
+                    continue
+                loose_rev = _ab_rev_from_name(child.stem)
+                is_dup = (highest_ab_folder is not None
+                          and loose_rev is not None
+                          and loose_rev <= highest_ab_folder)
+                if not is_dup:
+                    # sole/highest AB → the live master; keep it loose at root.
+                    actions.append({'doc_id': doc_id, 'kind': 'ab_master_kept',
+                                    'path': str(child), 'moved': False})
                     continue
                 moved = True if report_only else self._move_to_ss(child, ss_dir)
                 actions.append({'doc_id': doc_id, 'kind': 'stray_ab_file',
@@ -11718,15 +11735,50 @@ class AsBuiltManager(IFCManager):
         'AS', 'BUILT', 'AS-BUILT', 'DRAWINGS', 'DRAWING', 'TO', 'BE',
         'PRINTED', 'IN', 'COLOUR', 'COLOR'))
 
+    @staticmethod
+    def _seg_crosses_rect(ax, ay, bx, by, rx0, ry0, rx1, ry1):
+        """True if segment (ax,ay)-(bx,by) crosses the rect interior with a
+        positive-length portion inside (Liang-Barsky). A segment merely tangent to
+        an edge/corner yields zero interior length → False."""
+        dx, dy = bx - ax, by - ay
+        p = (-dx, dx, -dy, dy)
+        q = (ax - rx0, rx1 - ax, ay - ry0, ry1 - ay)
+        u1, u2 = 0.0, 1.0
+        for pi, qi in zip(p, q):
+            if abs(pi) < 1e-9:
+                if qi < 0:
+                    return False  # parallel to this edge and outside the slab
+            else:
+                t = qi / pi
+                if pi < 0:
+                    if t > u2:
+                        return False
+                    if t > u1:
+                        u1 = t
+                else:
+                    if t < u1:
+                        return False
+                    if t < u2:
+                        u2 = t
+        if u1 > u2:
+            return False
+        return (u2 - u1) * (abs(dx) + abs(dy)) > 1e-6
+
     def _stamp_overlaps_content(self, page, boxes):
         """True if any stamp box overlaps FOREIGN drawing content (geometric, so
         COLOUR-INDEPENDENT — unaffected by whether a sheet's CTB renders the stamp
         red or black, which broke raster ink-counting on mono sheets like
-        C-PLN-003). Two signals: (1) a foreign text word whose centre lands inside
+        C-PLN-003). Three signals: (1) a foreign text word whose centre lands inside
         a box; (2) a foreign cell-like rect (fill=None, not a stamp box) whose
-        intersection with a box exceeds 15% of the box area. Catches the stamp
-        landing on a detail/dimension table (C-PLN-003 DOUBLE ACCESS GATES) or on
-        notes shown through a viewport (C-PLN-006). Tag-/project-agnostic."""
+        intersection with a box exceeds 15% of the box area; (3) foreign vector
+        LINEWORK — a stroke (line/curve) that passes THROUGH a box interior.
+        Signals (1)/(2) miss bare schematic linework: on WIRING SCHEMATICS the
+        overlapping content is diagram strokes (column lines, leader arrows) with no
+        word centred in the box and no cell-sized rect (LMS ES-302 p4/p5: the DV1
+        current-transducer column's two full-height vertical lines cross both stamp
+        boxes, yet (1)+(2) reported clear). Catches the stamp landing on a
+        detail/dimension table (C-PLN-003), notes through a viewport (C-PLN-006), or
+        schematic linework (ES-302). Tag-/project-agnostic."""
         pw, ph = page.rect.width, page.rect.height
         # (1) foreign words
         for w in page.get_text("words"):
@@ -11758,6 +11810,56 @@ class AsBuiltManager(IFCManager):
                 if ix > 0 and iy > 0 and barea > 0 \
                         and (ix * iy) > barea * 0.15:
                     return True
+        # (3) foreign vector LINEWORK passing THROUGH a box interior. Tested against
+        # each box shrunk by a small inset so the stamp's OWN border strokes and any
+        # line merely running ALONG a box edge do not self-trigger. A line qualifies
+        # only if it is a THROUGH-line: BOTH endpoints lie OUTSIDE the (inset) box
+        # while the segment crosses its interior. That pass-through rule is the key
+        # discriminator — genuine design content (wiring/column lines) traverses the
+        # small stamp box and continues well beyond it, whereas title-block furniture
+        # that legitimately sits by the stamp (north-arrow circle, scale symbol,
+        # leader arrowhead) TERMINATES locally inside the box (an endpoint within it)
+        # and is correctly ignored (verified: Coleambally C-PLN-007 north arrow,
+        # C-SEC-02 stay clear; ES-302 p4/p5 flag). Exclusions: filled paths (the
+        # stamp box border renders filled — skipped above via fill), any path whose
+        # bbox is near-coincident with a stamp box (a stroked box outline), and the
+        # sheet border / title-block frame (bbox large in BOTH dims — a single
+        # full-height/width content line is large in ONE dim only, so it is kept).
+        ins = max(2.0, min(pw, ph) * 0.002)
+        inset = [(b.x0 + ins, b.y0 + ins, b.x1 - ins, b.y1 - ins) for b in boxes]
+        for dr in page.get_drawings():
+            if dr.get('fill') is not None:
+                continue  # filled = stamp box / solid, not foreign linework
+            r = dr['rect']
+            if r.width > pw * 0.5 and r.height > ph * 0.5:
+                continue  # sheet border / title-block frame (large in BOTH dims)
+            if any(abs(r.x0 - b.x0) < ph * 0.01 and abs(r.y0 - b.y0) < ph * 0.01
+                   and abs(r.x1 - b.x1) < ph * 0.01 and abs(r.y1 - b.y1) < ph * 0.01
+                   for b in boxes):
+                continue  # the stamp box's own outline path
+            for it in dr['items']:
+                op = it[0]
+                if op == 'l':
+                    segs = ((it[1], it[2]),)
+                elif op == 'c':
+                    segs = ((it[1], it[4]),)  # bezier endpoints (chord approx)
+                elif op == 're':
+                    rr = it[1]
+                    segs = ((rr.tl, rr.tr), (rr.tr, rr.br),
+                            (rr.br, rr.bl), (rr.bl, rr.tl))
+                elif op == 'qu':
+                    qd = it[1]
+                    segs = ((qd.ul, qd.ur), (qd.ur, qd.lr),
+                            (qd.lr, qd.ll), (qd.ll, qd.ul))
+                else:
+                    continue
+                for a, c in segs:
+                    for (ix0, iy0, ix1, iy1) in inset:
+                        if (self._seg_crosses_rect(a.x, a.y, c.x, c.y,
+                                                   ix0, iy0, ix1, iy1)
+                                and (a.x < ix0 or a.x > ix1 or a.y < iy0 or a.y > iy1)
+                                and (c.x < ix0 or c.x > ix1 or c.y < iy0 or c.y > iy1)):
+                            return True
         return False
 
     def _black_frac(self, page, rx0, ry0, rx1, ry1):
