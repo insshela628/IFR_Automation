@@ -10022,6 +10022,79 @@ class AsBuiltManager(IFCManager):
 
         return results
 
+    # doc-list actions that mean an item is legitimately ABSENT, not a gap to chase.
+    _AB_ORACLE_SUPPRESS = {"CANCEL_NUMBER", "RETURN_UNCHANGED", "DUP_NUMBER"}
+
+    def _load_ab_deliverable_oracle(self) -> Dict[str, Dict]:
+        """Read the client As Built *Deliverables List* as the gap-reporter's oracle.
+
+        The list is the client's authoritative register (Number / Current As Built /
+        Comments). Parsing it lets Stage 4 (a) know the client's TARGET rev per item
+        and (b) suppress false gaps — numbers the client cancelled / incorporated /
+        returned unchanged are absent BY DESIGN, not conversion gaps.
+
+        Reuses the Doc-Control keystone parser (`deliverable_list.parse_deliverable_list`
+        in the energy-agent domain — never re-implemented here) so the classification
+        vocabulary stays single-source. SOFT dependency: if the sibling repo or the
+        list file is absent, returns {} and the reporter degrades to its old behavior
+        (never breaks the pipeline). Cached on self._ab_oracle.
+
+        Returns {DOC_ID_UPPER: {action_type, target_rev, comment, suppress}}.
+        """
+        if getattr(self, '_ab_oracle', None) is not None:
+            return self._ab_oracle
+        self._ab_oracle = {}
+        self._ab_oracle_src = None
+        try:
+            # locate the canonical list beside the deliverable folder ('5. As Built/')
+            stage_dir = Path(self.ab_output).parent
+            cands = list(stage_dir.glob('*Deliverables List*.xlsx'))
+            cands = [c for c in cands if not c.name.startswith('~$')]
+            if not cands:
+                return self._ab_oracle
+            # prefer an ACE-commented copy, then newest mtime
+            def _rank(p: Path):
+                nm = p.name.lower()
+                return (('comment' in nm or 'ace' in nm), p.stat().st_mtime)
+            list_path = max(cands, key=_rank)
+
+            # import the keystone parser from the sibling energy-agent repo
+            import sys as _sys
+            ea_root = Path(__file__).resolve().parents[2] / "L02-knowledge" / "energy-agent"
+            if ea_root.is_dir() and str(ea_root) not in _sys.path:
+                _sys.path.insert(0, str(ea_root))
+            from modules.review.deliverable_list import parse_deliverable_list
+
+            recs = parse_deliverable_list(str(list_path))
+            grouped: Dict[str, List[Dict]] = {}
+            for r in recs:
+                did = (r.get('doc_number') or '').upper()
+                if did:
+                    grouped.setdefault(did, []).append(r)
+
+            oracle: Dict[str, Dict] = {}
+            for did, rows in grouped.items():
+                actions = {r['action_type'] for r in rows}
+                suppress = actions.issubset(self._AB_ORACLE_SUPPRESS)
+                # target rev + comment: prefer an actionable (non-suppress) row
+                act_rows = [r for r in rows
+                            if r['action_type'] not in self._AB_ORACLE_SUPPRESS] or rows
+                tgt = next((r['as_built_rev'] for r in act_rows if r.get('as_built_rev')),
+                           None)
+                oracle[did] = {
+                    'action_type': sorted(actions)[0] if len(actions) == 1
+                                   else '/'.join(sorted(actions)),
+                    'target_rev': tgt,
+                    'comment': (act_rows[0].get('comment_text') or '')[:80],
+                    'suppress': suppress,
+                }
+            self._ab_oracle = oracle
+            self._ab_oracle_src = list_path.name
+        except Exception as e:
+            print(f"    (客户清单 oracle 不可用，缺口报告降级为纯扫描: {e})")
+            self._ab_oracle = {}
+        return self._ab_oracle
+
     def report_missing_ab(self) -> List[Dict]:
         """Read-only GAP report: native IFC drawings that have NO AS BUILT PDF yet.
 
@@ -10036,9 +10109,18 @@ class AsBuiltManager(IFCManager):
         Returns sorted list of {doc_id, ifc_rev, pages, source, folder, description}.
         """
         native_root = self.native_root
+        oracle = self._load_ab_deliverable_oracle()
+        self._ab_gaps_suppressed = []      # client-list non-gaps, for transparency
         gaps = []
         for info in self.scan_native_for_ab():
             if info.get('existing_ab_rev') is not None:
+                continue
+            o = oracle.get((info['doc_id'] or '').upper())
+            if o and o['suppress']:
+                # client cancelled / incorporated / returned unchanged → not a gap
+                self._ab_gaps_suppressed.append({
+                    'doc_id': info['doc_id'], 'action': o['action_type'],
+                    'comment': o['comment']})
                 continue
             src = info['ifc_source']
             gaps.append({
@@ -10049,6 +10131,9 @@ class AsBuiltManager(IFCManager):
                           else 'report',
                 'folder': info['folder'],
                 'description': info.get('description', ''),
+                # oracle annotations (None when the doc isn't on the client list)
+                'target_rev': o['target_rev'] if o else None,
+                'list_action': o['action_type'] if o else None,
             })
         gaps.sort(key=lambda g: g['doc_id'])
         return gaps
@@ -13620,16 +13705,30 @@ class PipelineOrchestrator:
                 gaps = ab_mgr.report_missing_ab()
                 results['asbuilt_version']['missing_ab'] = [
                     {'doc_id': g['doc_id'], 'ifc_rev': g['ifc_rev'],
-                     'pages': g['pages']} for g in gaps]
+                     'pages': g['pages'], 'target_rev': g.get('target_rev'),
+                     'list_action': g.get('list_action')} for g in gaps]
+                suppressed = getattr(ab_mgr, '_ab_gaps_suppressed', [])
+                oracle_src = getattr(ab_mgr, '_ab_oracle_src', None)
+                if oracle_src:
+                    print(f"    (客户清单为准: {oracle_src})")
                 if gaps:
                     print(f"    ⚠ 缺 AS BUILT ({len(gaps)}) — 有 IFC 源但无客户 AB PDF:")
                     for g in gaps:
                         _desc = f"  {g['description']}" if g['description'] else ""
+                        _tgt = (f" → 客户要 Rev {g['target_rev']}"
+                                if g.get('target_rev') else "")
+                        _act = (f" [{g['list_action']}]"
+                                if g.get('list_action') else " [不在客户清单]")
                         print(f"        {g['doc_id']}  (IFC Rev.{g['ifc_rev']}, "
-                              f"{g['pages']} 页){_desc}")
+                              f"{g['pages']} 页){_tgt}{_act}{_desc}")
                     print(f"      → 用 convert_multi_to_ab 逐个补做")
                 else:
                     print(f"    缺 AS BUILT: 无 (所有 IFC 图纸都已有 AB PDF)")
+                if suppressed:
+                    print(f"    ℹ 客户清单判定「非缺口」已跳过 ({len(suppressed)}) — "
+                          f"取消/并入/原样退回:")
+                    for s in suppressed:
+                        print(f"        {s['doc_id']} [{s['action']}] {s['comment']}")
             except Exception as e:
                 UIHelper.print_error(f"AS BUILT 版本管理异常(不影响主流程): {e}")
                 results['asbuilt_version'] = {'error': str(e)}
