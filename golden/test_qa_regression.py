@@ -20,6 +20,11 @@ Re-baseline (only after deliberately accepting a new golden): gen_qa_golden.py
 import sys, json
 from pathlib import Path
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from gen_qa_golden import collect, GOLDEN  # same source → same fidelity
