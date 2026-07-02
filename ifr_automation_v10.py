@@ -64,6 +64,7 @@ from typing import List, Dict, Tuple, Optional, Set
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 from itertools import groupby
+import register_membership as _rm   # cross-track title-membership SSOT
 
 try:
     from tqdm import tqdm
@@ -10067,13 +10068,6 @@ _RE_MERGE_MARK = re.compile(r'2b\s*merged|merge\s*into|2bmerged', re.IGNORECASE)
 _RE_RECOVER_MARK = re.compile(r'_recover\b|IN\s*DESIGN', re.IGNORECASE)
 _RE_REV_LETTER = re.compile(r'rev\.?\s*([A-Z])\b', re.IGNORECASE)
 _RE_REV_NUMTAG = re.compile(r'rev\.?\s*\d|\b_?r\d', re.IGNORECASE)
-# Markers stripped to form a title signature. Separator/edge-anchored on BOTH
-# sides so a bare 'AB'/'IFC' inside a real word ('CABLE', 'FABRIC') is NOT eaten.
-_RE_AB_SIG_STRIP = re.compile(
-    r'(?:^|[\s_\-(])(?:rev\.?\s*\d+(?:\.\d+)?|as[ _]?built|ab(?:-exp)?|ifc'
-    r'|sheet\s*\d+|exp)(?=$|[\s_\-).])', re.IGNORECASE)
-
-
 def _ab_rev_from_name(stem: str) -> Optional[float]:
     """Numeric AS BUILT rev from a filename stem, or None.
 
@@ -10086,91 +10080,32 @@ def _ab_rev_from_name(stem: str) -> Optional[float]:
     return float(f"{m.group(1)}.{m.group(2)}") if m.group(2) else float(m.group(1))
 
 
+# ── title-membership helpers: thin delegations to the cross-track SSOT ────────
+# These names are kept for call-site compatibility; the logic now lives ONCE in
+# register_membership.py so the AS BUILT / IFR-PDF / Native tracks can never
+# drift apart. (Was an inlined duplicate; collapsed to delegation.)
 def _ab_title_text(stem: str, doc_id: Optional[str]) -> str:
-    """The human drawing-title portion of a filename stem — doc-id + rev +
-    AB/IFC/exp/sheet markers removed, separators normalized to single spaces, but
-    WORD BOUNDARIES KEPT (unlike _ab_title_signature, which collapses them). Used
-    for token-level reconciliation against a register title."""
-    sig = stem
-    if doc_id:
-        sig = re.sub(re.escape(doc_id), ' ', sig, flags=re.IGNORECASE)
-    prev = None
-    while prev != sig:                       # collapse adjacent markers
-        prev = sig
-        sig = _RE_AB_SIG_STRIP.sub(' ', sig)
-    return re.sub(r'\s+', ' ', re.sub(r'[_\-]', ' ', sig)).strip()
+    return _rm.title_text(stem, doc_id)
 
 
 def _ab_title_signature(stem: str, doc_id: Optional[str]) -> str:
-    """Normalized drawing-title signature: strip doc-id + rev + AB/IFC/exp/sheet
-    markers + all punctuation, uppercase. Two files sharing a signature are the
-    SAME drawing/document at different revisions; differing signatures are kept
-    apart (so two different drawings wrongly sharing a doc-id are never merged).
-    """
-    return re.sub(r'[^A-Za-z0-9]', '', _ab_title_text(stem, doc_id)).upper()
-
-
-# Words that carry no drawing-identity (mirrors the Doc-Control keystone
-# _TITLE_STOP so the two sides tokenize a title the same way). A title's
-# IDENTITY tokens are the len≥3 words left after removing these.
-_AB_TITLE_STOP = frozenset({
-    "the", "and", "for", "plan", "layout", "design", "rev", "as", "built", "ab",
-    "ifc", "diagram", "box", "general", "arrangement", "power", "station",
-    "nawma", "bess", "new", "existing", "drawing", "sheet", "details", "detail"})
+    return _rm.title_signature(stem, doc_id)
 
 
 def _ab_title_tokens(s: Optional[str]) -> frozenset:
-    return frozenset(t for t in re.findall(r"[a-z0-9]+", (s or "").lower())
-                     if len(t) >= 3 and t not in _AB_TITLE_STOP)
+    return _rm.title_tokens(s)
 
 
 def _ab_norm_title(s: Optional[str]) -> str:
-    """Punctuation/space-insensitive, upper-cased title key (matches the shape a
-    file's _ab_title_signature already has, so the two are directly comparable)."""
-    return re.sub(r'[^A-Za-z0-9]', '', s or '').upper()
+    return _rm.norm_title(s)
 
 
 def _ab_initials(s: Optional[str]) -> str:
-    """First letter of each word → acronym key (e.g. 'Single Line Diagram'→'SLD')."""
-    return ''.join(w[0] for w in re.findall(r'[A-Za-z0-9]+', s or '')).upper()
+    return _rm.initials(s)
 
 
 def _ab_title_reconciles(file_title: str, reg_title: str) -> bool:
-    """True iff a file's title denotes the SAME drawing as a register (Deliverables
-    List) title. `file_title` may be the spaced _ab_title_text OR a collapsed
-    signature. Same-drawing is decided (all auto-resolved, NO human step) by ANY of:
-      • fuzzy ≥ 0.85 on the normalized text (case/space/underscore drift), OR
-      • one is the ACRONYM of the other (SLD ≡ Single Line Diagram — some
-        engineers just save the file under the abbreviation), OR
-      • identity-token containment / overlap — the file's significant words are a
-        subset of the register title's (or vice-versa), or Jaccard ≥ 0.6. Real
-        registers are wordier than filenames ('Trench Alignment' vs 'Trench
-        Alignment Layout Plan'), so a pure-fuzzy test under-matches.
-    A genuinely different drawing sharing a doc-id (50023-CA-001 Trench Alignment
-    vs Cable Route GA) reconciles to NEITHER register title → the caller flags it
-    instead of collapsing it (guards the normalize-Rule-3 data-loss trap)."""
-    a, b = _ab_norm_title(file_title), _ab_norm_title(reg_title)
-    if not a or not b:
-        return False
-    if a == b:
-        return True
-    from difflib import SequenceMatcher
-    if SequenceMatcher(None, a, b).ratio() >= 0.85:
-        return True
-    # acronym-of, either direction (a collapsed side has no separators, so its
-    # initials can't be recomputed — compare the SHORT normalized form to the LONG
-    # side's word-initials).
-    if len(a) <= len(b):
-        if len(a) >= 2 and a == _ab_initials(reg_title):
-            return True
-    elif len(b) >= 2 and b == _ab_initials(file_title):
-        return True
-    # identity-token containment / overlap.
-    ta, tb = _ab_title_tokens(file_title), _ab_title_tokens(reg_title)
-    if ta and tb and (ta <= tb or tb <= ta
-                      or len(ta & tb) / len(ta | tb) >= 0.6):
-        return True
-    return False
+    return _rm.title_reconciles(file_title, reg_title)
 
 
 class AsBuiltManager(IFCManager):
