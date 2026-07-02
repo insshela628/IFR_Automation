@@ -12102,9 +12102,15 @@ class AsBuiltManager(IFCManager):
         detail/revision-table cells share the zone+size but are thin-stroked
         (fill=None) and so are correctly excluded. Tag- and project-agnostic."""
         pw, ph = page.rect.width, page.rect.height
+        # MILESTONE-AGNOSTIC hints: the main status box says 'AS BUILT' (AS BUILT),
+        # 'FOR CONSTRUCTION' (IFC) or 'ISSUED FOR REVIEW' (IFR); the COLOUR box is
+        # common to all. Keying only on BUILT/COLOUR missed the IFC/IFR main box →
+        # its overlaps were never detected/relocated. Matching CONSTRUCTION/REVIEW
+        # too makes overlap + two-corner relocation + QA identical across
+        # IFR → IFC → AS BUILT.
+        _STAMP_HINTS = ('BUILT', 'COLOUR', 'COLOR', 'CONSTRUCTION', 'REVIEW')
         words = [w for w in page.get_text("words")
-                 if 'BUILT' in w[4].upper() or 'COLOUR' in w[4].upper()
-                 or 'COLOR' in w[4].upper()]
+                 if any(k in w[4].upper() for k in _STAMP_HINTS)]
 
         def _encloses(r):
             for w in words:
@@ -12131,9 +12137,13 @@ class AsBuiltManager(IFCManager):
         return dedup
 
     # Stamp's own words — excluded when looking for FOREIGN text inside a box.
+    # Covers all three milestones: AS BUILT, FOR CONSTRUCTION (IFC), ISSUED FOR
+    # REVIEW (IFR) — so the milestone's own status text is never mis-read as
+    # foreign content overlapping the box.
     _STAMP_OWN_WORDS = frozenset((
         'AS', 'BUILT', 'AS-BUILT', 'DRAWINGS', 'DRAWING', 'TO', 'BE',
-        'PRINTED', 'IN', 'COLOUR', 'COLOR'))
+        'PRINTED', 'IN', 'COLOUR', 'COLOR',
+        'FOR', 'CONSTRUCTION', 'ISSUED', 'REVIEW'))
 
     @staticmethod
     def _seg_crosses_rect(ax, ay, bx, by, rx0, ry0, rx1, ry1):
