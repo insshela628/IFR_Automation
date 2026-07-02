@@ -6897,6 +6897,23 @@ class IFCManager(IFCStampMixin):
             if pdf_ok:
                 result['pdf_path'] = str(ifc_pdf_path)
                 result['success'] = True
+                # Stamp-overlap auto-fix — same cure as the AS BUILT path, now
+                # milestone-agnostic: if the FOR CONSTRUCTION / COLOUR box lands on
+                # content only visible in the published PDF (e.g. through a
+                # viewport), move the whole IFC_STAMP group to the clear opposite
+                # corner (two-corner mirror rule) and republish. Stops an IFC
+                # delivery shipping with the stamp over the drawing — the exact
+                # defect that hit AS BUILT. No AS-BUILT QA here (its stamp-presence
+                # / FOR-CONSTRUCTION-leftover checks are milestone-specific and
+                # would false-flag a legitimate IFC sheet). No-op when every page
+                # is clean → zero regression.
+                try:
+                    _fixed = self._raster_fix_stamp_overlaps(
+                        acad, ifc_dwg_path, ifc_pdf_path)
+                    if _fixed:
+                        print(f"    印章: 栅格检测到 {_fixed} 页与图面重叠 → 已避让并重出 PDF")
+                except Exception as _e_rf:
+                    print(f"    印章: 栅格避让跳过 ({_e_rf})")
             else:
                 result['errors'].append(
                     f"PDF PUBLISH 导出失败: {ifc_pdf_path.name} (DWG已保存)")
