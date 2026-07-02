@@ -6907,8 +6907,16 @@ class IFCManager(IFCStampMixin):
                 # / FOR-CONSTRUCTION-leftover checks are milestone-specific and
                 # would false-flag a legitimate IFC sheet). No-op when every page
                 # is clean → zero regression.
+                # The relocation toolkit (_raster_fix_stamp_overlaps + geometry
+                # detectors) lives on AsBuiltManager; IFCManager does not inherit it.
+                # Delegate through a bare AsBuiltManager instance — its methods need
+                # no __init__ state (they take acad + paths and use only class-level
+                # constants), verified against _publish_single_pdf / _shortpath_open_
+                # target having no self-attr dependencies. Milestone-agnostic detector
+                # + two-corner mirror relocation now protect IFC deliveries too.
                 try:
-                    _fixed = self._raster_fix_stamp_overlaps(
+                    _reloc = AsBuiltManager.__new__(AsBuiltManager)
+                    _fixed = _reloc._raster_fix_stamp_overlaps(
                         acad, ifc_dwg_path, ifc_pdf_path)
                     if _fixed:
                         print(f"    印章: 栅格检测到 {_fixed} 页与图面重叠 → 已避让并重出 PDF")
