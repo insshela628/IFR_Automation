@@ -192,6 +192,24 @@ def format_pipeline_result(results: Dict) -> str:
     elif dlv and dlv.get('error'):
         lines.append(f"  ❌ Deliverable: {dlv['error']}")
 
+    av = results.get('asbuilt_version')
+    if av:
+        moved = av.get('deliverable_moved', 0) + av.get('native_loose_moved', 0)
+        if moved:
+            lines.append(f"  🗂 AS BUILT 版本: 收旧版 {moved} → Superseded/")
+        # Standing manual-review checklist: version/membership decisions the
+        # engine deferred to human. Rendered from the structured flags via the
+        # playbook so each carries a fix; reappears every run until resolved.
+        try:
+            import qa_faults
+            vfaults = qa_faults.faults_from_version_flags(av)
+        except Exception:
+            vfaults = []
+        if vfaults:
+            lines.append(f"  ⚠️ 版本/归属需人工 ({len(vfaults)}) — 默认保留不动:")
+            for f in vfaults[:12]:
+                lines.append(f"     • {f['message']}")
+
     return "\n".join(lines)
 
 
@@ -14117,6 +14135,27 @@ class PipelineOrchestrator:
                 _flags = (hyg['flagged']
                           + [{'doc_id': a['doc_id'], 'kind': a['kind'],
                               'path': a['path']} for a in loose_flag])
+                # Persist the DEFERRED version/membership decisions as structured
+                # flags on the result so the bot renders them in the standing
+                # fault checklist (qa_faults.faults_from_version_flags) EVERY run
+                # until a human resolves them — not a one-shot console print (the
+                # LMS-15-flags-lost-for-a-week hole). Data only; nothing is moved.
+                results['asbuilt_version']['flags'] = {
+                    'crosstitle': [
+                        {'doc_id': f['doc_id'],
+                         'titles': ", ".join(
+                             f"{v['title']}({'/'.join(v['revs'])})"
+                             for v in f['variants'])}
+                        for f in multi],
+                    'ties': [
+                        {'doc_id': t.get('doc_id'), 'rev': t.get('rev'),
+                         'name': t.get('name')}
+                        for t in sup['flagged'] if 'variants' not in t],
+                    'membership': [
+                        {'kind': fl['kind'], 'name': Path(fl['path']).name,
+                         'doc_id': fl.get('doc_id')}
+                        for fl in _flags],
+                }
                 if _flags:
                     print(f"    ⚠ 交付物/Native 需人工确认 ({len(_flags)}) — 默认保留不动:")
                     for fl in _flags[:15]:

@@ -95,3 +95,34 @@ def faults_from_result(result: dict) -> list:
     faults.sort(key=lambda f: (_SEV_ORDER.get(f["severity"], 9),
                                f["page"] if f["page"] is not None else 0))
     return faults
+
+
+def faults_from_version_flags(av: dict) -> list:
+    """Structured faults from the AS BUILT version-management flag block
+    (results['asbuilt_version']['flags']) — the folder-level analogue of
+    faults_from_result. Turns the version/membership decisions the engine
+    DEFERRED to human (same-number-multi-title, same-mtime tie, non-drawing
+    stray) into standing playbook faults so they persist in the bot checklist
+    EVERY run until a human resolves them — not a one-shot console print (the
+    LMS-15-flags-lost-for-a-week hole). Pure; reads engine output only, never
+    moves a file or touches PASS/FAIL. Match strings must stay in sync with
+    qa_playbook.json (同号多图 / 同时间戳 / 交付物归属)."""
+    flags = (av or {}).get("flags") or {}
+    faults = []
+    for c in flags.get("crosstitle", []):
+        w = (f"[需人工检查] 同号多图 {c.get('doc_id', '?')}: {c.get('titles', '')}"
+             " — 同一图号下多个图名，判定合并（同义漂移）或拆分（真两张图）")
+        faults.append(build_fault(w, doc_id=c.get("doc_id")))
+    for t in flags.get("ties", []):
+        rev = t.get("rev")
+        rev_s = f" Rev{rev:g}" if isinstance(rev, (int, float)) else ""
+        w = (f"[需人工检查] 同时间戳 {t.get('doc_id', '?')}{rev_s}: "
+             f"{t.get('name', '')} — 与保留文件同 mtime，无法判新旧")
+        faults.append(build_fault(w, doc_id=t.get("doc_id")))
+    for m in flags.get("membership", []):
+        w = (f"[需人工检查] 交付物归属 [{m.get('kind', '?')}] {m.get('name', '')}"
+             " — 不属本交付夹（仅当前版图纸 PDF），核对客户清单后归位")
+        faults.append(build_fault(w, doc_id=m.get("doc_id")))
+    faults.sort(key=lambda f: (_SEV_ORDER.get(f["severity"], 9),
+                               f["page"] if f["page"] is not None else 0))
+    return faults
