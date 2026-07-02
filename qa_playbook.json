@@ -190,14 +190,14 @@
       ]
     },
     "VERSION_CROSSTITLE": {
-      "match": ["同号多图"],
+      "match": ["同号多图", "同号异图"],
       "severity": "挡出图",
-      "title": "同一图号挂多个图名 — 需人工判定合并 or 拆分（机器只探测不分类）",
-      "auto_tried": ["按 doc-id+图名签名分组：同签名内自动收旧版，跨签名一律不动、挂起转人工"],
+      "title": "同号异图 — 图名对不上 DLV 规范名（同义漂移已自动规范化，此为真异常）",
+      "auto_tried": ["用 doc-id 查 DLV col C 规范名；同义/缩写漂移（SLD→Single Line Diagram）应已自动规范化+版本化，本项是对不上 register 的残留"],
       "fix_checklist": [
-        "对比两图名是否同义/缩写漂移（如 SLD ≡ Single Line Diagram）→ 同一张图：旧版 → Superseded/，图名统一",
-        "若确为同号两张不同图（如 50023-CA-001 的 Trench Alignment ≠ Cable Route GA）→ 拆成两个 doc-id，各自独立版本管理",
-        "裁定并/拆后此项自动消失；未裁定则每次跑常驻在清单（不会自愈）"
+        "先确认此图名确非 DLV 规范名的同义/缩写（若是→补 acronym 规则让其自动规范化，不必人工）",
+        "若确为同号两张不同图（如 50023-CA-001 的 Trench Alignment ≠ Cable Route GA）→ 拆成两个 doc-id 各自独立版本管理，或给 register 补该图正式行",
+        "拆/补后此项自动消失；未处理则每次跑常驻在清单（不会自愈）"
       ]
     },
     "VERSION_SAME_MTIME": {
