@@ -2192,6 +2192,7 @@ class VersionManager:
         if not multi_version_groups and not ifc_files:
             if show_details:
                 print(f"    [v] 没有重复版本文件")
+            self._preview_name_format(target_dir, set(), show_details)
             return stats
         if multi_version_groups and show_details:
             print(f"    发现 {len(multi_version_groups)} 组多版本文件:")
@@ -2215,7 +2216,37 @@ class VersionManager:
                     print(f"        [->SS] {src.name} ({reason})")
             moved_ifc = self.move_files(ifc_files, ss_folder)
             stats["moved"] += moved_ifc
+        moved_srcs = {str(s) for s, _d, _r in files_to_move} | {str(s) for s, _d, _r in ifc_files}
+        self._preview_name_format(target_dir, moved_srcs, show_details)
         return stats
+
+    def _preview_name_format(self, target_dir: Path, moved_srcs: set, show_details: bool):
+        """DRY-RUN PREVIEW of identity-preserving filename-format fixes (case/space/
+        underscore/Rev only — register_membership.normalize_filename_format) for the
+        files that STAY. Preview ONLY: renaming client deliverables needs an explicit
+        per-project go, so nothing is executed here. Description→register-canonical
+        (SLD→Single Line Diagram) is intentionally NOT done — that is reconcile-gated
+        and higher-risk (a stray would be misnamed)."""
+        try:
+            import register_membership as _rm
+        except Exception:
+            return
+        props = []
+        try:
+            for f in target_dir.glob('*.pdf'):
+                if not f.is_file() or str(f) in moved_srcs:
+                    continue
+                new = _rm.normalize_filename_format(f.name)
+                if new != f.name:
+                    props.append((f.name, new))
+        except (OSError, PermissionError):
+            return
+        if props and show_details:
+            print(f"    [格式预览] {len(props)} 个文件名可统一格式 (仅预览, 批准后才执行):")
+            for old, new in props[:8]:
+                print(f"        {old}  ->  {new}")
+            if len(props) > 8:
+                print(f"        … 另 {len(props) - 8} 个")
 
     def process_project(self, project_path: Path, show_details: bool = True) -> Dict[str, int]:
         project_stats = {"scanned": 0, "groups": 0, "moved": 0}
