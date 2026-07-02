@@ -122,6 +122,58 @@ def match_register_title(file_title: str, reg_titles: List[str]) -> Optional[str
                  if title_reconciles(file_title, t)), None)
 
 
+# ── doc-id extraction (mirrors ifr_automation_v10._RE_DOC_ID_* / _extract_doc_id
+#    _standalone; the engine passes its own richer extractor, v5 uses this) ────
+_RE_DOC_ID_GG = re.compile(r'(GG\d{2}-[A-Z]-[A-Z]{3}-\d{3})', re.IGNORECASE)
+_RE_DOC_ID_LMS = re.compile(r'(\d{5}-[A-Z]{2}-\d{3})', re.IGNORECASE)
+_RE_DOC_ID_TSF = re.compile(r'(TSF-[A-Z]{2}-[A-Z]{3}-\w+-\d{2})', re.IGNORECASE)
+_RE_DOC_ID_GENERIC = re.compile(r'([A-Z0-9][\w]+-[A-Z]+-[A-Z]*-?\d{3})', re.IGNORECASE)
+_DOC_ID_PATS = (_RE_DOC_ID_GG, _RE_DOC_ID_LMS, _RE_DOC_ID_TSF, _RE_DOC_ID_GENERIC)
+
+
+def extract_doc_id(filename: str) -> Optional[str]:
+    """Structured doc-id from a filename, or None. Match-at-start first (standard
+    naming), then search-anywhere (inaccurate names — FILE-NO rule). NO greedy
+    'everything before _Rev' fallback: a None answer means 'no clean doc-id', so
+    the caller groups by base_name as today (safe)."""
+    stem = Path(filename).stem
+    for pat in _DOC_ID_PATS:
+        m = pat.match(stem)
+        if m:
+            return m.group(1)
+    for pat in _DOC_ID_PATS:
+        m = pat.search(stem)
+        if m:
+            return m.group(1)
+    return None
+
+
+def canonical_group_key(base_name: str, filename: str,
+                        reg_titles: Optional[List[str]],
+                        doc_id: Optional[str] = None):
+    """Register-canonical grouping key for a versioning/collision gate. Returns
+    (key, matched_title, is_stray):
+      • no register for this doc-id (reg_titles falsy) → (base_name, None, False)
+        — BYTE-IDENTICAL to today's base_name grouping (zero-regression default);
+      • file title reconciles to a register title → ('<DOCID>::<TITLE><ext>',
+        title, False) — so a re-worded revision (SLD vs Single Line Diagram) of
+        the same drawing shares a key and the older one supersedes (fixes the PDF/
+        Native UNDER-merge);
+      • register present but NO title matches → (base_name, None, True) — STRAY:
+        keep the file in its own group (never merged/moved), surface the flag.
+    Two different register titles under one doc-id (CA-001 Trench vs Cable Route)
+    yield two different keys → they stay split (the collision is preserved)."""
+    if not reg_titles:
+        return base_name, None, False
+    ext = Path(filename).suffix
+    ftext = title_text(Path(filename).stem, doc_id)
+    matched = match_register_title(ftext, reg_titles)
+    if matched is None:
+        return base_name, None, True
+    did = (doc_id or '').upper()
+    return f"{did}::{norm_title(matched)}{ext}", matched, False
+
+
 # ── register loading (soft dep on the Doc-Control keystone parser) ───────────
 _REGISTER_CACHE: Dict[str, Dict[str, List[str]]] = {}
 _AB_DIR_NAMES = ('5. As Built', '6.AS Built', '6. As Built', '5.As Built')

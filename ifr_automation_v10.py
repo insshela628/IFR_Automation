@@ -1995,6 +1995,24 @@ class VersionManager:
             pass
         return target_dir / 'SS'
 
+    def _reg_titles_for(self, target_dir: Path) -> Dict[str, List[str]]:
+        """Client *Deliverables List* titles for register-canonical grouping — the
+        shared cross-track oracle (register_membership). SOFT dep: {} → grouping
+        stays byte-identical to base_name. Cached per target_dir; strays surfaced
+        via self._version_strays."""
+        cache = getattr(self, '_reg_titles_cache', None)
+        if cache is None:
+            cache = self._reg_titles_cache = {}
+            self._version_strays = []
+        k = str(target_dir)
+        if k not in cache:
+            try:
+                import register_membership as _rm
+                cache[k] = _rm.load_register_titles(target_dir)
+            except Exception:
+                cache[k] = {}
+        return cache[k]
+
     def scan_files_pdf(self, target_dir: Path) -> Dict[str, List[Tuple[Path, str, datetime]]]:
         if not target_dir.exists():
             return {}
@@ -2003,14 +2021,28 @@ class VersionManager:
             pdf_files = list(target_dir.glob("*.pdf"))
         except (OSError, PermissionError):
             return file_groups
+        reg = self._reg_titles_for(target_dir)
         for file_path in pdf_files:
             try:
                 if file_path.is_file():
                     base_name, version = self.extract_base_name_and_version(file_path.name)
+                    key = base_name
+                    if reg:   # register-canonical key: collapse re-worded revs of
+                        did = _extract_doc_id_standalone(file_path.name, allow_fallback=False)  # one drawing; keep different-title clashes split
+                        titles = reg.get((did or '').upper())
+                        if titles:
+                            try:
+                                import register_membership as _rm
+                                key, _m, stray = _rm.canonical_group_key(
+                                    base_name, file_path.name, titles, did)
+                                if stray:
+                                    self._version_strays.append((file_path.name, did))
+                            except Exception:
+                                key = base_name
                     pdf_long = to_long_path(file_path)
                     modified_time = datetime.fromtimestamp(pdf_long.stat().st_mtime)
                     version_str = version if version else "NO_VERSION"
-                    file_groups[base_name].append((file_path, version_str, modified_time))
+                    file_groups[key].append((file_path, version_str, modified_time))
             except (OSError, PermissionError):
                 continue
         return file_groups
@@ -2143,7 +2175,13 @@ class VersionManager:
                 print(f"    [!] 目录不存在，跳过")
             return stats
         ss_folder = self._find_ss_folder(target_dir)
+        self._version_strays = []
         file_groups = self.scan_files_pdf(target_dir)
+        if self._version_strays and show_details:
+            print(f"    [i] {len(self._version_strays)} 个文件对不上客户清单标题，"
+                  f"单独保留不合并 (可能编号有误): "
+                  f"{', '.join(n for n, _ in self._version_strays[:5])}"
+                  f"{' …' if len(self._version_strays) > 5 else ''}")
         total_files = sum(len(files) for files in file_groups.values())
         stats["scanned"] = total_files
         if show_details:
@@ -2389,6 +2427,45 @@ class NativeVersionManager:
             to_long_path(ss_path).mkdir(exist_ok=True)
         return ss_path
 
+    def _reg_titles_for(self, folder: Path) -> Dict[str, List[str]]:
+        """Client *Deliverables List* titles for register-canonical grouping — the
+        shared cross-track oracle (register_membership). SOFT dep: {} → grouping
+        stays byte-identical. Cached per project (walk-up finds ONE list)."""
+        cache = getattr(self, '_reg_titles_cache', None)
+        if cache is None:
+            cache = self._reg_titles_cache = {}
+        k = str(folder)
+        if k not in cache:
+            try:
+                import register_membership as _rm
+                cache[k] = _rm.load_register_titles(folder)
+            except Exception:
+                cache[k] = {}
+        return cache[k]
+
+    def _title_subkey(self, f: 'DwgFile', reg: Dict[str, List[str]]):
+        """Register-canonical title sub-key to SPLIT genuinely-different drawings
+        that share a doc-id folder (CA-001 = Trench Alignment + Cable Route GA), so
+        keeping 'newest per ext/doc-id' never supersedes a real second drawing.
+        Returns '' when no register (byte-identical grouping); a title token when
+        matched; ('STRAY', name) to isolate a title that matches no register name."""
+        if not reg:
+            return ''
+        try:
+            import register_membership as _rm
+            did = _rm.extract_doc_id(f.filename)
+            titles = reg.get((did or '').upper())
+            if not titles:
+                return ''
+            _k, matched, stray = _rm.canonical_group_key('', f.filename, titles, did)
+            if stray:
+                self._folder_strays.append(f.filename)
+                return ('STRAY', f.filename)
+            self._folder_titles.add(_rm.norm_title(matched))
+            return _rm.norm_title(matched)
+        except Exception:
+            return ''
+
     def scan_files(self, folder: Path) -> List[DwgFile]:
         files = []
         bak_map: Dict[str, Path] = {}
@@ -2436,24 +2513,32 @@ class NativeVersionManager:
         other_files = [f for f in files if f.rev_type == 'OTHER']
         ss_folder = self._find_or_create_ss_folder(folder)
 
-        # v10: IFR — 按扩展名分组，每组保留最新版 (版本号优先, mtime 仅平手; _rev_sort_key)
+        # Register-canonical title split (soft): a doc-id folder holding TWO real
+        # drawings (CA-001 = Trench Alignment + Cable Route GA) must NOT collapse to
+        # one "newest". Sub-key '' when no register → byte-identical grouping.
+        reg = self._reg_titles_for(folder)
+        self._folder_strays = []
+        self._folder_titles = set()
+        _sub = lambda f: self._title_subkey(f, reg)
+
+        # v10: IFR — 按 (扩展名 × 图名) 分组，每组保留最新版 (版本号优先, mtime 仅平手)
         if ifr_files:
-            ifr_by_ext: dict[str, list] = {}
+            ifr_by_ext: dict[tuple, list] = {}
             for f in ifr_files:
-                ifr_by_ext.setdefault(f.path.suffix.lower(), []).append(f)
-            for ext, group in ifr_by_ext.items():
+                ifr_by_ext.setdefault((f.path.suffix.lower(), _sub(f)), []).append(f)
+            for _k, group in ifr_by_ext.items():
                 group_sorted = sorted(group, key=_rev_sort_key, reverse=True)
                 result.kept_ifr_all.append(group_sorted[0])
                 for old in group_sorted[1:]:
                     self._plan_move(result, old, ss_folder, "older IFR revision")
             result.kept_ifr = max(result.kept_ifr_all, key=_rev_sort_key)
 
-        # v10: IFC — 按扩展名分组，每组保留最新版 (版本号优先, mtime 仅平手; _rev_sort_key)
+        # v10: IFC — 按 (扩展名 × 图名) 分组，每组保留最新版 (版本号优先, mtime 仅平手)
         if ifc_files:
-            ifc_by_ext: dict[str, list] = {}
+            ifc_by_ext: dict[tuple, list] = {}
             for f in ifc_files:
-                ifc_by_ext.setdefault(f.path.suffix.lower(), []).append(f)
-            for ext, group in ifc_by_ext.items():
+                ifc_by_ext.setdefault((f.path.suffix.lower(), _sub(f)), []).append(f)
+            for _k, group in ifc_by_ext.items():
                 group_sorted = sorted(group, key=_rev_sort_key, reverse=True)
                 result.kept_ifc_all.append(group_sorted[0])
                 for old in group_sorted[1:]:
@@ -2474,14 +2559,16 @@ class NativeVersionManager:
         dwg_files = [f for f in files if f.path.suffix.lower() == '.dwg']
         if dwg_files:
             _did_pat = re.compile(r'^([A-Z0-9][\w-]+-\d{3})', re.IGNORECASE)
-            dwg_by_docid: dict[str, list] = {}
+            dwg_by_docid: dict[tuple, list] = {}
             for f in dwg_files:
                 m = _did_pat.match(f.filename)
                 did = m.group(1) if m else '__no_docid__'
-                dwg_by_docid.setdefault(did, []).append(f)
+                # split by title too, so a real 2nd drawing under one doc-id keeps
+                # its own newest DWG protected (mirror of the ext-stage split)
+                dwg_by_docid.setdefault((did, _sub(f)), []).append(f)
             protected_paths: set[str] = set()
             movable_paths: set[str] = set()
-            for did, group in dwg_by_docid.items():
+            for _grp_key, group in dwg_by_docid.items():
                 ifr_dwgs = [f for f in group if f.rev_type == 'IFR']
                 ifc_dwgs = [f for f in group if f.rev_type == 'IFC']
                 if ifc_dwgs:
@@ -2513,12 +2600,20 @@ class NativeVersionManager:
                         self._plan_move(result, f, ss_folder,
                                         "IFR DWG superseded by IFC DWG")
 
-        # v10: 对所有保留的文件执行重命名
-        if doc_id and description:
+        # v10: 对所有保留的文件执行重命名 — 但当本文件夹按客户清单确认含 ≥2 张不同图
+        # 时跳过：标准名只用文件夹描述，会把两张图重命名成同名互相覆盖 (数据丢失)。
+        multi_title = len(self._folder_titles) > 1
+        if doc_id and description and not multi_title:
             for kept in result.kept_ifr_all:
                 self._plan_rename(result, kept, doc_id, description)
             for kept in result.kept_ifc_all:
                 self._plan_rename(result, kept, doc_id, description)
+        if multi_title:
+            print(f"    [i] {folder.name}: 客户清单确认含 {len(self._folder_titles)} 张不同图，"
+                  f"各自独立保留最新版、跳过按文件夹名的标准化重命名 (避免同名覆盖)")
+        if self._folder_strays:
+            print(f"    [i] {folder.name}: {len(self._folder_strays)} 个文件对不上客户清单标题，"
+                  f"单独保留不合并 (可能编号有误): {', '.join(self._folder_strays[:5])}")
         return result
 
     def _plan_move(self, result, dwg, ss_folder, reason):

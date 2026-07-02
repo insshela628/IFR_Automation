@@ -71,6 +71,42 @@ check("description words untouched (no canonicalization)",
       R.normalize_filename_format("50023-EL-001 Rev 1 SLD_AS BUILT.pdf"),
       "50023-EL-001 Rev 1 SLD_AS BUILT.pdf")
 
+# ── doc-id extraction ────────────────────────────────────────────────────────
+check("extract LMS doc-id", R.extract_doc_id("50023-EL-001 REV 1 SLD_AS BUILT.pdf"),
+      "50023-EL-001")
+check("extract GG doc-id", R.extract_doc_id("GG31-C-PLN-006_RevA.dwg"),
+      "GG31-C-PLN-006")
+check("extract doc-id anywhere (inaccurate name)",
+      R.extract_doc_id("Trench Alignment 50023-CA-001 final.pdf"), "50023-CA-001")
+check("no doc-id → None (falls back to base_name grouping)",
+      R.extract_doc_id("random site plan.pdf"), None)
+
+# ── canonical_group_key: the collision-gate key transform ────────────────────
+# no register → byte-identical base_name, not stray.
+check("no register → base_name passthrough",
+      R.canonical_group_key("base.pdf", "50023-EL-001 SLD.pdf", None, "50023-EL-001"),
+      ("base.pdf", None, False))
+
+# SLD and Single Line Diagram → SAME canonical key (merge → old superseded).
+reg1 = ["Single Line Diagram"]
+k_sld = R.canonical_group_key("50023-EL-001 SLD.pdf",
+                              "50023-EL-001 REV 0 SLD_AS BUILT.pdf", reg1, "50023-EL-001")
+k_sln = R.canonical_group_key("50023-EL-001 Single Line Diagram.pdf",
+                              "50023-EL-001 REV 1 Single Line Diagram.pdf", reg1, "50023-EL-001")
+check("SLD & Single Line Diagram share a canonical key", k_sld[0], k_sln[0])
+check("canonical key is DOCID::TITLE", k_sld[0], "50023-EL-001::SINGLELINEDIAGRAM.pdf")
+
+# CA-001 Trench vs Cable Route → DIFFERENT keys (stay split).
+reg2 = ["Trench Alignment Layout Plan", "Cable Route GA"]
+k_tr = R.canonical_group_key("x.pdf", "50023-CA-001 REV 1 Trench Alignment.pdf", reg2, "50023-CA-001")
+k_cr = R.canonical_group_key("y.pdf", "50023-CA-001 REV 1 Cable Route GA.pdf", reg2, "50023-CA-001")
+check("Trench and Cable Route get DIFFERENT keys", k_tr[0] != k_cr[0], True)
+check("neither Trench nor Cable is stray", (k_tr[2], k_cr[2]), (False, False))
+
+# stray: register present, title matches nothing → base_name key + stray flag.
+k_stray = R.canonical_group_key("z.pdf", "50023-CA-001 REV 1 Zeta Section.pdf", reg2, "50023-CA-001")
+check("stray keeps base_name key + flags", (k_stray[0], k_stray[2]), ("z.pdf", True))
+
 print()
 print("ALL PASS" if all(results) else "SOME FAILED")
 sys.exit(0 if all(results) else 1)
