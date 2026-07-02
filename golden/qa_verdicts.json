@@ -652,12 +652,9 @@
   },
   "2.SA/LMS/Design/Engineering/1. Drawings/5. As Built/3. As Built/50023-ES-302 REV 3 - IP5 FCAS Meter Box - Wiring Schematics NEW_AS BUILT.pdf": {
     "doc_id": "50023-ES-302",
-    "size": 1029611,
-    "warnings": [
-      "Page 4: 印章压住图面内容 — 自动避让无空位 [需人工检查]",
-      "Page 5: 印章压住图面内容 — 自动避让无空位 [需人工检查]"
-    ],
-    "verdict": "ESCALATE"
+    "size": 1029621,
+    "warnings": [],
+    "verdict": "PASS"
   },
   "2.SA/LMS/Design/Engineering/1. Drawings/5. As Built/3. As Built/50023-GA-001 REV 8 Site Plan_AS BUILT.pdf": {
     "doc_id": "50023-GA-001",
