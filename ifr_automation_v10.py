@@ -8162,6 +8162,65 @@ class PanelIFCManager(IFCStampMixin):
                     group_result['pdf_result'] = pdf_result
                     if pdf_result['success']:
                         print(f"    PDF: {Path(pdf_result['pdf_path']).name}")
+                        # Stamp-overlap auto-fix for the multi-page IFC group — same
+                        # milestone-agnostic detector + two-corner mirror relocation
+                        # used by AS BUILT / single-IFC. The geometry toolkit lives on
+                        # AsBuiltManager (delegate via a bare instance); republish via
+                        # THIS panel's own _publish_group_pdf. Defensive + no-op when
+                        # every page is clean → zero regression on clean conversions.
+                        try:
+                            _reloc = AsBuiltManager.__new__(AsBuiltManager)
+                            _acad = self._get_acad()
+                            _pdfp = Path(pdf_result['pdf_path'])
+                            for _it in range(5):
+                                _ov = _reloc._scan_pdf_stamp_overlaps(_pdfp)
+                                if not _ov:
+                                    break
+                                _moved = False
+                                for _pi, _info in _ov.items():
+                                    if _pi >= len(ok_pages):
+                                        continue
+                                    _dp = ifc_folder / ok_pages[_pi]['path'].name
+                                    _op, _jc = _reloc._shortpath_open_target(_dp)
+                                    _d = None
+                                    try:
+                                        _d = _reloc._com_retry(
+                                            lambda p=_op: _acad.Documents.Open(p))
+                                        for _w in range(20):
+                                            try:
+                                                _ = _d.Layouts.Count; break
+                                            except Exception:
+                                                time.sleep(1)
+                                        time.sleep(2)
+                                        _lo = _reloc._publish_layout_order(_d)
+                                        _ln = _lo[0] if _lo else None
+                                        if _ln and _reloc._move_stamp_group_in_layout(
+                                                _d, _ln, _info):
+                                            _moved = True
+                                            try:
+                                                _reloc._com_retry(lambda: _d.Save())
+                                                time.sleep(2)
+                                            except Exception:
+                                                pass
+                                    finally:
+                                        if _d is not None:
+                                            try:
+                                                _d.Close(False)
+                                            except Exception:
+                                                pass
+                                        _jc()
+                                if not _moved:
+                                    break
+                                _rp = self._publish_group_pdf(
+                                    doc_no, ifc_rev, ifc_folder, ok_pages)
+                                if not _rp.get('success'):
+                                    break
+                                pdf_result = _rp
+                                group_result['pdf_result'] = _rp
+                                _pdfp = Path(_rp['pdf_path'])
+                                print(f"    印章: 多页 IFC 检测到印章压图 → 已避让并重出 PDF")
+                        except Exception as _e_pg:
+                            print(f"    印章: 栅格避让跳过 ({_e_pg})")
                     else:
                         print(f"    PDF 失败: {pdf_result['error']}")
                         group_result['errors'].append(pdf_result['error'])
