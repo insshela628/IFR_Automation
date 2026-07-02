@@ -445,6 +445,8 @@ python run_ab_batch_safe.py <project> [docid-or-srcdir-filter] [--timeout N]
   仍不过则升级。另外 `_run_post_batch_qa` 扫描**所有**输出 PDF。
 - 运行器汇总里：`PASS`（通过）、`WARN`（成功但 QA 标记了问题——看该行）、`FAIL`。
 - QA 判据定义在 CLAUDE.md → "AS BUILT Post-Conversion QA"，不要重新实现。
+- **印章压图重叠触发必须含线条(linework)**，不止文字/表格格——接线图/单线图几乎全是裸线、无表格格，只查文字/格会漏判印章压线（LMS EL-002）。
+- **LMS 专用路径 `asbuilt_revclean_lms.py` 现已补上印章压图 QA 门**：`publish_pdf` 后调 `qa_stamp_overlap()`，复用主引擎 detector（`AsBuiltManager.__new__` 绕开 COM `__init__`），只读 FLAG，命中即打印 `[需人工检查] … 印章压图面内容` 并把该次 run 标为不干净，绝不改动 PDF。
 - **只做 QA / 验证的 agent 必须只读**：用 fitz 打开 PDF 即可，**绝不驱动 AutoCAD**
   （不转换、不 SaveAs、不碰 COM）—— 否则可能引发第二次卡死 + 孤儿 acad.exe。
 

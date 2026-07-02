@@ -611,6 +611,69 @@ def publish_pdf(doc, src: Path, pdf_path: Path):
     return pdf_path.exists()
 
 
+# ----------------------------------------------------------------------------- stamp-overlap QA
+def qa_stamp_overlap(pdf_path: Path):
+    """Stamp-overlap QA gate for the LMS bespoke path (read-only — FLAG, never fix).
+
+    The main engine (ifr_automation_v10.py) already runs a stamp-vs-content
+    overlap check on ALL its native->PDF paths; publish_pdf() in THIS script did
+    not, so the LMS drawings routed through here shipped with ZERO stamp-overlap
+    QA. This closes that gap by REUSING the engine's geometric detector — same
+    three signals (foreign word-in-box, foreign table cell, foreign LINEWORK
+    crossing a box), colour-/project-agnostic — so wiring schematics can't
+    silently false-pass.
+
+    We import AsBuiltManager and bypass its COM-connecting __init__ via __new__:
+    the detector methods use only class-level constants, not the live AutoCAD
+    session, and importing the engine merely pulls in win32com.client as a
+    library (it does NOT Dispatch/connect to AutoCAD at import time).
+
+    Returns a list of '[需人工检查] ...' warning strings (empty = clean). The PDF
+    is opened read-only and NEVER modified.
+    """
+    warnings = []
+    try:
+        import fitz
+    except Exception:
+        print("  stamp-overlap QA: PyMuPDF not available — SKIPPED (unverified)")
+        return warnings
+    try:
+        from ifr_automation_v10 import AsBuiltManager
+        det = AsBuiltManager.__new__(AsBuiltManager)   # no __init__ -> no AutoCAD COM
+    except Exception as e:
+        print(f"  stamp-overlap QA: detector import failed ({repr(e)[:60]}) — SKIPPED")
+        return warnings
+    try:
+        doc = fitz.open(str(pdf_path))
+    except Exception as e:
+        print(f"  stamp-overlap QA: cannot open PDF ({repr(e)[:50]}) — SKIPPED")
+        return warnings
+    try:
+        for pi in range(doc.page_count):
+            page = doc[pi]
+            try:
+                boxes = det._detect_stamp_boxes(page)
+                if boxes and det._stamp_overlaps_content(page, boxes):
+                    w = f"[需人工检查] {pdf_path.name} page {pi + 1}: 印章压图面内容"
+                    print("  " + w)
+                    warnings.append(w)
+                # title-block overlap: the stamp's home sits ABOVE the TB strip;
+                # a stamp landing INSIDE the TB band = dropped onto the title block
+                # (user: 不能挡住 titleblock). Same geometric detector the engine
+                # QA gate uses — colour-/project-agnostic, read-only.
+                if boxes and det._rect_hits_tb(boxes, det._detect_tb_box(page)):
+                    w = f"[需人工检查] {pdf_path.name} page {pi + 1}: 印章压住标题栏 (title block)"
+                    print("  " + w)
+                    warnings.append(w)
+            except Exception as e:
+                print(f"  stamp-overlap QA: page {pi + 1} scan error ({repr(e)[:50]})")
+    finally:
+        doc.close()
+    if not warnings:
+        print("  stamp-overlap QA: no stamp/content overlap — OK")
+    return warnings
+
+
 # ----------------------------------------------------------------------------- run one target
 def run(key, dry_run=True, do_pdf=True, acad=None):
     cfg = TARGETS[key]
@@ -625,6 +688,7 @@ def run(key, dry_run=True, do_pdf=True, acad=None):
         acad = get_acad()
     doc = find_open_doc(acad, src)
     print(f"  doc: {doc.Name}")
+    needs_review = False
 
     # ---- rev-clean the title block ----
     apply_titleblock_edit(doc, cfg, dry_run)
@@ -664,6 +728,11 @@ def run(key, dry_run=True, do_pdf=True, acad=None):
         ok = publish_pdf(doc, src, pdf_path)
         print(f"  PDF: {'OK' if ok else 'FAILED'} -> {pdf_path.name}")
         if ok and pdf_path.exists():
+            # ---- stamp-overlap QA gate (engine detector; read-only, FLAG only) ----
+            if qa_stamp_overlap(pdf_path):
+                needs_review = True
+                print("  !! STAMP-OVERLAP QA FAILED — deliverable FLAGGED "
+                      "[需人工检查]（印章压图面内容；PDF 未改动，人工复核后放行）")
             try:
                 CLIENT_PDF_DIR.mkdir(parents=True, exist_ok=True)
                 client_pdf = CLIENT_PDF_DIR / cfg.get("client_name", pdf_path.name)
@@ -679,7 +748,9 @@ def run(key, dry_run=True, do_pdf=True, acad=None):
         print(f"  archive: {note} -> {dest}")
     else:
         print(f"  archive skipped (doc still open); native left at {src}")
-    return True
+    if needs_review:
+        print(f"  >>> RESULT {key}: 完成但 [需人工检查] — 印章压图面内容，人工复核后放行")
+    return not needs_review
 
 
 def main():

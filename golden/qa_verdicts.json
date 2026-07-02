@@ -1,19 +1,19 @@
 {
   "NSW153-C-PLN-002 REV 1 Site Coordinates design Civil Scope_AS BUILT.pdf": {
     "doc_id": "NSW153-C-PLN-002",
-    "size": 685659,
+    "size": 685626,
     "warnings": [],
     "verdict": "PASS"
   },
   "NSW153-C-PLN-002 REV 1 Site Coordinates design Equipment Scope_AS BUILT.pdf": {
     "doc_id": "NSW153-C-PLN-002",
-    "size": 625735,
+    "size": 625718,
     "warnings": [],
     "verdict": "PASS"
   },
-  "NSW153-C-PLN-003 REV 1 Fence Gate Layout Plan_AS BUILT.pdf": {
+  "NSW153-C-PLN-003_REV 1 Fence & Gate Layout Plan_AS BUILT.pdf": {
     "doc_id": "NSW153-C-PLN-003",
-    "size": 440650,
+    "size": 443287,
     "warnings": [],
     "verdict": "PASS"
   },
@@ -79,51 +79,49 @@
   },
   "NSW153-E-BLD-001 REV 1 Auxiliary Cable Block Diagram_AS BUILT.pdf": {
     "doc_id": "NSW153-E-BLD-001",
-    "size": 125640,
-    "warnings": [
-      "Page 1: 印章压住图面内容 — 自动避让无空位 [需人工检查]"
-    ],
-    "verdict": "ESCALATE"
-  },
-  "NSW153-E-BLD-002 REV 1 Earthing Block Diagram_AS BUILT.pdf": {
-    "doc_id": "NSW153-E-BLD-002",
-    "size": 418614,
+    "size": 126387,
     "warnings": [],
     "verdict": "PASS"
   },
-  "NSW153-E-BLD-003 REV 1 Communication Block Diagram_AS BUILT.pdf": {
+  "NSW153-E-BLD-002 REV1 Earthing Block Diagram_AS BUILT.pdf": {
+    "doc_id": "NSW153-E-BLD-002",
+    "size": 422390,
+    "warnings": [],
+    "verdict": "PASS"
+  },
+  "NSW153-E-BLD-003 REV1 Communication Block Diagram_AS BUILT.pdf": {
     "doc_id": "NSW153-E-BLD-003",
-    "size": 330104,
+    "size": 280486,
     "warnings": [],
     "verdict": "PASS"
   },
   "NSW153-E-CFG-001 REV 1 String Configuration_AS BUILT.pdf": {
     "doc_id": "NSW153-E-CFG-001",
-    "size": 345508,
+    "size": 345410,
     "warnings": [],
     "verdict": "PASS"
   },
   "NSW153-E-CFG-002 REV 1 DC Combiner Box Configuration_AS BUILT.pdf": {
     "doc_id": "NSW153-E-CFG-002",
-    "size": 291092,
+    "size": 293092,
     "warnings": [],
     "verdict": "PASS"
   },
-  "NSW153-E-PLN-001 REV 1 DC Cable Route Layout Plan_AS BUILT.pdf": {
+  "NSW153-E-PLN-001 REV1 DC Cable Route Layout Plan_AS BUILT.pdf": {
     "doc_id": "NSW153-E-PLN-001",
-    "size": 2490086,
+    "size": 2541070,
     "warnings": [],
     "verdict": "PASS"
   },
-  "NSW153-E-PLN-002 REV 1 Earth Cable Route Layout Plan_AS BUILT.pdf": {
+  "NSW153-E-PLN-002 REV1 Earth Cable Route Layout Plan_AS BUILT.pdf": {
     "doc_id": "NSW153-E-PLN-002",
-    "size": 1300364,
+    "size": 1330504,
     "warnings": [],
     "verdict": "PASS"
   },
   "NSW153-E-PLN-003 REV 1 Communication Cable Route Layout Plan_AS BUILT.pdf": {
     "doc_id": "NSW153-E-PLN-003",
-    "size": 1570652,
+    "size": 1564542,
     "warnings": [],
     "verdict": "PASS"
   },
@@ -136,6 +134,12 @@
   "NSW153-E-PLN-008 REV 1 CCTV Layout Plan_AS BUILT.pdf": {
     "doc_id": "NSW153-E-PLN-008",
     "size": 906329,
+    "warnings": [],
+    "verdict": "PASS"
+  },
+  "NSW153-E-SLD-001 REV1 Single Line Diagram_AS BUILT.pdf": {
+    "doc_id": "NSW153-E-SLD-001",
+    "size": 310770,
     "warnings": [],
     "verdict": "PASS"
   },
