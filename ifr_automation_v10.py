@@ -9876,12 +9876,11 @@ def _ab_rev_from_name(stem: str) -> Optional[float]:
     return float(f"{m.group(1)}.{m.group(2)}") if m.group(2) else float(m.group(1))
 
 
-def _ab_title_signature(stem: str, doc_id: Optional[str]) -> str:
-    """Normalized drawing-title signature: strip doc-id + rev + AB/IFC/exp/sheet
-    markers + all punctuation, uppercase. Two files sharing a signature are the
-    SAME drawing/document at different revisions; differing signatures are kept
-    apart (so two different drawings wrongly sharing a doc-id are never merged).
-    """
+def _ab_title_text(stem: str, doc_id: Optional[str]) -> str:
+    """The human drawing-title portion of a filename stem — doc-id + rev +
+    AB/IFC/exp/sheet markers removed, separators normalized to single spaces, but
+    WORD BOUNDARIES KEPT (unlike _ab_title_signature, which collapses them). Used
+    for token-level reconciliation against a register title."""
     sig = stem
     if doc_id:
         sig = re.sub(re.escape(doc_id), ' ', sig, flags=re.IGNORECASE)
@@ -9889,7 +9888,79 @@ def _ab_title_signature(stem: str, doc_id: Optional[str]) -> str:
     while prev != sig:                       # collapse adjacent markers
         prev = sig
         sig = _RE_AB_SIG_STRIP.sub(' ', sig)
-    return re.sub(r'[^A-Za-z0-9]', '', sig).upper()
+    return re.sub(r'\s+', ' ', re.sub(r'[_\-]', ' ', sig)).strip()
+
+
+def _ab_title_signature(stem: str, doc_id: Optional[str]) -> str:
+    """Normalized drawing-title signature: strip doc-id + rev + AB/IFC/exp/sheet
+    markers + all punctuation, uppercase. Two files sharing a signature are the
+    SAME drawing/document at different revisions; differing signatures are kept
+    apart (so two different drawings wrongly sharing a doc-id are never merged).
+    """
+    return re.sub(r'[^A-Za-z0-9]', '', _ab_title_text(stem, doc_id)).upper()
+
+
+# Words that carry no drawing-identity (mirrors the Doc-Control keystone
+# _TITLE_STOP so the two sides tokenize a title the same way). A title's
+# IDENTITY tokens are the len≥3 words left after removing these.
+_AB_TITLE_STOP = frozenset({
+    "the", "and", "for", "plan", "layout", "design", "rev", "as", "built", "ab",
+    "ifc", "diagram", "box", "general", "arrangement", "power", "station",
+    "nawma", "bess", "new", "existing", "drawing", "sheet", "details", "detail"})
+
+
+def _ab_title_tokens(s: Optional[str]) -> frozenset:
+    return frozenset(t for t in re.findall(r"[a-z0-9]+", (s or "").lower())
+                     if len(t) >= 3 and t not in _AB_TITLE_STOP)
+
+
+def _ab_norm_title(s: Optional[str]) -> str:
+    """Punctuation/space-insensitive, upper-cased title key (matches the shape a
+    file's _ab_title_signature already has, so the two are directly comparable)."""
+    return re.sub(r'[^A-Za-z0-9]', '', s or '').upper()
+
+
+def _ab_initials(s: Optional[str]) -> str:
+    """First letter of each word → acronym key (e.g. 'Single Line Diagram'→'SLD')."""
+    return ''.join(w[0] for w in re.findall(r'[A-Za-z0-9]+', s or '')).upper()
+
+
+def _ab_title_reconciles(file_title: str, reg_title: str) -> bool:
+    """True iff a file's title denotes the SAME drawing as a register (Deliverables
+    List) title. `file_title` may be the spaced _ab_title_text OR a collapsed
+    signature. Same-drawing is decided (all auto-resolved, NO human step) by ANY of:
+      • fuzzy ≥ 0.85 on the normalized text (case/space/underscore drift), OR
+      • one is the ACRONYM of the other (SLD ≡ Single Line Diagram — some
+        engineers just save the file under the abbreviation), OR
+      • identity-token containment / overlap — the file's significant words are a
+        subset of the register title's (or vice-versa), or Jaccard ≥ 0.6. Real
+        registers are wordier than filenames ('Trench Alignment' vs 'Trench
+        Alignment Layout Plan'), so a pure-fuzzy test under-matches.
+    A genuinely different drawing sharing a doc-id (50023-CA-001 Trench Alignment
+    vs Cable Route GA) reconciles to NEITHER register title → the caller flags it
+    instead of collapsing it (guards the normalize-Rule-3 data-loss trap)."""
+    a, b = _ab_norm_title(file_title), _ab_norm_title(reg_title)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    from difflib import SequenceMatcher
+    if SequenceMatcher(None, a, b).ratio() >= 0.85:
+        return True
+    # acronym-of, either direction (a collapsed side has no separators, so its
+    # initials can't be recomputed — compare the SHORT normalized form to the LONG
+    # side's word-initials).
+    if len(a) <= len(b):
+        if len(a) >= 2 and a == _ab_initials(reg_title):
+            return True
+    elif len(b) >= 2 and b == _ab_initials(file_title):
+        return True
+    # identity-token containment / overlap.
+    ta, tb = _ab_title_tokens(file_title), _ab_title_tokens(reg_title)
+    if ta and tb and (ta <= tb or tb <= ta
+                      or len(ta & tb) / len(ta | tb) >= 0.6):
+        return True
+    return False
 
 
 class AsBuiltManager(IFCManager):
@@ -10139,6 +10210,58 @@ class AsBuiltManager(IFCManager):
             print(f"    (客户清单 oracle 不可用，缺口报告降级为纯扫描: {e})")
             self._ab_oracle = {}
         return self._ab_oracle
+
+    def _ab_register_titles(self) -> Dict[str, List[str]]:
+        """{DOC_ID_UPPER: [doc_title, ...]} from the client *Deliverables List* —
+        the TITLE authority the collision gate uses to adjudicate same-number/
+        different-title clashes without a synonym dictionary.
+
+        The doc-id IS the join key: the register maps it to its canonical Doc
+        Name(s). A doc-id the register lists under ONE title → every file under it
+        is that one drawing, so a filename that only drifted (SLD vs Single Line
+        Diagram) is reconciled and versioned, NOT frozen for a human. A doc-id the
+        register lists under SEVERAL titles (50023-CA-001 = Trench Alignment +
+        Cable Route GA + Underground Services) → genuinely several drawings, each
+        versioned independently. Reuses the Doc-Control keystone parser
+        (deliverable_list.parse_deliverable_list) so the register vocabulary stays
+        single-source. SOFT dependency — empty dict if the list/parser is absent,
+        and supersede_ab_deliverables falls back to its conservative wholesale
+        defer. Cached on self._ab_reg_titles.
+        """
+        if getattr(self, '_ab_reg_titles', None) is not None:
+            return self._ab_reg_titles
+        self._ab_reg_titles = {}
+        try:
+            stage_dir = Path(self.ab_output).parent
+            cands = [c for c in stage_dir.glob('*Deliverables List*.xlsx')
+                     if not c.name.startswith('~$')]
+            if not cands:
+                return self._ab_reg_titles
+
+            def _rank(p: Path):
+                nm = p.name.lower()
+                return (('comment' in nm or 'ace' in nm), p.stat().st_mtime)
+            list_path = max(cands, key=_rank)
+
+            import sys as _sys
+            ea_root = Path(__file__).resolve().parents[2] / "L02-knowledge" / "energy-agent"
+            if ea_root.is_dir() and str(ea_root) not in _sys.path:
+                _sys.path.insert(0, str(ea_root))
+            from modules.review.deliverable_list import parse_deliverable_list
+
+            reg: Dict[str, List[str]] = {}
+            for r in parse_deliverable_list(str(list_path)):
+                did = (r.get('doc_number') or '').upper()
+                title = (r.get('doc_title') or '').strip()
+                if did and title:
+                    reg.setdefault(did, [])
+                    if title not in reg[did]:
+                        reg[did].append(title)
+            self._ab_reg_titles = reg
+        except Exception as e:
+            print(f"    (客户清单标题权威不可用，碰撞闸降级为保守整体挂起: {e})")
+            self._ab_reg_titles = {}
+        return self._ab_reg_titles
 
     def report_missing_ab(self) -> List[Dict]:
         """Read-only GAP report: native IFC drawings that have NO AS BUILT PDF yet.
@@ -10917,9 +11040,19 @@ class AsBuiltManager(IFCManager):
           - Grouping key = doc-id + extension + normalized TITLE signature +
             exp-flag. An 'exp' export variant never supersedes the real _AS BUILT
             deliverable — both tracks are retained (user rule: keep both).
-          - A doc-id carrying >1 distinct title is deferred WHOLESALE to manual
-            review (surfaced under 'flagged' with 'variants') — nothing under it
-            is auto-moved, since a number clash may mean two real drawings.
+          - A doc-id carrying >1 distinct title is adjudicated against the client
+            *Deliverables List* (the title authority — _ab_register_titles):
+              · files reconciling to the SAME register title are one drawing whose
+                name drifted (SLD ≡ Single Line Diagram) → MERGED + versioned
+                together, NO human step;
+              · files reconciling to DIFFERENT register titles are genuinely
+                several drawings sharing a number (CA-001 Trench ≠ Cable Route) →
+                each versioned independently, never cross-superseded;
+              · a file matching NO register title → 'flagged' (variants), never
+                moved — this is the anti-data-loss guard (blind col-C rename would
+                overwrite a real drawing);
+              · register absent for the doc-id → deferred WHOLESALE to manual
+                (the old conservative behavior), nothing under it auto-moved.
           - A file sharing the kept file's exact mtime is NOT auto-moved →
             'flagged' (can't tell which is newer).
           - Files with no extractable doc-id OR no rev are left untouched
@@ -10934,7 +11067,11 @@ class AsBuiltManager(IFCManager):
             return out
         ss_dir = self._ab_superseded_dir(ab_dir)
 
-        groups: Dict[tuple, list] = {}
+        reg_titles = self._ab_register_titles()
+
+        # Pass 1 — raw grouping by the LITERAL title signature (legacy key).
+        raw: Dict[tuple, list] = {}
+        key_text: Dict[tuple, str] = {}          # key → spaced title (for tokens)
         for f in sorted(ab_dir.iterdir()):
             if not f.is_file() or f.name.startswith('~$'):
                 continue
@@ -10949,22 +11086,46 @@ class AsBuiltManager(IFCManager):
             except OSError:
                 mt = 0.0
             key = (doc_id.upper(), f.suffix.lower(), sig, is_exp)
-            groups.setdefault(key, []).append((rev, mt, f))
+            raw.setdefault(key, []).append((rev, mt, f))
+            key_text.setdefault(key, _ab_title_text(f.stem, doc_id))
 
-        # Distinct title signatures per doc-id → cross-title hazard flag.
-        titles_by_doc: Dict[str, set] = {}
-        for (doc, _ext, sig, _exp) in groups:
-            titles_by_doc.setdefault(doc, set()).add(sig)
-        # A doc-id that carries >1 distinct title is deferred WHOLESALE to manual
-        # review — not even its same-title subgroups are auto-moved. The client
-        # acceptance cycle re-numbers drawings (some forced to Rev1, some to Rev5),
-        # so a number clash under one doc-id may mean two real drawings; collapsing
-        # any part risks losing one. Surfaced under 'flagged' below, never moved.
-        multi_title = {d for d, sigs in titles_by_doc.items() if len(sigs) >= 2}
+        sigs_by_doc: Dict[str, set] = {}
+        for (doc, _ext, sig, _exp) in raw:
+            sigs_by_doc.setdefault(doc, set()).add(sig)
+        # Only a doc-id with >1 distinct title signature is a collision needing
+        # adjudication; a single-title doc-id keeps the legacy behavior untouched
+        # (register wording may differ from the filename yet be the same drawing —
+        # that is what normalize_filename fixes — so we do NOT demand a register
+        # match when there is no clash to resolve).
+        collision_docs = {d for d, s in sigs_by_doc.items() if len(s) >= 2}
+
+        # Pass 2 — resolve each collision against the client Deliverables List (the
+        # title authority). See the SAFETY docstring for the four outcomes.
+        groups: Dict[tuple, list] = {}
+        stray: List[Dict] = []
+        deferred: set = set()
+        for key, items in raw.items():
+            doc, ext, sig, is_exp = key
+            if doc not in collision_docs:
+                groups[key] = items                      # single title — as-is
+                continue
+            titles = reg_titles.get(doc)
+            if not titles:
+                deferred.add(doc)                        # can't adjudicate
+                continue
+            match = next((t for t in titles
+                          if _ab_title_reconciles(key_text.get(key, sig), t)), None)
+            if match is None:
+                for rev, mt, f in items:                 # matches nothing → stray
+                    stray.append({'doc_id': doc, 'ext': ext, 'rev': rev,
+                                  'title': sig, 'name': f.name, 'path': str(f)})
+                continue
+            # Same register title → same drawing (SLD drift) → MERGE + version.
+            mkey = (doc, ext, ('reg', _ab_norm_title(match)), is_exp)
+            groups.setdefault(mkey, []).extend(items)
 
         for key, items in groups.items():
-            doc, ext, sig, is_exp = key
-            if doc in multi_title or len(items) < 2:
+            if len(items) < 2:
                 continue
             # Keep the physically NEWEST export (mtime), NOT the highest rev.
             # AS BUILT deliverables pass through a client acceptance cycle that
@@ -10974,9 +11135,9 @@ class AsBuiltManager(IFCManager):
             items.sort(key=lambda t: (t[1], t[0]), reverse=True)  # mtime, rev
             keep_rev, keep_mt, keep_f = items[0]
             for rev, mt, f in items[1:]:
-                rec = {'doc_id': doc, 'ext': ext, 'rev': rev,
+                rec = {'doc_id': key[0], 'ext': key[1], 'rev': rev,
                        'keep_rev': keep_rev, 'keep_name': keep_f.name,
-                       'path': str(f), 'name': f.name, 'exp': is_exp}
+                       'path': str(f), 'name': f.name, 'exp': key[3]}
                 if mt == keep_mt:
                     rec['reason'] = 'same mtime as kept file — cannot tell newer'
                     out['flagged'].append(rec)
@@ -10984,23 +11145,34 @@ class AsBuiltManager(IFCManager):
                 rec['moved'] = True if report_only else self._move_to_ss(f, ss_dir)
                 out['moved'].append(rec)
 
-        # Cross-title: same doc-id, >1 distinct title signature. Never auto-moved
-        # (could be one drawing whose title drifted, OR two drawings wrongly
-        # sharing a doc-id) — surfaced for a human to resolve.
-        for doc in sorted(titles_by_doc):
-            if len(titles_by_doc[doc]) < 2:
-                continue
+        # Stray: a colliding title reconciles to NO register entry → same-number/
+        # different-drawing, or a name drift the register doesn't cover. Never
+        # moved — surfaced for a human to split the number or add the register row.
+        stray_by_doc: Dict[str, List[Dict]] = {}
+        for s in stray:
+            stray_by_doc.setdefault(s['doc_id'], []).append(s)
+        for doc in sorted(stray_by_doc):
+            variants = [{'ext': s['ext'], 'title': s['title'], 'name': s['name'],
+                         'revs': [f"{s['rev']:g}"]} for s in stray_by_doc[doc]]
+            out['flagged'].append({
+                'doc_id': doc, 'reason': '图名对不上客户清单任何规范名 — 同号异图或名称'
+                '漂移，核对后拆分/补录 register', 'variants': variants})
+
+        # Deferred: a title collision the register cannot adjudicate (doc-id not on
+        # the client list) → wholesale manual review, nothing under it auto-moved.
+        for doc in sorted(deferred):
             variants = []
-            for key in sorted(groups):
+            for key in sorted(raw):
                 d, ext, sig, is_exp = key
                 if d != doc:
                     continue
-                revs = sorted(r for r, _, _ in groups[key])
+                revs = sorted(r for r, _, _ in raw[key])
                 variants.append({'ext': ext, 'title': sig, 'exp': is_exp,
                                  'revs': [f"{r:g}" for r in revs]})
             out['flagged'].append({
-                'doc_id': doc, 'reason': 'multiple titles under one doc-id — '
-                'verify same drawing before collapsing', 'variants': variants})
+                'doc_id': doc, 'reason': 'multiple titles under one doc-id '
+                '(客户清单未收录，无法判定) — verify same drawing before collapsing',
+                'variants': variants})
 
         return out
 
@@ -12173,24 +12345,26 @@ class AsBuiltManager(IFCManager):
         return b / tot
 
     def _scan_pdf_stamp_overlaps(self, pdf_path: Path):
-        """Per page, decide whether the stamp group overlaps foreign ink and, if
-        so, the 2-D PDF offset (dx,dy) that relocates the WHOLE group to the
-        nearest clear slot anywhere on the sheet.
+        """Per page, decide whether the stamp group overlaps design content or the
+        title block and, if so, the 2-D PDF offset (dx,dy) that relocates the WHOLE
+        group to the OPPOSITE bottom corner.
 
-        Probabilistically a stamp-vs-content clash has only two cures: move the
-        viewport, or move the stamp. This handles the move-the-stamp case
-        GENERALLY. Earlier code only searched UP/DOWN along the current X — fine
-        when the notes sit directly above (C-PLN-006), but useless when the entire
-        right edge is occupied by detail/dimension tables (C-PLN-003: the COLOUR
-        box landed on the DOUBLE ACCESS GATES table and there was no vertical slot
-        on the right). Searching the full sheet lets the group relocate to the
-        empty lower-left area (the conventional clear zone on these frames), and
-        generalises to any project/frame — the only criterion is "lands on white".
+        A stamp-vs-content clash has only two cures: move the viewport, or move the
+        stamp. This handles the move-the-stamp case with the user's TWO-CORNER rule:
+        the stamp belongs in exactly one of two places — its as-drawn lower-RIGHT
+        home, or the lower-LEFT corner which is the MIRROR of the home reflected
+        across the sheet's vertical centre ("左下角靠边,基本跟右下角轴对称"). If the
+        home is clear it stays; if not, it reflects to the mirror corner; if neither
+        corner is clear it is left as-is and QA escalates [需人工检查]. A free
+        full-sheet grid search was tried and rejected: on a sheet whose right edge is
+        blocked (e.g. ES-302's current-transducer column) the nearest clear pixel is
+        an inboard mid-right band — a FLOATING placement, exactly the defect to
+        avoid. Mirroring keeps the stamp tucked in a real corner, edge-aligned.
 
         Returns {page_index: {'dx','dy','scale_ref_h','boxes'}} for pages that
-        BOTH overlap AND have a reachable clear slot. Empty dict = nothing to do
-        (the normal case → caller no-ops). Works on the rendered raster, so it
-        sees content shown THROUGH a viewport that COM geometry can't.
+        overlap AND whose mirror corner is clear. Empty dict = nothing to do (the
+        normal case → caller no-ops). Geometry-only ⇒ colour-/project-agnostic; the
+        same detectors the QA gate uses vet each candidate.
         """
         import fitz as _fitz
         out = {}
@@ -12204,115 +12378,44 @@ class AsBuiltManager(IFCManager):
                     continue
                 gx0 = min(b.x0 for b in boxes); gy0 = min(b.y0 for b in boxes)
                 gx1 = max(b.x1 for b in boxes); gy1 = max(b.y1 for b in boxes)
-                gw, gh = gx1 - gx0, gy1 - gy0
-                ins = 2.0
-
-                def _all_clear(dx, dy):
-                    for b in boxes:
-                        f = self._black_frac(page, b.x0 + dx + ins, b.y0 + dy + ins,
-                                             b.x1 + dx - ins, b.y1 + dy - ins)
-                        if f >= self._RASTER_CLEAR_FRAC:
-                            return False
-                    return True
-
-                # TRIGGER is geometric (colour-independent); the raster _all_clear
-                # is reused only to vet candidate TARGET areas (empty there → no
-                # stamp ink to confound the measurement).
-                if not self._stamp_overlaps_content(page, boxes):
-                    continue  # stamp sits on white — the common case, no-op
-
-                # Candidate top-left anchors over a coarse full-sheet grid. The
-                # title block is a hard NO-GO (user: the relocated stamp "不能挡住
-                # titleblock"), and the preferred landing is the LOWER-RIGHT, with
-                # the LOWER-LEFT as backup (user: "右下（优先）左下（备选）"). So we
-                # search in two ordered passes — right-anchored first, then left-
-                # anchored — each favouring LOW placement (near the TB top edge),
-                # and take the first slot that is clear by BOTH the raster vet AND
-                # the geometric QA detector AND fully outside the title block. Using
-                # the same geometric detector the QA gate uses guarantees the
-                # relocator never picks a slot QA would later reject (the earlier
-                # bug: raster said "clear" on a slot whose stamp border sat on the
-                # TB rule, which the geometric linework signal then flagged).
-                # Project-agnostic: right/left corners + TB-clear + content-clear.
-                margin = min(pw, ph) * 0.012
                 tb_box = self._detect_tb_box(page)
-                # keep a clearance gap so the stamp never sits ON the TB top rule
-                gap = min(pw, ph) * 0.008
-                x_lo, x_hi = margin, pw - gw - margin
-                y_lo = ph * 0.08
-                y_hi = (tb_box[1] - gap if tb_box else ph - margin) - gh
-                xstep = max(gw * 0.5, pw * 0.03)
-                ystep = max(gh * 0.5, ph * 0.02)
 
-                def _slot_ok(dx, dy):
-                    grp = (gx0 + dx, gy0 + dy, gx1 + dx, gy1 + dy)
-                    if self._rect_hits_tb([grp], tb_box):
-                        return False
-                    if not _all_clear(dx, dy):
-                        return False  # cheap raster pre-filter
-                    tr = [_fitz.Rect(b.x0 + dx, b.y0 + dy, b.x1 + dx, b.y1 + dy)
-                          for b in boxes]
-                    return not self._stamp_overlaps_content(page, tr)
+                # TWO-CORNER rule (user, verbatim intent): the stamp lives in ONE of
+                # exactly TWO places — the lower-RIGHT corner (its as-drawn home) or
+                # the lower-LEFT corner, and the lower-left is the MIRROR IMAGE of the
+                # home reflected across the sheet's vertical centre ("左下角靠边,基本
+                # 跟右下角轴对称"). It must never cover the title block and never float
+                # mid-sheet. So: if the home is clear (of content AND title block) →
+                # no-op. Else reflect the whole group to the opposite corner; if that
+                # mirror is clear → move there. Else NEITHER corner is usable → leave
+                # as-is and let QA escalate [需人工检查] (a free grid search would only
+                # find a floating mid-sheet slot, which is exactly the defect to
+                # avoid). Geometry-only ⇒ colour-/project-agnostic; the same
+                # _stamp_overlaps_content / _rect_hits_tb the QA gate uses vet each
+                # candidate, so the relocator can never pick a spot QA rejects.
+                home_bad = (self._stamp_overlaps_content(page, boxes)
+                            or self._rect_hits_tb(boxes, tb_box))
+                if not home_bad:
+                    continue  # home corner is clean — the common case, no-op
 
-                cands = []
-                ty = y_lo
-                while ty <= y_hi:
-                    tx = x_lo
-                    while tx <= x_hi:
-                        dx, dy = tx - gx0, ty - gy0
-                        # two costs: proximity to bottom-RIGHT and to bottom-LEFT.
-                        low = (ph - (ty + gh)) ** 2
-                        c_right = ((pw - (tx + gw)) ** 2 + low) ** 0.5
-                        c_left = (tx * tx + low) ** 0.5
-                        cands.append((c_right, c_left, dx, dy))
-                        tx += xstep
-                    ty += ystep
-                best, forced = None, False
-                for key in (0, 1):  # 0 = right-preferred, 1 = left-backup
-                    for cand in sorted(cands, key=lambda t: t[key]):
-                        dx, dy = cand[2], cand[3]
-                        if _slot_ok(dx, dy):
-                            best = (dx, dy)
-                            break
-                    if best is not None:
-                        break
-                if best is None:
-                    # LAST RESORT (user-approved): no fully-clear on-edge slot
-                    # exists anywhere (a dense sheet that fills every corner,
-                    # e.g. E-BLD-001). Rather than leave the stamp on whatever it
-                    # currently covers, move the WHOLE group to the LEAST-INK
-                    # position so it obstructs as little design content as
-                    # possible — least foreign-ink primary, right-then-left as the
-                    # tiebreak. Title-block slots are still excluded (never dump the
-                    # stamp onto the title block even as a last resort). QA is NOT
-                    # relaxed: _stamp_overlaps_content still runs on the result
-                    # and still escalates [需人工检查] if the least-bad spot is
-                    # not actually clear — the stamp is merely in the least
-                    # obstructive place to make the human placement easier. Moves
-                    # ONLY if strictly better than the current position, so it is
-                    # never worse than as-is. This branch is unreachable for the
-                    # passing sheets (they find a clear slot or never overlap), so
-                    # their geometry is untouched.
-                    def _total_ink(dx, dy):
-                        return sum(self._black_frac(
-                            page, b.x0 + dx + ins, b.y0 + dy + ins,
-                            b.x1 + dx - ins, b.y1 + dy - ins) for b in boxes)
-                    best_ink = _total_ink(0.0, 0.0)  # current position
-                    # right-preferred order; skip title-block slots
-                    for cand in sorted(cands, key=lambda t: t[0]):
-                        dx, dy = cand[2], cand[3]
-                        grp = (gx0 + dx, gy0 + dy, gx1 + dx, gy1 + dy)
-                        if self._rect_hits_tb([grp], tb_box):
-                            continue
-                        ink = _total_ink(dx, dy)
-                        if ink < best_ink - 1e-6:
-                            best_ink, best, forced = ink, (dx, dy), True
-                    if best is None:
-                        continue  # current position already least-bad → leave as-is
-                # scale reference: the tallest stamp box (COLOUR) height in PDF pts.
+                dx = pw - gx1 - gx0   # reflect across the sheet vertical centre
+                mirror = [_fitz.Rect(b.x0 + dx, b.y0, b.x1 + dx, b.y1) for b in boxes]
+                mirror_ok = (not self._stamp_overlaps_content(page, mirror)
+                             and not self._rect_hits_tb(mirror, tb_box))
+                if not mirror_ok:
+                    continue  # neither corner clear → QA will escalate [需人工检查]
+
+                # scale references in PDF pts: tallest box height AND the full group
+                # width. WIDTH gives a much more accurate paper↔PDF scale for the big
+                # horizontal mirror move — the stamp is ~4× wider than tall, so
+                # border-render thickness is a far smaller fraction of the width, and
+                # a small scale error over a full-sheet Δx would otherwise land the
+                # mirror ~100pt off the symmetric position.
                 scale_ref_h = max(b.height for b in boxes)
-                out[pi] = {'dx': best[0], 'dy': best[1], 'forced': forced,
-                           'scale_ref_h': scale_ref_h, 'boxes': tuple(boxes)}
+                scale_ref_w = gx1 - gx0
+                out[pi] = {'dx': dx, 'dy': 0.0, 'forced': False,
+                           'scale_ref_h': scale_ref_h, 'scale_ref_w': scale_ref_w,
+                           'boxes': tuple(boxes)}
         finally:
             doc.close()
         return out
@@ -12338,7 +12441,8 @@ class AsBuiltManager(IFCManager):
 
     def _move_stamp_group_in_layout(self, doc, layout_name, info) -> bool:
         """Translate the IFC_STAMP group on `layout_name` by the PDF-space offset
-        in `info` (converted to paper units via the stamp-box height ratio).
+        in `info` (converted to paper units via the stamp-group WIDTH ratio, with
+        the height ratio as a fallback).
 
         Shared by the single-DWG (`_raster_fix_stamp_overlaps`) and multi-DWG
         (`_raster_fix_ab_group_overlaps`) relocators so both use identical,
@@ -12351,6 +12455,7 @@ class AsBuiltManager(IFCManager):
         blk = lay.Block
         ents = []
         rects = []  # (top_y, height) of IFC_STAMP polylines (paper)
+        gxmin, gxmax = None, None  # paper x-extent of the IFC_STAMP polylines
         for i in range(blk.Count):
             e = blk.Item(i)
             try:
@@ -12363,18 +12468,29 @@ class AsBuiltManager(IFCManager):
                 if e.EntityName in ('AcDbPolyline', 'AcDbLwPolyline'):
                     mn, mx = e.GetBoundingBox()
                     rects.append((float(mx[1]), float(mx[1]) - float(mn[1])))
+                    gxmin = float(mn[0]) if gxmin is None else min(gxmin, float(mn[0]))
+                    gxmax = float(mx[0]) if gxmax is None else max(gxmax, float(mx[0]))
             except Exception:
                 pass
         if not ents or not rects:
             return False
-        # scale = pdf pts per paper unit, from the tallest stamp box (COLOUR)
-        # height ↔ tallest IFC_STAMP polyline height (paper).
+        # scale = pdf pts per paper unit. Uniform plot scale, so derive it from the
+        # most reliable measurement: the stamp-group WIDTH (info['scale_ref_w'] ↔
+        # paper x-extent) — border-render thickness is a tiny fraction of the width,
+        # so it is far more accurate over a full-sheet mirror move than the height
+        # ratio. Fall back to the tallest-box height ratio if width is unavailable.
         rects.sort(key=lambda t: t[0])  # by top-y
-        colour_paper_h = max(h for _t, h in rects)
-        colour_pdf_h = info['scale_ref_h']
-        if colour_paper_h <= 0:
-            return False
-        scale = colour_pdf_h / colour_paper_h
+        scale = None
+        paper_w = (gxmax - gxmin) if (gxmin is not None and gxmax is not None) else 0.0
+        pdf_w = info.get('scale_ref_w', 0.0)
+        if paper_w > 0 and pdf_w > 0:
+            scale = pdf_w / paper_w
+        if scale is None:
+            colour_paper_h = max(h for _t, h in rects)
+            colour_pdf_h = info['scale_ref_h']
+            if colour_paper_h <= 0:
+                return False
+            scale = colour_pdf_h / colour_paper_h
         # 2-D move. PDF +x = paper +x; PDF +y = DOWN, paper +y = UP → negate dy.
         # Divide PDF offsets by scale to get paper units.
         shift_px = info['dx'] / scale
