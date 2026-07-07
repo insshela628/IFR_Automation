@@ -188,6 +188,10 @@ def format_pipeline_result(results: Dict) -> str:
         lines.append(f"  📋 Deliverable: 新增={dlv.get('new_items',0)}, "
                      f"更新={dlv.get('rev_mismatches',0)}, "
                      f"插入={dlv.get('inserted',0)}, 更新={dlv.get('updated',0)}")
+        te = dlv.get('title_energy')
+        if te and te.get('status') == 'diff':
+            lines.append(f"     ⚠️ C1 容量与 Portfolio 不符 [需人工]: "
+                         f"{te.get('title')} vs {te.get('portfolio')} @ {te.get('cell')}")
     elif dlv and dlv.get('skipped'):
         lines.append(f"  ⚠️ Deliverable: {dlv.get('reason','skipped')}")
     elif dlv and dlv.get('error'):
@@ -2946,6 +2950,7 @@ class DeliverableCrossCheckResult:
     doc_id_corrections: List[Dict] = field(default_factory=list)  # rows where FILE NO was corrected
     status_updates: List[Dict] = field(default_factory=list)  # IFC status updates
     naming_warnings: List[Dict] = field(default_factory=list)  # filename normalization warnings
+    title_energy: Optional[Dict] = None  # C1 容量 ↔ ACE_Portfolio 漂移检测 (跨项目, 只读)
     rows_inserted: int = 0
     rows_updated: int = 0
     new_file_rev: str = ""
@@ -3476,6 +3481,25 @@ class DeliverableManager:
                 except Exception:
                     pass
 
+    def _reconcile_title_energy(self, ws) -> Optional[Dict]:
+        """跨项目 DLV 标题容量(C1) ↔ ACE_Portfolio 漂移检测 (只读, 不改盘)。
+
+        复用 pm-automation 的 `portfolio_energy` —— 与 kickoff 生成 C1 **同一份逻辑**, 单一 SSOT,
+        绝不在本仓另写一份 (否则 Forbes/Hay #2/Waterloo 的量纲/#2-防误配 边角要修两遍)。
+        项目名 = 项目文件夹名 (跨项目走同一路径, 不硬编码任何项目)。
+        缺依赖/任何异常 → None (软, 绝不打断 pipeline)。"""
+        try:
+            import sys as _sys
+            pe_dir = (Path(__file__).resolve().parents[2]
+                      / "L04-decision" / "pm-automation" / "kickoff")
+            if pe_dir.is_dir() and str(pe_dir) not in _sys.path:
+                _sys.path.insert(0, str(pe_dir))
+            import portfolio_energy as _pe
+            return _pe.reconcile_title_cell(ws, self.project_path.name)
+        except Exception as e:
+            print(f"    (标题容量对账跳过: {e})")
+            return None
+
     def cross_check(self, excel_path: Path, external_ifc_map: Optional[Dict] = None) -> DeliverableCrossCheckResult:
         """Perform full cross-check between source folders and deliverable Excel.
 
@@ -3510,6 +3534,15 @@ class DeliverableManager:
             result.errors.append(str(e))
             wb.close()
             return result
+
+        # C1 容量 ↔ ACE_Portfolio 漂移检测 (跨项目, 只读; 不符→WARN 需人工, 绝不自动覆盖)
+        te = self._reconcile_title_energy(ws)
+        if te:
+            result.title_energy = te
+            if te.get('status') == 'diff':
+                print(f"    ⚠️ C1 容量与 Portfolio 不符 [需人工检查]: "
+                      f"标题={te.get('title')} vs Portfolio={te.get('portfolio')} "
+                      f"({te.get('quantity')}) @ {te.get('cell')}")
 
         # Scan source folders
         folder_items = self.scan_source_folders()
@@ -14521,6 +14554,7 @@ class PipelineOrchestrator:
                         'naming_warnings': len(check_result.naming_warnings),
                         'inserted': check_result.rows_inserted,
                         'updated': check_result.rows_updated,
+                        'title_energy': check_result.title_energy,
                     }
                 else:
                     UIHelper.print_warning("未找到交付物 Excel 文件")

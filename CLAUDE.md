@@ -254,6 +254,13 @@ The AS BUILT analogue of the IFC VersionManager step — the missing half of AB 
 - **Failure mode if rev col hardcoded**: `update_deliverable_ifc_status()` wrote integer revision (0) to date column (L) → Excel showed `0/01/00`
 - **Failure mode if deliverable gated by new_files**: All IFC files already transmitted → `new_files` empty → deliverable never updated → Excel shows stale IFR status for items already at IFC
 
+### Deliverable Title Capacity ↔ ACE_Portfolio (cross-project drift check)
+- `DeliverableManager.cross_check()` runs `_reconcile_title_energy(ws)` for **every** project: reads the DLV title capacity (C1, e.g. `10.03MWh` / `4.98MVA`) and compares it to the SAME physical quantity in the exec **ACE_Portfolio** tab. **Read-only — never overwrites the DLV.**
+- **One cross-project logic, single SSOT**: the compare lives in `pm-automation/kickoff/portfolio_energy.py` (`reconcile_title_cell`) — the SAME module kickoff uses to SET C1 at generation. Never reimplement it here (else Forbes / Hay #2 / Waterloo edge cases get fixed twice). ifr imports it via `parents[2]/L04-decision/pm-automation/kickoff` (same sibling-repo pattern as the `deliverable_list` parser).
+- **Dimension-aware**: energy (MWh/kWh) and power (MVA/MW/kVA) are different quantities → C1's own unit picks which Portfolio column to compare (Energy vs Power); kVA↔MVA / kWh↔MWh normalized, MW≈MVA at PF≈1. Never cross-fill quantities (a PV project's C1 is MVA, a BESS project's is MWh).
+- **Project match is exact** (type-suffix stripped): `Waterloo`→`waterloo` matches Portfolio `Waterloo`, but **never collapses `Waterloo #2`→`Waterloo`** (would grab a different project's number). Project name = the project **folder** name (`self.project_path.name`) → nothing hardcoded.
+- **Gate**: match within ε (0.5% / 0.01) → silent OK; Portfolio has no value for that project/quantity, or the title has no capacity token → silent **skip** (no false warn — e.g. Waterloo today: Portfolio energy cell still blank → skip); **material mismatch → WARN `[需人工检查]`** in run log + pipeline summary, and **NEVER auto-overwrite** (no provenance to decide who's newer). Auto-resolution would need a provenance/LWW event-table — deliberately deferred, not owed as debt.
+
 ### AS BUILT Post-Conversion QA (MANDATORY)
 - `_qa_validate_ab_pdf()`: Auto-runs after every successful AB PDF export. Uses PyMuPDF (fitz) to check:
   1. Page count matches expected (from title block count or page DWG count)
