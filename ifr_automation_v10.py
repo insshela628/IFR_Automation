@@ -190,8 +190,8 @@ def format_pipeline_result(results: Dict) -> str:
                      f"插入={dlv.get('inserted',0)}, 更新={dlv.get('updated',0)}")
         te = dlv.get('title_energy')
         if te and te.get('status') == 'diff':
-            lines.append(f"     ⚠️ C1 容量与 Portfolio 不符 [需人工]: "
-                         f"{te.get('title')} vs {te.get('portfolio')} @ {te.get('cell')}")
+            lines.append(f"     ⚠️ C1 容量与真源不符 [需人工]: "
+                         f"{te.get('title')} vs {te.get('authoritative')} @ {te.get('cell')}")
     elif dlv and dlv.get('skipped'):
         lines.append(f"  ⚠️ Deliverable: {dlv.get('reason','skipped')}")
     elif dlv and dlv.get('error'):
@@ -2950,7 +2950,7 @@ class DeliverableCrossCheckResult:
     doc_id_corrections: List[Dict] = field(default_factory=list)  # rows where FILE NO was corrected
     status_updates: List[Dict] = field(default_factory=list)  # IFC status updates
     naming_warnings: List[Dict] = field(default_factory=list)  # filename normalization warnings
-    title_energy: Optional[Dict] = None  # C1 容量 ↔ ACE_Portfolio 漂移检测 (跨项目, 只读)
+    title_energy: Optional[Dict] = None  # C1 容量 ↔ 容量真源(Input→脊柱→Portfolio) 漂移检测 (跨项目, 只读)
     rows_inserted: int = 0
     rows_updated: int = 0
     new_file_rev: str = ""
@@ -3482,10 +3482,12 @@ class DeliverableManager:
                     pass
 
     def _reconcile_title_energy(self, ws) -> Optional[Dict]:
-        """跨项目 DLV 标题容量(C1) ↔ ACE_Portfolio 漂移检测 (只读, 不改盘)。
+        """跨项目 DLV 标题容量(C1) ↔ **容量真源** 漂移检测 (只读, 不改盘)。
 
-        复用 pm-automation 的 `portfolio_energy` —— 与 kickoff 生成 C1 **同一份逻辑**, 单一 SSOT,
-        绝不在本仓另写一份 (否则 Forbes/Hay #2/Waterloo 的量纲/#2-防误配 边角要修两遍)。
+        真源权威链 = ACE_Project_Input → 脊柱 projects.db → ACE_Portfolio(遗留兜底);
+        箭头方向 2026-07-07 掰正 (Portfolio 是下游看板, 不再当源)。复用 pm-automation 的
+        `portfolio_energy` —— 与 kickoff 生成 C1 **同一份逻辑**, 单一 SSOT, 绝不在本仓另写一份
+        (否则 Forbes/Hay #2/Waterloo 的量纲/#2-防误配 边角要修两遍)。
         项目名 = 项目文件夹名 (跨项目走同一路径, 不硬编码任何项目)。
         缺依赖/任何异常 → None (软, 绝不打断 pipeline)。"""
         try:
@@ -3535,13 +3537,13 @@ class DeliverableManager:
             wb.close()
             return result
 
-        # C1 容量 ↔ ACE_Portfolio 漂移检测 (跨项目, 只读; 不符→WARN 需人工, 绝不自动覆盖)
+        # C1 容量 ↔ 容量真源(Input→脊柱→Portfolio) 漂移检测 (跨项目, 只读; 不符→WARN 需人工, 绝不自动覆盖)
         te = self._reconcile_title_energy(ws)
         if te:
             result.title_energy = te
             if te.get('status') == 'diff':
-                print(f"    ⚠️ C1 容量与 Portfolio 不符 [需人工检查]: "
-                      f"标题={te.get('title')} vs Portfolio={te.get('portfolio')} "
+                print(f"    ⚠️ C1 容量与真源不符 [需人工检查]: "
+                      f"标题={te.get('title')} vs 真源={te.get('authoritative')} "
                       f"({te.get('quantity')}) @ {te.get('cell')}")
 
         # Scan source folders
