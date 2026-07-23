@@ -11542,7 +11542,15 @@ class AsBuiltManager(IFCManager):
             desc_val = ''
             if desc_tag in attrs:
                 desc_val = self._safe_get_text(attrs[desc_tag]).strip().upper()
-            if 'AS BUILT' in desc_val or 'AS-BUILT' in desc_val:
+            is_ab = 'AS BUILT' in desc_val or 'AS-BUILT' in desc_val
+            # Idempotency is keyed on (AS BUILT *AND* the SAME rev number). Re-running
+            # the identical conversion (existing AB row's rev == ab_rev) overwrites in
+            # place. But a PRIOR AS BUILT revision (e.g. Rev 1 when we are now issuing
+            # Rev 2) is real revision history to PRESERVE — it counts as an occupied
+            # row so the new AS BUILT row is ADDED (rolling when the table is full),
+            # NEVER clobbering the previous AS BUILT row. (User rule: 上一版得有 — the
+            # prior version must remain; only the oldest rolls off.)
+            if is_ab and val == str(ab_rev):
                 existing_ab_row = max(existing_ab_row, row_num)
             else:
                 last_occupied_row = max(last_occupied_row, row_num)
@@ -11570,12 +11578,20 @@ class AsBuiltManager(IFCManager):
                         self._safe_set_text(attrs[d_tag], sval)
             target_row = tb_rows
 
-        # Clean up duplicate AB rows above target_row (idempotent safety)
+        # Clean up duplicate AB rows above target_row (idempotent safety). Only
+        # clear a row that duplicates the SAME revision we are writing — a PRIOR
+        # AS BUILT rev (different number) is legitimate history and MUST survive
+        # the roll (user rule: 上一版得有). Keying the clear on rev-number prevents
+        # wiping the Rev 1 row when issuing Rev 2.
         for row_num in range(1, target_row):
             desc_tag = f"{row_num}DESCRIPTION"
+            rev_tag = f"{row_num}REV"
             if desc_tag in attrs:
                 desc_val = self._safe_get_text(attrs[desc_tag]).strip().upper()
-                if 'AS BUILT' in desc_val or 'AS-BUILT' in desc_val:
+                row_rev = (self._safe_get_text(attrs[rev_tag]).strip()
+                           if rev_tag in attrs else '')
+                if ('AS BUILT' in desc_val or 'AS-BUILT' in desc_val) \
+                        and row_rev == str(ab_rev):
                     for suffix in all_suffixes:
                         tag = f"{row_num}{suffix}"
                         if tag in attrs:
@@ -12905,8 +12921,15 @@ class AsBuiltManager(IFCManager):
         print(f"    长路径({len(p)}>256) → 经短 junction 打开: {link_root.name}")
         return (short, _cleanup)
 
-    def convert_to_ab(self, dwg_info: Dict) -> Dict:
+    def convert_to_ab(self, dwg_info: Dict, preserve_existing_stamp: bool = False) -> Dict:
         """Convert a single IFC DWG to AS BUILT.
+
+        `preserve_existing_stamp`: when the SOURCE is already a QA-passed AS BUILT
+        whose stamp placement is authoritative (e.g. a punchlist re-issue where the
+        designer updated only the native content and the gold stamp must stay
+        exactly where it is), skip remove+redraw so a clear stamp is never moved
+        onto content. Only the titleblock revision row is updated. QA still runs on
+        the output PDF, so a genuinely bad preserved stamp is still caught.
 
         Steps:
           1. Open IFC DWG in AutoCAD
@@ -13078,13 +13101,19 @@ class AsBuiltManager(IFCManager):
             # Fix known typos
             self._fix_known_typos(doc)
 
-            # Scan for existing COLOUR stamp BEFORE removal
-            has_colour = self._scan_has_colour(doc)
-            if has_colour:
-                print(f"    COLOUR: 原DWG已有 COLOUR 印章，保留原样，仅画 AS BUILT")
+            if preserve_existing_stamp:
+                # Source is already a gold AS BUILT — leave its stamp exactly in
+                # place (do NOT remove/redraw). Only the titleblock rev is updated.
+                has_colour = True
+                print("    印章: 保留源图既有 AS BUILT 印章（不移除/不重绘）")
+            else:
+                # Scan for existing COLOUR stamp BEFORE removal
+                has_colour = self._scan_has_colour(doc)
+                if has_colour:
+                    print(f"    COLOUR: 原DWG已有 COLOUR 印章，保留原样，仅画 AS BUILT")
 
-            # Remove existing stamps ONCE (covers all spaces — removes IFC stamps too)
-            self._remove_ifc_stamp(doc)
+                # Remove existing stamps ONCE (covers all spaces — removes IFC stamps too)
+                self._remove_ifc_stamp(doc)
 
             # Update EVERY title block + add AS BUILT stamp near each one
             date_str = datetime.now().strftime('%d/%m/%y')
@@ -13098,7 +13127,9 @@ class AsBuiltManager(IFCManager):
                 _tbw = self._update_title_block(attrs, ab_rev, personnel, date_str, space=space)
                 for _w in (_tbw or []):
                     _tb_qa_all.append(f"Sheet {tb_idx}: {_w}")
-                if block_ref and space:
+                if preserve_existing_stamp:
+                    pass  # gold stamp left untouched (see convert_to_ab docstring)
+                elif block_ref and space:
                     self._stamp_via_com_draw(doc, block_ref, space,
                                              has_colour=has_colour,
                                              layout_name=layout_name)
