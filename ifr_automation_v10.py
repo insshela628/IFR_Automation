@@ -8417,6 +8417,16 @@ _RE_DOC_ID_LMS = re.compile(r'^(\d{5}-[A-Z]{2}-\d{3})', re.IGNORECASE)
 _RE_DOC_ID_GENERIC = re.compile(r'^([A-Z0-9][\w]+-[A-Z]+-[A-Z]*-?\d{3})', re.IGNORECASE)
 _RE_DOC_ID_TSF = re.compile(r'^(TSF-[A-Z]{2}-[A-Z]{3}-\w+-\d{2})', re.IGNORECASE)
 
+# Pass-2 twins — the SAME structured patterns WITHOUT the '^' anchor. The
+# anchored originals make `.search()` a no-op (no MULTILINE), so the documented
+# "doc-ID anywhere in the filename" pass below was DEAD CODE: any decorated name
+# ('☆GG31-C-PLN-006 REV 1 …', 'copy of GG31-…') extracted None and then dropped
+# silently out of every doc-ID-keyed gate — dedup, version control, QA. Only the
+# STRUCTURED ids get an unanchored twin; _RE_DOC_ID_GENERIC stays anchored
+# because unanchored it would happily match arbitrary text mid-filename.
+_RE_DOC_ID_ANY = [re.compile(r.pattern.lstrip('^'), re.IGNORECASE)
+                  for r in (_RE_DOC_ID_GG, _RE_DOC_ID_LMS, _RE_DOC_ID_TSF)]
+
 
 def _extract_doc_id_standalone(filename: str, allow_fallback: bool = True) -> Optional[str]:
     """Extract doc-ID from a filename without needing a class instance.
@@ -8443,7 +8453,9 @@ def _extract_doc_id_standalone(filename: str, allow_fallback: bool = True) -> Op
             return m.group(1)
     # Pass 2: non-standard — doc-ID anywhere in filename
     # Handles files where FILE NAME is inaccurate but FILE NO is present somewhere
-    for pat in [_RE_DOC_ID_GG, _RE_DOC_ID_LMS, _RE_DOC_ID_TSF, _RE_DOC_ID_GENERIC]:
+    # (leading '☆'/'copy of'/language prefix). Uses the UNANCHORED twins — the
+    # anchored patterns above would make this pass a silent no-op.
+    for pat in _RE_DOC_ID_ANY:
         m = pat.search(stem_clean)
         if m:
             return m.group(1)
@@ -11252,12 +11264,24 @@ class AsBuiltManager(IFCManager):
         # Pass 1 — raw grouping by the LITERAL title signature (legacy key).
         raw: Dict[tuple, list] = {}
         key_text: Dict[tuple, str] = {}          # key → spaced title (for tokens)
+        unparsed: List[Dict] = []                # PDFs the gate could not judge
         for f in sorted(ab_dir.iterdir()):
             if not f.is_file() or f.name.startswith('~$'):
                 continue
             doc_id = _extract_doc_id_standalone(f.name)
             rev = _ab_rev_from_name(f.stem)
             if not doc_id or rev is None:
+                # THIRD STATE — never fail open. A deliverable PDF the gate can't
+                # parse is not "clean", it is UNJUDGED: it silently left the dedup
+                # set, so a real duplicate under it stayed invisible (that is how a
+                # '☆'-prefixed twin survived on GG-31). Non-PDF strays stay quiet —
+                # audit_ab_deliverable_hygiene owns those.
+                if f.suffix.lower() == '.pdf':
+                    unparsed.append({
+                        'name': f.name, 'path': str(f),
+                        'doc_id': doc_id, 'rev': rev, 'kind': 'unparsed',
+                        'reason': '无法解析 ' + ('doc-ID' if not doc_id else 'rev')
+                                  + ' — 未参与查重，请改名后重跑 (not de-duplicated)'})
                 continue
             sig = _ab_title_signature(f.stem, doc_id)
             is_exp = bool(_RE_AB_EXP_MARK.search(f.stem))
@@ -11314,6 +11338,16 @@ class AsBuiltManager(IFCManager):
             # for display and as a mtime tiebreak.
             items.sort(key=lambda t: (t[1], t[0]), reverse=True)  # mtime, rev
             keep_rev, keep_mt, keep_f = items[0]
+            # The survivor is what the client folder now presents as CURRENT. If
+            # it is the one a human marked '☆ 有问题', keeping it quietly is the
+            # worst outcome — recency picked it, but a person already said it is
+            # wrong. Move nothing extra; just refuse to be silent about it.
+            if self._RE_SUSPECT_MARK.match(keep_f.stem):
+                out['flagged'].append({
+                    'doc_id': key[0], 'name': keep_f.name, 'kind': 'suspect_kept',
+                    'path': str(keep_f), 'rev': keep_rev,
+                    'reason': '按时间它最新，但它带 ☆ 人工「有问题」标记 — '
+                              '当前交付面正摆着一份已知有问题的图，先修再出'})
             for rev, mt, f in items[1:]:
                 rec = {'doc_id': key[0], 'ext': key[1], 'rev': rev,
                        'keep_rev': keep_rev, 'keep_name': keep_f.name,
@@ -11354,6 +11388,117 @@ class AsBuiltManager(IFCManager):
                 '(客户清单未收录，无法判定) — verify same drawing before collapsing',
                 'variants': variants})
 
+        out['flagged'].extend(unparsed)
+        return out
+
+    # Leading decoration a human adds in Explorer to mark a file ('☆', '★', '✓',
+    # '副本', 'copy of', digits used as a manual sort key). It carries no document
+    # identity, it is NOT part of any naming standard, and — before the pass-2
+    # doc-ID fix — it made the file invisible to every doc-ID-keyed gate. Strip it.
+    # '☆'/'★' is NOT decoration — the user marks a deliverable with it to mean
+    # "THIS VERSION IS SUSPECT / 待查". It is the only hand-authored quality signal
+    # in the folder, so the machine must READ it, never erase it: renaming it away
+    # would silently launder a known-bad PDF into a clean house name. It is cleared
+    # by fixing the drawing and re-plotting, not by the renamer.
+    _RE_SUSPECT_MARK = re.compile(r'^[\s]*[☆★]+[\s]*')
+
+    _RE_NAME_DECOR = re.compile(
+        r'^(?:[\s\-_.~!@#$%^&*+= -⯿︀-️🀀-🫿]'
+        r'|copy\s+of\s|副本[\s_-]*)+', re.IGNORECASE)
+
+    def canonicalize_ab_deliverable_names(self, report_only: bool = True) -> Dict[str, List[Dict]]:
+        """Rename client AS BUILT deliverable PDFs to the ONE house form —
+        `_build_ab_pdf_filename`, i.e. `{doc-ID} REV {N} {title}_AS BUILT.pdf`.
+
+        WHY THIS AND NOT `standardize_filenames.normalize_filename_format`:
+        that helper is a GENERIC tidier ('Rev 1', underscores kept) and it agrees
+        with NEITHER house form — the AB folder is written as `… REV 1 …_AS BUILT`
+        and the IFC folder as `…_…_Rev1_IFC`. Run it here and every bot-produced
+        name is renamed away from what the bot itself will write next run, so the
+        two fight forever. The BUILDER is the naming authority for the folder it
+        writes; this step just pulls hand-made / hand-copied strays onto it.
+
+        The title comes from the client Deliverables List when the register can
+        adjudicate it (canonical wording), otherwise from the file's own title
+        text — identity-preserving, never invented.
+
+        SAFETY: dry-run by default; collision → BOTH skipped and flagged (never
+        overwrite, never merge); case-only rename routed via a temp name. Run
+        AFTER supersede_ab_deliverables — de-duplicating first is what keeps two
+        variants of one drawing from normalising onto the same target name.
+        """
+        out: Dict[str, List[Dict]] = {'renamed': [], 'flagged': []}
+        ab_dir = self.ab_output
+        if not ab_dir.exists():
+            return out
+        reg_titles = self._ab_register_titles()
+        existing = {f.name.lower() for f in ab_dir.iterdir() if f.is_file()}
+
+        plan: List[tuple] = []
+        for f in sorted(ab_dir.iterdir()):
+            if not f.is_file() or f.suffix.lower() != '.pdf' or f.name.startswith('~$'):
+                continue
+            doc_id = _extract_doc_id_standalone(f.name)
+            rev = _ab_rev_from_name(f.stem)
+            if not doc_id or rev is None:
+                continue                     # already surfaced by the dedup gate
+            if _RE_AB_EXP_MARK.search(f.stem):
+                continue                     # 'exp' export variant keeps its name
+            if self._RE_SUSPECT_MARK.match(f.stem):
+                out['flagged'].append({
+                    'doc_id': doc_id, 'name': f.name, 'target': None,
+                    'path': str(f), 'kind': 'suspect_mark',
+                    'reason': '带 ☆ 人工标记 (此版有问题/待查) — 规范化命名已挂起。'
+                              '修好并重新出图后 ☆ 自然消失，本项自动清除'})
+                continue
+            stem = self._RE_NAME_DECOR.sub('', f.stem)
+            title = _ab_title_text(stem, doc_id)
+            reg_match = next((t for t in (reg_titles.get(doc_id.upper()) or [])
+                              if _ab_title_reconciles(title, t)), None)
+            desc = self._sanitize_ab_desc(reg_match or title)
+            if not desc:
+                continue
+            rev_s = f"{rev:g}"
+            target = f"{doc_id} REV {rev_s} {desc}_AS BUILT{f.suffix.lower()}"
+            if target == f.name:
+                continue
+            plan.append((f, target, bool(reg_match)))
+
+        want: Dict[str, int] = {}
+        for _f, t, _r in plan:
+            want[t.lower()] = want.get(t.lower(), 0) + 1
+        for f, target, from_reg in plan:
+            key = target.lower()
+            rec = {'doc_id': _extract_doc_id_standalone(f.name), 'name': f.name,
+                   'target': target, 'path': str(f), 'title_from_register': from_reg}
+            if want[key] > 1:
+                rec['reason'] = (f'{want[key]} 个文件规范化后同名 — 先判定是否重复，'
+                                 f'不自动改名')
+                out['flagged'].append(rec)
+                continue
+            if key in existing and key != f.name.lower():
+                rec['reason'] = f"目标名 '{target}' 已存在且不是本文件 — 不覆盖"
+                out['flagged'].append(rec)
+                continue
+            if report_only:
+                rec['renamed'] = False
+                out['renamed'].append(rec)
+                continue
+            try:
+                dst = f.with_name(target)
+                if f.name.lower() == target.lower():
+                    tmp = f.with_name(f.name + '.rncase.tmp')
+                    os.replace(to_long_path(f), to_long_path(tmp))
+                    os.replace(to_long_path(tmp), to_long_path(dst))
+                else:
+                    os.replace(to_long_path(f), to_long_path(dst))
+                existing.discard(f.name.lower())
+                existing.add(key)
+                rec['renamed'] = True
+                out['renamed'].append(rec)
+            except OSError as e:
+                rec['reason'] = f'rename failed: {e}'
+                out['flagged'].append(rec)
         return out
 
     def _ab_existing_pdf_qa_clean(self, dwg_info: Dict) -> bool:
@@ -14171,9 +14316,13 @@ class AsBuiltManager(IFCManager):
             for a in sup['moved'][:12]:
                 print(f"    →SS  {a['doc_id']} Rev{a['rev']:g} (留最新, Rev{a['keep_rev']:g})  {a['name']}")
             flagged = [f for f in sup['flagged'] if 'variants' in f]
-            ties = [f for f in sup['flagged'] if 'variants' not in f]
+            unparsed = [f for f in sup['flagged'] if f.get('kind') == 'unparsed']
+            ties = [f for f in sup['flagged'] if 'variants' not in f
+                    and f.get('kind') not in ('unparsed', 'suspect_kept')]
             for t in ties:
                 print(f"    ⚠ 同时间戳[需人工]  {t['doc_id']} Rev{t['rev']:g}: {t['name']}")
+            for u in unparsed:
+                print(f"    ⚠ 未参与查重[需改名]  {u['name']}  ({u['reason']})")
             for f in flagged:
                 titles = ", ".join(f"{v['title']}({'/'.join(v['revs'])})" for v in f['variants'])
                 print(f"    ⚠ 同号多图[需人工]  {f['doc_id']}: {titles}")
@@ -14440,8 +14589,14 @@ class PipelineOrchestrator:
                 loose_flag = [a for a in loose if a.get('flag')]
                 sup = {'moved': [], 'flagged': []}
                 hyg = {'moved': [], 'flagged': []}
+                nam = {'renamed': [], 'flagged': []}
                 if ab_mgr.ab_output.exists():
                     sup = ab_mgr.supersede_ab_deliverables(report_only=self.dry_run)
+                    # Name canonicalisation runs AFTER the dedup: with the older
+                    # twin already in Superseded/, the survivor can take the house
+                    # name without colliding with it.
+                    nam = ab_mgr.canonicalize_ab_deliverable_names(
+                        report_only=self.dry_run)
                     # Deliverable TYPE hygiene: PDF-only-current contract. Client
                     # folder → only junk auto-moves; misfiled DWG / non-AB PDF /
                     # foreign all FLAGGED (cross-check the client As Built register).
@@ -14456,6 +14611,8 @@ class PipelineOrchestrator:
                     'deliverable_type_moved': len(hyg['moved']),
                     'deliverable_type_flagged': len(hyg['flagged']),
                     'flagged_multi_title': len(multi),
+                    'deliverable_renamed': len(nam['renamed']),
+                    'deliverable_rename_flagged': len(nam['flagged']),
                 }
                 verb = '将收' if self.dry_run else '已收'
                 parts = []
@@ -14464,6 +14621,8 @@ class PipelineOrchestrator:
                 parts.append(f"交付物{verb}旧版 {len(sup['moved'])} → Superseded/")
                 if hyg['moved']:
                     parts.append(f"交付物清 junk {len(hyg['moved'])} → SS")
+                if nam['renamed']:
+                    parts.append(f"交付物规范命名 {len(nam['renamed'])}")
                 if multi:
                     parts.append(f"同号多图跳过 {len(multi)} (需人工)")
                 UIHelper.print_success("AS BUILT 版本管理: " + ", ".join(parts))
@@ -14487,7 +14646,25 @@ class PipelineOrchestrator:
                     'ties': [
                         {'doc_id': t.get('doc_id'), 'rev': t.get('rev'),
                          'name': t.get('name')}
-                        for t in sup['flagged'] if 'variants' not in t],
+                        for t in sup['flagged']
+                        if 'variants' not in t
+                        and t.get('kind') not in ('unparsed', 'suspect_kept')],
+                    'suspect': [
+                        {'doc_id': x.get('doc_id'), 'name': x.get('name'),
+                         'reason': x.get('reason')}
+                        for x in list(sup['flagged']) + list(nam['flagged'])
+                        if x.get('kind') in ('suspect_kept', 'suspect_mark')],
+                    # Files the dedup gate could not judge. They are NOT clean —
+                    # they never entered the comparison — so they must stand in
+                    # the checklist until renamed, exactly like a deferred tie.
+                    'unparsed': [
+                        {'name': u.get('name'), 'reason': u.get('reason')}
+                        for u in sup['flagged'] if u.get('kind') == 'unparsed'],
+                    'rename': [
+                        {'doc_id': r.get('doc_id'), 'name': r.get('name'),
+                         'target': r.get('target'), 'reason': r.get('reason')}
+                        for r in nam['flagged']
+                        if r.get('kind') != 'suspect_mark'],
                     'membership': [
                         {'kind': fl['kind'], 'name': Path(fl['path']).name,
                          'doc_id': fl.get('doc_id')}

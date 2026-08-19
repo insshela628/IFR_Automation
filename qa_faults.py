@@ -119,6 +119,18 @@ def faults_from_version_flags(av: dict) -> list:
         w = (f"[需人工检查] 同时间戳 {t.get('doc_id', '?')}{rev_s}: "
              f"{t.get('name', '')} — 与保留文件同 mtime，无法判新旧")
         faults.append(build_fault(w, doc_id=t.get("doc_id")))
+    for u in flags.get("unparsed", []):
+        w = (f"[需人工检查] 未参与查重 {u.get('name', '?')} — {u.get('reason', '')}"
+             " (文件名解析不出 doc-ID/Rev，它没进过去重比较，不等于没有重复)")
+        faults.append(build_fault(w))
+    for x in flags.get("suspect", []):
+        w = (f"[需人工检查] ☆有问题标记 {x.get('doc_id') or ''} {x.get('name', '')}"
+             f" — {x.get('reason', '')}")
+        faults.append(build_fault(w, doc_id=x.get("doc_id")))
+    for r in flags.get("rename", []):
+        w = (f"[需人工检查] 规范命名冲突 {r.get('doc_id', '?')}: {r.get('name', '')}"
+             f" → {r.get('target', '')} — {r.get('reason', '')}")
+        faults.append(build_fault(w, doc_id=r.get("doc_id")))
     for m in flags.get("membership", []):
         w = (f"[需人工检查] 交付物归属 [{m.get('kind', '?')}] {m.get('name', '')}"
              " — 不属本交付夹（仅当前版图纸 PDF），核对客户清单后归位")

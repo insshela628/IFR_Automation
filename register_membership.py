@@ -33,9 +33,16 @@ from difflib import SequenceMatcher
 from typing import Dict, List, Optional
 
 # ── title-signature extraction (mirrors ifr_automation_v10._ab_title_*) ──────
+# NB: the rev alternative accepts a LETTER rev ('_RevA', 'Rev B') as well as a
+# numeric one. Letter revs are the IFR/draft scheme, so a Native doc-folder holds
+# both — while this regex only stripped digits, '..._RevA.dwg' kept 'REVA' inside
+# its title signature and looked like a DIFFERENT DRAWING from '..._Rev1_IFC.dwg'.
+# That fake collision made the gate declare "N distinct titles share doc-id" and
+# defer the whole folder to manual forever (21 files on GG-31). Keep it in step
+# with normalize_filename_format's _RE_REV, which has always accepted letters.
 _RE_AB_SIG_STRIP = re.compile(
-    r'(?:^|[\s_\-(])(?:rev\.?\s*\d+(?:\.\d+)?|as[ _]?built|ab(?:-exp)?|ifc'
-    r'|sheet\s*\d+|exp)(?=$|[\s_\-).])', re.IGNORECASE)
+    r'(?:^|[\s_\-(])(?:rev\.?\s*(?:\d+(?:\.\d+)?|[A-Za-z])|as[ _]?built'
+    r'|ab(?:-exp)?|ifc|sheet\s*\d+|exp)(?=$|[\s_\-).])', re.IGNORECASE)
 
 
 def title_text(stem: str, doc_id: Optional[str]) -> str:
@@ -176,7 +183,17 @@ def canonical_group_key(base_name: str, filename: str,
 
 # ── register loading (soft dep on the Doc-Control keystone parser) ───────────
 _REGISTER_CACHE: Dict[str, Dict[str, List[str]]] = {}
-_AB_DIR_NAMES = ('5. As Built', '6.AS Built', '6. As Built', '5.As Built')
+# Folders (relative to an ancestor) that can hold the client Deliverables List.
+# '8. Deliverables' / '3.Deliverables' matter because the CURRENT list often lives
+# there rather than beside the AS BUILT PDFs — GG-31's rev6.3 does.
+_AB_DIR_NAMES = ('5. As Built', '6.AS Built', '6. As Built', '5.As Built',
+                 '8. Deliverables', '8.Deliverables',
+                 'Design/Engineering/8. Deliverables',
+                 '3. IFR(Client)/3.Deliverables')
+# Real lists are named '… Deliverables *Document* List …', so a literal
+# '*Deliverables List*' glob matched nothing and the title oracle silently
+# degraded to "no register" on every GG project.
+_LIST_GLOBS = ('*Deliverable*List*.xlsx', '*DLV*.xlsx')
 
 
 def _rank_list(p: Path):
@@ -199,8 +216,10 @@ def find_deliverables_list(start: Path) -> Optional[Path]:
         cands: List[Path] = []
         for base in (anc, *[anc / d for d in _AB_DIR_NAMES]):
             if base.is_dir():
-                cands += [c for c in base.glob('*Deliverables List*.xlsx')
-                          if not c.name.startswith('~$')]
+                for g in _LIST_GLOBS:
+                    cands += [c for c in base.glob(g)
+                              if not c.name.startswith('~$')]
+                cands = list(dict.fromkeys(cands))   # globs overlap
         if cands:
             return max(cands, key=_rank_list)
     return None
