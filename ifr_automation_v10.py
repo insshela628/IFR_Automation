@@ -10354,17 +10354,14 @@ class AsBuiltManager(IFCManager):
         self._ab_oracle = {}
         self._ab_oracle_src = None
         try:
-            # locate the canonical list beside the deliverable folder ('5. As Built/')
-            stage_dir = Path(self.ab_output).parent
-            cands = list(stage_dir.glob('*Deliverables List*.xlsx'))
-            cands = [c for c in cands if not c.name.startswith('~$')]
-            if not cands:
+            # Locate via the SHARED finder — never re-inline the glob. The two
+            # inlined copies that used to live here (and in _ab_register_titles)
+            # are exactly why fixing the lookup in register_membership.py did NOT
+            # reach the AS BUILT track: the fix landed on a code path this one
+            # never called. One finder, one write port.
+            list_path = _rm.find_deliverables_list(Path(self.ab_output))
+            if not list_path:
                 return self._ab_oracle
-            # prefer an ACE-commented copy, then newest mtime
-            def _rank(p: Path):
-                nm = p.name.lower()
-                return (('comment' in nm or 'ace' in nm), p.stat().st_mtime)
-            list_path = max(cands, key=_rank)
 
             # import the keystone parser from the sibling energy-agent repo
             import sys as _sys
@@ -10424,16 +10421,9 @@ class AsBuiltManager(IFCManager):
             return self._ab_reg_titles
         self._ab_reg_titles = {}
         try:
-            stage_dir = Path(self.ab_output).parent
-            cands = [c for c in stage_dir.glob('*Deliverables List*.xlsx')
-                     if not c.name.startswith('~$')]
-            if not cands:
+            list_path = _rm.find_deliverables_list(Path(self.ab_output))
+            if not list_path:
                 return self._ab_reg_titles
-
-            def _rank(p: Path):
-                nm = p.name.lower()
-                return (('comment' in nm or 'ace' in nm), p.stat().st_mtime)
-            list_path = max(cands, key=_rank)
 
             import sys as _sys
             ea_root = Path(__file__).resolve().parents[2] / "L02-knowledge" / "energy-agent"
