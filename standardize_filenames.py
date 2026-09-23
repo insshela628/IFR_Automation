@@ -18,8 +18,29 @@ SAFETY:
   • Case-only renames (Windows case-insensitive FS) go through a temp name.
   • Dry-run by default; --apply required to touch the disk.
 
+MODES (`--mode`):
+  format  (default) register_membership.normalize_filename_format -- house style
+          "Rev 1" with SPACE separators. Matches the GG-31 / AS BUILT corpus.
+  rev     DeliverableManager.normalize_filename with NO deliverable_desc, and
+          only the changes that touch the REVISION TOKEN are kept. Target is
+          "_RevA": measured 2026-09-23 across Waterloo + Forbes that is the
+          de-facto plurality (9 of 27 versioned deliverables; `_rA` 6, `_Rev.A`
+          6, `-rA` 1). Use this on a project whose files are underscore-style --
+          running `format` there would rewrite the ALREADY-CORRECT `_RevA` files
+          into ` Rev A` and churn the whole folder.
+  ⚠ The separator rule (`-`/` ` -> `_` right after the FILE NO) is deliberately
+    DROPPED in `rev` mode. Measured, it does real damage: it rewrites the
+    sub-sheet number in `GG38-C-PLN-002-1-...` (002-1/-2/-3 are three DIFFERENT
+    drawings, not revisions of one) and it turns
+    `NSW113 - AuxTx ... - Rev.A.pdf` into `..._-_RevA.pdf`. Changing a document
+    numbering convention is not the same job as fixing a revision token.
+  ⚠ Neither mode ever touches DESCRIPTION words. cross_check's own `suggested`
+    name does -- it pulls the title from the DLV, which on Forbes would rename a
+    real drawing `NSW113-C-PLN-012_Steel Platform_RevB.pdf` to `..._Reserved_...`.
+
 Usage:
     python standardize_filenames.py <dir>                 # preview only
+    python standardize_filenames.py <dir> --mode rev      # revision token only
     python standardize_filenames.py <dir> --apply         # actually rename
     python standardize_filenames.py <dir> -r --apply      # recurse into subfolders
     python standardize_filenames.py <dir> --ext .pdf .dwg # restrict to extensions
@@ -44,14 +65,41 @@ def _iter_files(root: Path, recurse: bool, exts):
         yield p
 
 
-def plan_renames(root: Path, recurse=False, exts=None):
+_dm_cache = {}
+
+
+def _rev_only_namer(path: Path) -> str:
+    """`rev` mode namer: DeliverableManager.normalize_filename(name) with NO
+    deliverable_desc (Rule 3 -- description rewrite -- is then skipped entirely),
+    keeping ONLY the changes whose reason mentions the revision. Returns the
+    original name when nothing revision-shaped needs fixing."""
+    import ifr_automation_v10 as _ifr
+    key = str(path.parent)
+    dm = _dm_cache.get(key)
+    if dm is None:
+        dm = _dm_cache[key] = _ifr.DeliverableManager.__new__(_ifr.DeliverableManager)
+        dm.project_path = path.parent
+        dm.dry_run = True
+        dm.logger = __import__("logging").getLogger("standardize_filenames")
+    try:
+        new, changes = dm.normalize_filename(path.name)
+    except Exception:
+        return path.name
+    if not changes or any("revision" not in c for c in changes):
+        return path.name          # separator-only / mixed -> leave it to a human
+    return new
+
+
+def plan_renames(root: Path, recurse=False, exts=None, mode="format"):
     """Return (renames, skips): renames = [(src, dst)], skips = [(src, reason)].
     Files already tidy are silently omitted. Collisions land in `skips`."""
     exts = {e.lower() for e in exts} if exts else None
+    namer = _rev_only_namer if mode == "rev" else (
+        lambda p: _rm.normalize_filename_format(p.name))
     # group planned targets per parent dir to catch two-into-one collisions.
     planned = defaultdict(list)          # parent -> [(src, new_name)]
     for src in _iter_files(root, recurse, exts):
-        new_name = _rm.normalize_filename_format(src.name)
+        new_name = namer(src)
         if new_name == src.name:
             continue                     # already standard
         planned[src.parent].append((src, new_name))
@@ -94,10 +142,10 @@ def _do_rename(src: Path, dst: Path):
         os.replace(src, dst)
 
 
-def run(root: Path, apply=False, recurse=False, exts=None):
-    renames, skips = plan_renames(root, recurse, exts)
+def run(root: Path, apply=False, recurse=False, exts=None, mode="format"):
+    renames, skips = plan_renames(root, recurse, exts, mode)
     label = "APPLY" if apply else "DRY-RUN (preview only — pass --apply to rename)"
-    print(f"=== standardize_filenames [{label}] : {root} ===")
+    print(f"=== standardize_filenames [{label}] mode={mode} : {root} ===")
     if not renames and not skips:
         print("Nothing to do — all filenames already standard.")
         return 0
@@ -132,12 +180,16 @@ def main(argv=None):
                     help="recurse into subfolders")
     ap.add_argument("--ext", nargs="+", metavar="EXT",
                     help="restrict to these extensions, e.g. --ext .pdf .dwg")
+    ap.add_argument("--mode", choices=("format", "rev"), default="format",
+                    help="format = house 'Rev 1' style (default); "
+                         "rev = revision token only, target '_RevA' (see header)")
     args = ap.parse_args(argv)
     root = Path(args.directory)
     if not root.is_dir():
         print(f"error: not a directory: {root}", file=sys.stderr)
         return 2
-    return run(root, apply=args.apply, recurse=args.recurse, exts=args.ext)
+    return run(root, apply=args.apply, recurse=args.recurse, exts=args.ext,
+               mode=args.mode)
 
 
 if __name__ == "__main__":

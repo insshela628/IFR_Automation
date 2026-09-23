@@ -14793,12 +14793,25 @@ class PipelineOrchestrator:
                         UIHelper.print_success(
                             f"交付物更新完成: 新增={check_result.rows_inserted}, "
                             f"更新={check_result.rows_updated}")
+                    # Counts alone force the reader back into the interactive
+                    # menu to find out WHICH file. Carry a capped detail list so
+                    # an unattended caller can name the file in its own report.
+                    def _nw(w):
+                        d = w if isinstance(w, dict) else {}
+                        return {'filename': d.get('filename', ''),
+                                'suggested': d.get('suggested', ''),
+                                'doc_id': d.get('doc_id', '')}
                     results['deliverable'] = {
                         'new_items': len(check_result.items_in_folders_not_excel),
                         'rev_mismatches': len(check_result.revision_mismatches),
                         'doc_id_corrections': len(check_result.doc_id_corrections),
                         'status_updates': len(check_result.status_updates),
                         'naming_warnings': len(check_result.naming_warnings),
+                        'naming_items': [_nw(w) for w in check_result.naming_warnings[:40]],
+                        'rev_items': [{'doc_id': m.get('doc_id', ''),
+                                       'excel_rev': m.get('excel_rev', ''),
+                                       'folder_rev': m.get('folder_rev', '')}
+                                      for m in check_result.revision_mismatches[:40]],
                         'inserted': check_result.rows_inserted,
                         'updated': check_result.rows_updated,
                         'title_energy': check_result.title_energy,
