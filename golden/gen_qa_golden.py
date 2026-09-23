@@ -55,6 +55,15 @@ _DUP_SEG = ("superseded", "share to client", "shared with client", "handover",
             "submit", "submission", "feedback", "client template",
             "ifr", "ifc", "native", "old", "archive", "backup", "wip", "draft")
 
+# Retired-copy folders matched on the WHOLE path part, never as a substring.
+# The org writes "SS" for Superseded (the same convention `standardize_filenames
+# --mode dlv` already gates on) — without this, a retired copy is counted as a
+# live deliverable and its doc-ID is scored TWICE. Measured on the live tree:
+# GG31-E-PLN-001 was double-counted from `3. As Built Client/SS/`.
+# ⚠ MUST be exact-part: the substring "ss" also matches real segments such as
+#   "GG-31 Warnertown BESS", which would silently drop a whole project.
+_DUP_EXACT = ("ss",)
+
 GOLDEN = Path(__file__).resolve().parent / "qa_verdicts.json"
 COVERAGE = Path(__file__).resolve().parent / "coverage.json"
 
@@ -111,6 +120,8 @@ def _deliverables_in(drawings_dir: Path):
         rel_parts = [x.lower() for x in p.relative_to(drawings_dir).parts]
         if any(any(d in seg for d in _DUP_SEG) for seg in rel_parts):
             continue
+        if any(seg.strip() in _DUP_EXACT for seg in rel_parts):
+            continue
         if _is_deliverable(p):
             out.append(p)
     return out
@@ -139,7 +150,7 @@ def verdict_of(warnings, escalate_keywords):
     return "RETRYABLE"
 
 
-def collect():
+def collect(write_coverage: bool = False):
     """{key -> {doc_id,size,warnings,verdict}} over EVERY project's deliverables.
     Also writes coverage.json (all projects incl. zero-deliverable) as a side
     effect record — the snapshot itself only holds files that exist."""
@@ -174,6 +185,8 @@ def collect():
                 "warnings": list(warns),
                 "verdict": verdict_of(warns, escalate_kw),
             }
+    if not write_coverage:
+        return snap
     try:
         COVERAGE.write_text(json.dumps(coverage, ensure_ascii=False, indent=2),
                             encoding="utf-8")
@@ -184,7 +197,7 @@ def collect():
 
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    snap = collect()
+    snap = collect(write_coverage=True)
     GOLDEN.write_text(json.dumps(snap, ensure_ascii=False, indent=2),
                       encoding="utf-8")
     n = len(snap)
