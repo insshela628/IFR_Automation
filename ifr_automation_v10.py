@@ -3023,19 +3023,66 @@ class DeliverableManager:
                 return found
         return None
 
+    # Names that mark a RETIRED copy left beside the live one. `.superseded-<ts>`
+    # is stamped by this pipeline's own supersede path, so it is guaranteed to
+    # show up here -- and NTFS/iterdir hands back names in alphabetical order,
+    # where "...revA.superseded-20260903.xlsx" sorts BEFORE "...revA.xlsx".
+    # ⚠ 2026-09-23, measured: that is exactly why Forbes (NSW113) had been
+    # cross-checked against a retired DLV -- its folder holds 3 files and the
+    # OLDEST retired one won. Every rev/status verdict for that project was
+    # computed against the wrong table, and nothing ever said so.
+    # ⚠ Word boundaries are load-bearing, and bare 'old' is NOT in this list.
+    #   Measured 2026-09-23: without them this pattern also excluded
+    #   'GREEN GOLD ENERGY DLV', 'Threshold Design List' and 'Holder Schedule'
+    #   -- it would silently drop a live DLV whose name contains the company's
+    #   own name, and the caller would then fall through to 'any xlsx' or None
+    #   with no error. A filter that hides the file it was meant to protect is
+    #   worse than the bug it fixes.
+    _RE_RETIRED = re.compile(r'\.superseded[-.]|\bsuperse?e?ded\b|\bobsolete\b',
+                             re.IGNORECASE)
+
     def _find_excel_in_folder(self, folder: Path) -> Optional[Path]:
-        """Find a deliverable Excel in a specific folder."""
+        """Find the CURRENT deliverable Excel in a folder.
+
+        Never trust directory order for "which one is current" -- filter the
+        retired copies out first, then pick by revision (highest wins), falling
+        back to mtime only to break a tie. Revision comes from the shared
+        `register_membership` rule, not a local regex.
+        """
         if not folder.exists():
             return None
-        # Priority 1: filename contains 'dlv' or 'deliverable'
-        for f in folder.iterdir():
-            if f.is_file() and f.suffix.lower() in ('.xlsx', '.xlsm') and not f.name.startswith('~$'):
-                if 'dlv' in f.name.lower() or 'deliverable' in f.name.lower():
-                    return f
-        # Priority 2: any xlsx that isn't a temp file
-        for f in folder.iterdir():
-            if f.is_file() and f.suffix.lower() in ('.xlsx', '.xlsm') and not f.name.startswith('~$'):
-                return f
+
+        def _cands(named_only: bool):
+            out = []
+            for f in folder.iterdir():
+                if not (f.is_file() and f.suffix.lower() in ('.xlsx', '.xlsm')):
+                    continue
+                if f.name.startswith('~$') or self._RE_RETIRED.search(f.stem):
+                    continue
+                if named_only and not ('dlv' in f.name.lower()
+                                       or 'deliverable' in f.name.lower()):
+                    continue
+                out.append(f)
+            return out
+
+        def _key(f: Path):
+            try:
+                import register_membership as _rmm
+                ms = list(_rmm._RE_REV.finditer(f.stem))
+                rev = ms[-1].group(2).upper() if ms else ''
+            except Exception:
+                rev = ''
+            rank = (2, int(rev)) if rev.isdigit() else ((1, ord(rev[0]) - 64) if rev else (0, 0))
+            try:
+                mt = to_long_path(f).stat().st_mtime
+            except OSError:
+                mt = 0.0
+            return (rank, mt)
+
+        for named_only in (True, False):     # Priority 1: named DLV; 2: any xlsx
+            c = _cands(named_only)
+            if c:
+                return max(c, key=_key)
         return None
 
     def detect_layout(self, ws) -> DeliverableLayout:

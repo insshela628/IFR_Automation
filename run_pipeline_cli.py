@@ -12,6 +12,12 @@ Usage:
   python run_pipeline_cli.py --list
   python run_pipeline_cli.py "<keyword>"            # dry-run preview (safe)
   python run_pipeline_cli.py "<keyword>" --execute  # real run (moves files → Superseded/)
+  python run_pipeline_cli.py "<keyword>" --stages deliverable asbuilt_version   # subset
+
+Stage subset (`--stages`): `PipelineOrchestrator` has always accepted a `stages`
+list; only this CLI never exposed it. Note it is a MEMBERSHIP FILTER, not a
+sequence -- run_pipeline checks `if 'x' in self.stages` in a hardcoded order, so
+you can choose WHICH stages run but never their order.
 
 Output: human-readable progress to stdout; last line is a machine marker
   RESULT_JSON: {...}   (parsed by drag_window)
@@ -45,6 +51,14 @@ from ifr_automation_v10 import (  # engine only — no telegram/apscheduler
 )
 
 
+# Mirror of PipelineOrchestrator's default stage list (ifr_automation_v10.py).
+# Kept here only to VALIDATE --stages input; the engine remains the SSOT for the
+# order and for what each stage does. A stage added there and not here is simply
+# not selectable from this CLI -- it never silently runs the wrong thing.
+_VALID_STAGES = ["health_check", "ifr_sync", "version_mgmt", "ifc_transmittal",
+                 "asbuilt_version", "sharepoint_sync", "deliverable"]
+
+
 def _get_config() -> ConfigManager:
     return ConfigManager(config_path=_HERE / "config.json")
 
@@ -70,13 +84,29 @@ def _find(projects, keyword):
 
 def _emit(status, **extra):
     """Final machine-readable marker for drag_window."""
-    print("RESULT_JSON: " + json.dumps({"status": status, **extra}, ensure_ascii=False))
+    print("RESULT_JSON: " + json.dumps({"status": status, **extra},
+                                       ensure_ascii=False, default=str))
 
 
 def main(argv):
     args = [a for a in argv if a]
     execute = "--execute" in args
     do_list = "--list" in args
+    # --stages s1 s2 ... : everything after the flag until the next --flag.
+    stages = None
+    if "--stages" in args:
+        i = args.index("--stages")
+        stages = []
+        for a in args[i + 1:]:
+            if a.startswith("--"):
+                break
+            stages.append(a)
+        bad = [s for s in stages if s not in _VALID_STAGES]
+        if bad or not stages:
+            print(f"[ERROR] --stages 取值不合法: {bad or '(空)'}; 可选: {' '.join(_VALID_STAGES)}")
+            _emit("error", message="bad stages", bad=bad)
+            return 2
+        args = args[:i] + [a for a in args[i + 1 + len(stages):]]
     kw = " ".join(a for a in args if not a.startswith("--")).strip()
 
     try:
@@ -115,12 +145,15 @@ def main(argv):
     print("=" * 60)
     print(f"  IFR Pipeline — {mode}")
     print(f"  项目: {project.project_name}")
+    if stages:
+        print(f"  Stages: {' '.join(stages)}  (子集; 顺序由引擎写死, 此处只选不排)")
     print(f"  路径: {project.project_path}")
     print("=" * 60)
     sys.stdout.flush()
 
     try:
-        pipeline = PipelineOrchestrator(_get_config(), dry_run=not execute)
+        pipeline = PipelineOrchestrator(_get_config(), dry_run=not execute,
+                                        stages=stages)
         result = pipeline.run_pipeline(Path(project.project_path), project)
     except Exception as e:
         import traceback
@@ -138,7 +171,11 @@ def main(argv):
 
     print("\n" + ("=" * 60))
     print("  ✓ 完成" + ("" if execute else " (预览，未改动文件)"))
-    _emit("ok", project=project.project_name, dry_run=not execute)
+    # `result` carries every stage's structured counts. Emitting it lets an
+    # unattended caller (auto_drain patrol slot) build its own verdicts without
+    # scraping the human-readable stdout above.
+    _emit("ok", project=project.project_name, dry_run=not execute,
+          stages=stages or _VALID_STAGES, result=result)
     return 0
 
 
