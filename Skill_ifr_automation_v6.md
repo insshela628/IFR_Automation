@@ -315,6 +315,16 @@ Fallback: `IFR_internal` 不存在时回退到 `IFR(Client)/1.Drawing`
 - **修复**: `archive_approved_in_ifr_client()` 检查 Sharepoint 审批状态，反向归档 IFR(Client) 中的文件
 - **规则**: 任何双向镜像关系，必须同时实现 outbound sync 和 inbound feedback
 
+### 10.7 IFC 出图 Runbook（GG38 Waterloo 2026-10-20 复盘，脚本不改，只靠驱动）
+驱动脚本存档: `project-notes/Waterloo/ifc_run_2026-10/`（换项目只改顶部 P/JOBS）。顺序 = 一次跑完不返工:
+1. **JOBS 显式清单**（doc_id, IFR描述, 源DWG, rev）: 源来自已批 TSMT 清单, foundation C-PLN 的 DWG 在 C-RPT 报告夹。别让 regex 自己找（002-1/2/3 会塌成 002）→ `ifc_phaseB.py`。
+2. **转前预检**（只读, 省掉事后修）: `rev_audit.py` 查修订表 — ①有 DATE/DESC 但 REV 空 → `tb_fix.py`; ②表已满 → 工具静默不加 IFC 行, 转后用 `fix_ifc4.py roll`（按日期排序丢最老, 同 AS BUILT 规则）; ③图号含 `00X` 先定号。`fix_inspect.py` 查旧印章块（A$C* 含 FOR INFORMATION 工具不删）。
+3. **路径 >250 字符**: md5 命名 junction（`ifcj_<md5(parent)[:8]>`）, 别用截断名（会撞）。
+4. **转后 QA 两层都要**: `ifc_qa.py`（页数 vs 批准版, 每页 FOR CONSTRUCTION, 无 FOR REVIEW）只看文本; 旧印章残留/印章压内容只有**看图**才抓得到 → 每张渲右下角裁图过目。
+5. **多余页**: 工具出全部 layout, 页数 > 批准版 → `ifc_trim.py`（按像素相似度留批准页, 原件进 SS）。
+6. **对外写入**: Sharepoint 2.IFC 直接拷 4.IFC 顶层（不跑 dedup）→ DLV `dlv_ifc_apply.py`（报告/Schedule 传 revision=None: scan regex 读不出 `_RevA-Approved`, 否则写成 0）→ `ifr_archive.py` 先 dry-run 数量=批准件数再 `--apply` → `build_tsmt02.py`（To/Attention 留给 PM 填）。
+工具已知缺口（未改脚本）: 印章短语缺 FOR INFORMATION · 满表跳过 IFC 行 · COLOUR 重叠只跳 COLOUR · `Rev?-Approved` rev 解析为 0 · 002-n 塌号。
+
 ---
 
 ## 十一、Issue Register Responder Assignment (独立模块，非 Pipeline 阶段)
