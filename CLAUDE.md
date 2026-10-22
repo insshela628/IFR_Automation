@@ -76,6 +76,7 @@ for lname in layout_names:
 
 ### IFC Revision History
 - `preserve_ifr=True` **(default for ALL projects)**: KEEP all existing IFR revision rows, add IFC row AFTER the last IFR row. **Idempotent**: if an IFC row already exists (DESCRIPTION contains "CONSTRUCTION"), overwrite it in-place instead of appending a new row. Clean up any duplicate IFC rows above target_row (from previous bug).
+- **Full table roll** (`_roll_rev_rows`): if the frame has fewer rev rows than `REV_ROWS` and all are used (GG38 009: 4 rows, designer reused slots D,C,F,E), sort rows by DATE, drop the oldest, IFC row last. Without it the write targets a missing `5REV` tag and silently does nothing (IFC shipped with no row 0).
 - `preserve_ifr=False`: Rev0 clears all IFR rows. Rev1+ keeps existing IFC rows. Use for clean IFC-only revision tables. Currently no project uses this.
 - **CRITICAL**: `_update_title_block()` must be idempotent — calling it multiple times on the same title block must produce the same result as calling it once. This prevents duplicate "FOR CONSTRUCTION" rows when `_find_all_title_blocks()` returns the same entity twice or when conversion is re-run.
 
@@ -108,6 +109,7 @@ for lname in layout_names:
   3. `has_colour=False` + no overlap → draw COLOUR box (rect + MText "DRAWINGS TO BE PRINTED IN COLOUR")
   4. (checked before 2/3) frame-baked COLOUR note **BLOCK** just above the slot (`_align_colour_note_block`, identified by baked text) → move it to line up with FOR CONSTRUCTION (same right edge, `_REF_COLOUR_GAP` above) and draw FOR CONSTRUCTION at the block's border width. The MText scan can't see block-baked text, so before this the zone read as overlap and the block stayed unaligned (GG38 Waterloo).
 - **Border weight**: IFC default `ConstantWidth = 2.0*scale` on every sheet, so single-stamp sheets look like the 2-stamp ones (AsBuilt keeps its own `_STAMP_CW`).
+- **Text clearance** (`_stamp_text_clearance`): PaperSpace TEXT/MTEXT dipping into the FC rect from ABOVE → shift stamp (and COLOUR box) down just enough, cap rect_h/2; else print ⚠ and leave it. Needed because SHX note text is glyph strokes in the PDF → raster QA can't see it (GG38 C-PLN-009 note 18).
 - `_scan_has_colour(doc)`: **Two-pass scan** — Pass A: SelectionSet MTEXT in ModelSpace (safe for 400K+), Pass B: direct iteration of each PaperSpace layout. Fixes COULOUR→COLOUR typos in-place. MUST search both spaces — SelectionSet mode 5 only searches active space, PaperSpace COLOUR MText is invisible to it.
 - `_check_colour_overlap(doc, ..., layout_name=None)`: When layout_name is PaperSpace, iterates layout block directly (bounding box overlap check). When ModelSpace, uses SelectionSet crossing window (mode 1) with ±15 unit expansion. Skips IFC_STAMP/DEFPOINTS/ASHADE layers and viewports.
 - `_ensure_colour_has_border(doc, ...)`: When `has_colour=True`, checks if existing COLOUR MText has an enclosing rectangle. If not, draws one at calculated stamp position on IFC_STAMP layer. Called from both IFCStampMixin and AsBuiltManager `_stamp_via_com_draw`.
@@ -144,6 +146,13 @@ for lname in layout_names:
 - User can force re-conversion via `force_doc_ids` or bot "强制重转" button
 - **When code changes require re-export**: use "强制重转" for affected doc-IDs, or delete old PDFs from `4. IFC(Client)/`
 - **Failure mode if ignored**: files get re-converted unnecessarily, or incomplete conversions get skipped
+
+### IFC Freshness (latest wins, automatic — PM 2026-10-22)
+- `ifc_source.json` (8. Deliverables/Transmittal) records per doc_key (doc-ID + sheet suffix, `_doc_key`) the IFR PDF each IFC came from: rev letter + size + mtime. Written by `convert_to_ifc` on success.
+- `ifc_stale_reason()`: stale if 2. IFR_internal has a newer letter rev, or the same letter re-saved with different content (GG38 017 RevA edited in place). No record → fallback: IFR mtime > IFC PDF mtime. **Never IFC-vs-IFR mtime as the primary test** — republishing an old IFC refreshes its mtime (GG38 009 RevE IFC looked newer than RevF).
+- Used by `_check_incremental` (stale → reconvert; never-transmitted IFC keeps its rev, old DWG/PDF → SS/*.pre-Rev<X>) and `_sync_ifc_files_to_sharepoint` (stale PDF is NOT synced, logged as error).
+- `refresh_approved_to_latest()` (Stage 5, before sync): every `Approved to IFC` (IFR(Client) + Client Sharepoint) holds the latest IFR of each approved doc; old copy → `3. IFR(Client)/<sub>/Approved to IFC/SS/`, nothing created on the client side. Letter revs only. IFC never delivered (not in `transmitted_files`) → old rev RETIRES: no `-Approved` tag kept in SS (identical duplicate removed); delivered → old `-Approved` kept as record.
+- Stamp nudge (`_glyph_nudge_down`, raster path): SHX glyph strokes straddling the stamp group's top edge → shift group down (re-check each step, cap half box height, must clear TB) before the two-corner mirror. Coleambally2 85 PDFs: 0 hits.
 
 ### Doc-ID Matching (FILE NO vs FILE NAME)
 - **Rule**: Match by FILE NO (doc-ID) only, even if FILE NAME (description part) is inaccurate or different

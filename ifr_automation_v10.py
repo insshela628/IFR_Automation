@@ -1763,6 +1763,90 @@ class IFRAutomation:
 
         return result
 
+    def refresh_approved_to_latest(self, project_path: Path) -> Dict[str, int]:
+        """Approved to IFC always holds the LATEST IFR of each approved doc (PM rule 2026-10-22).
+
+        Replaced when the IFR source (drawings: 2. IFR_internal; reports: IFR(Client)/2.Reports)
+        has a newer letter rev, or the same letter re-saved with different content:
+          IFR(Client)/<sub>/Approved to IFC        old → Approved to IFC/SS/, new copied in
+          Client Sharepoint/<sub>/Approved to IFC  old → the internal SS above, new as <stem>-Approved.pdf
+        Numeric revs (Rev1/Rev2 schedules) have no letter rev → untouched.
+        IFC never delivered (not in ifc_state transmitted_files) → the old rev RETIRES: its
+        '-Approved' tag is dropped in SS, and a byte-identical duplicate is removed (PM 10-22:
+        still in Transmittal 01 → no "RevE approved" record). Delivered → old -Approved kept.
+        """
+        import filecmp
+        sent = {_doc_key(n) for n in IFCTransmittalManager(project_path, dry_run=True)
+                .get_last_run_state().get('transmitted_files', [])}
+        result = {"refreshed": 0, "errors": [], "details": []}
+        eng = project_path / "Design/Engineering"
+        ifr_client_base = eng / "1. Drawings/3. IFR(Client)"
+        sharepoint_base = eng / "13. Client Sharepoint/1.IFR"
+        pairs = [(eng / "1. Drawings/2. IFR_internal", "1.Drawing", "2.Drawing"),
+                 (ifr_client_base / "2.Reports", "2.Reports", "1.Report")]
+
+        for source_dir, ifr_sub, sp_sub in pairs:
+            int_dir = self._to_long_path(ifr_client_base / ifr_sub / "Approved to IFC")
+            sp_dir = self._to_long_path(sharepoint_base / sp_sub / "Approved to IFC")
+            if not source_dir.exists() or not (int_dir.exists() or sp_dir.exists()):
+                continue
+            latest = _latest_ifr_pdfs(project_path) if ifr_sub == "1.Drawing" else {}
+            if ifr_sub != "1.Drawing":
+                for f in self._to_long_path(source_dir).iterdir():
+                    if (f.is_file() and f.suffix.lower() == '.pdf' and not f.name.startswith('~$')
+                            and not _RE_APPROVED_SUFFIX.search(f.stem)):
+                        k, rev = _doc_key(f.name), _letter_rev(f.stem)
+                        if k and rev and (k not in latest or rev > _letter_rev(latest[k].stem)):
+                            latest[k] = f
+
+            ss_dir = int_dir / "SS"
+            for appr_dir, suffix in ((int_dir, ''), (sp_dir, '-Approved')):
+                if not appr_dir.exists():
+                    continue
+                for f in [x for x in appr_dir.iterdir() if x.is_file() and x.suffix.lower() == '.pdf']:
+                    k, old_rev = _doc_key(f.name), _letter_rev(f.stem)
+                    src = latest.get(k) if k else None
+                    if not src or not old_rev:
+                        continue
+                    new_rev = _letter_rev(src.stem)
+                    resaved = (new_rev == old_rev and src.stat().st_size != f.stat().st_size
+                               and src.stat().st_mtime > f.stat().st_mtime + 2)
+                    if new_rev < old_rev or (new_rev == old_rev and not resaved):
+                        continue
+                    new = appr_dir / (src.stem + suffix + src.suffix)
+                    why = "同版本原地修改" if resaved else f"Rev{old_rev}→Rev{new_rev}"
+                    msg = f"Approved to IFC 换新({sp_sub if suffix else ifr_sub}, {why}): {f.name} → {new.name}"
+                    result["details"].append(msg)
+                    if self.dry_run:
+                        print(f"    [预览] {msg}")
+                        result["refreshed"] += 1
+                        continue
+                    try:
+                        ss_dir.mkdir(parents=True, exist_ok=True)
+                        retire = suffix and k not in sent
+                        bak = ss_dir / (_RE_APPROVED_SUFFIX.sub('', f.stem) + f.suffix if retire else f.name)
+                        if retire and bak.exists() and filecmp.cmp(str(f), str(bak), shallow=False):
+                            f.unlink()  # identical retired copy already in SS
+                        else:
+                            if bak.exists():
+                                bak = ss_dir / f"{bak.stem}.{datetime.now():%Y%m%d%H%M%S}{f.suffix}"
+                            shutil.move(str(f), str(bak))  # old out first: new may share its name
+                        try:
+                            shutil.copy2(str(src), str(new))
+                            if new.stat().st_size != src.stat().st_size:
+                                raise OSError(f"copy size mismatch {new.name}")
+                        except Exception:
+                            if not f.exists() and bak.exists():
+                                shutil.copy2(str(bak), str(f))
+                            raise
+                        self.logger.info(msg)
+                        print(f"    {msg}")
+                        result["refreshed"] += 1
+                    except Exception as e:
+                        self.logger.error(f"Approved to IFC 换新失败: {f.name} - {e}")
+                        result["errors"].append(f"{f.name}: {e}")
+        return result
+
     def sync_to_sharepoint(self, project_path: Path) -> Dict[str, int]:
         """Sync files to Client Sharepoint for files not yet approved or present.
 
@@ -1785,6 +1869,10 @@ class IFRAutomation:
         archive_result = self.archive_approved_in_ifr_client(project_path)
         result["archived"] = archive_result["archived"]
         result["errors"].extend(archive_result.get("errors", []))
+        # Step 0b: Approved to IFC → latest IFR rev (so newer revs replace, not queue as pending IFR)
+        refresh_result = self.refresh_approved_to_latest(project_path)
+        result["refreshed"] = refresh_result["refreshed"]
+        result["errors"].extend(refresh_result["errors"])
 
         # Mapping: (source_path_relative, sharepoint_subfolder, ifr_client_subfolder_for_approved_check)
         # Drawing: source = IFR_internal (version-managed); also check IFR(Client)/1.Drawing/Approved to IFC
@@ -4514,8 +4602,14 @@ class IFCTransmittalManager:
             if not self.ifc_dir.exists():
                 continue
             synced = 0
+            _latest, _srcs = _latest_ifr_pdfs(self.project_path), _ifc_source_load(self.project_path)
             for pdf in self.ifc_dir.glob("*.pdf"):
                 if pdf.name.startswith('~$'):
+                    continue
+                why = ifc_stale_reason(self.project_path, pdf, _latest, _srcs)
+                if why:
+                    self.logger.error(f"IFC 已过期, 不同步: {pdf.name} ({why})")
+                    print(f"    ✗ IFC 已过期, 不同步到 {rel_target}: {pdf.name} ({why})")
                     continue
                 dest = target_dir / pdf.name
                 # Only copy if newer or different size (idempotent)
@@ -5228,6 +5322,55 @@ class IFCStampMixin:
 
         return has_colour
 
+    def _stamp_text_clearance(self, doc, layout_name, left, right, bottom, top, rect_h, scale):
+        """Downward shift (0 = none) that clears PaperSpace TEXT/MTEXT overlapping the stamp rect.
+
+        Only text entering from ABOVE is handled (bottom edge inside the rect, top above
+        its middle); the shift is capped at rect_h/2 so the stamp stays in the corner.
+        ModelSpace-through-viewport content is out of scope (see P2 note).
+        """
+        if not layout_name or layout_name.lower() == 'model':
+            return 0.0
+        own = getattr(self, '_STAMP_OWN_WORDS', ('FOR', 'CONSTRUCTION', 'REVIEW'))
+        hits = []
+        try:
+            for layout in doc.Layouts:
+                if layout.Name != layout_name:
+                    continue
+                block = layout.Block
+                for i in range(block.Count):
+                    try:
+                        e = block.Item(i)
+                        if e.EntityName not in ('AcDbText', 'AcDbMText') \
+                                or e.Layer.upper() == self.STAMP_LAYER.upper():
+                            continue
+                        mn, mx = e.GetBoundingBox()
+                        if not (mn[0] < right and mx[0] > left and mn[1] < top and mx[1] > bottom):
+                            continue
+                        txt = self._strip_mtext_formatting(e.TextString or '').upper()
+                        toks = txt.replace(',', ' ').split()
+                        if not toks or all(t in own for t in toks) \
+                                or (('COLOUR' in txt or 'COLOR' in txt) and 'PRINT' in txt):
+                            continue
+                        hits.append((float(mn[1]), float(mx[1]), txt[:40]))
+                    except Exception:
+                        continue
+                break
+        except Exception:
+            return 0.0
+        if not hits:
+            return 0.0
+        mid = (bottom + top) / 2.0
+        if any(hi < mid for _, hi, _ in hits):
+            print(f"    印章: ⚠ 与图纸空间文字重叠(非上方压入), 未自动避让: {[h[2] for h in hits]}")
+            return 0.0
+        dy = top - min(lo for lo, _, _ in hits) + 1.0 * scale
+        if dy > rect_h / 2.0:
+            print(f"    印章: ⚠ 与上方文字重叠 {dy:.1f} > 上限 {rect_h / 2.0:.1f}, 未自动避让: {[h[2] for h in hits]}")
+            return 0.0
+        print(f"    印章: 上方文字压入 → 下移 {dy:.2f} 避让: {[h[2] for h in hits]}")
+        return dy
+
     def _check_colour_overlap(self, doc, stamp_left, stamp_right,
                               colour_bottom, colour_top, layout_name=None):
         """Check if the COLOUR stamp area overlaps with existing entities.
@@ -5729,6 +5872,16 @@ class IFCStampMixin:
         stamp_left_x = stamp_right_x - rect_w
         stamp_bottom_y = tb_bottom_y + y_bottom_offset
         stamp_top_y = stamp_bottom_y + rect_h
+
+        # PaperSpace note text grazing the stamp TOP (GG38 C-PLN-009 note 18): the
+        # raster QA can't see it (SHX text = glyph strokes, no PDF words), so check
+        # the real TEXT/MTEXT entities here. If they dip into the rect from above,
+        # shift the stamp down just enough (cap: half its height); else warn.
+        _dy = self._stamp_text_clearance(doc, layout_name, stamp_left_x, stamp_right_x,
+                                         stamp_bottom_y, stamp_top_y, rect_h, scale)
+        if _dy:
+            stamp_bottom_y -= _dy
+            stamp_top_y -= _dy
 
         # MText centered in rectangle
         mtext_x = (stamp_left_x + stamp_right_x) / 2.0
@@ -6472,6 +6625,30 @@ class IFCManager(IFCStampMixin):
                     return info
         return {}
 
+    def _roll_rev_rows(self, attrs, n_rows, ifc_rev, personnel, date_str, suffixes):
+        """Full revision table: keep the newest n_rows-1 IFR rows (by DATE, then rev),
+        rewrite them oldest→newest into rows 1..n-1 and put the IFC row in row n."""
+        g = lambda k: self._safe_get_text(attrs[k]).strip() if k in attrs else ''
+
+        def _key(r):
+            try:
+                d = datetime.strptime(r.get('DATE', ''), '%d/%m/%y')
+            except ValueError:
+                d = datetime.min
+            return (d, r.get('REV', ''))
+        rows = [{s: g(f"{n}{s}") for s in suffixes} for n in range(1, n_rows + 1)]
+        rows = sorted((r for r in rows if r.get('REV')), key=_key)
+        new = {s: personnel.get(s.lower(), '') for s in self.PERSONNEL_TAGS}
+        new.update(REV=str(ifc_rev), DATE=date_str, DESCRIPTION='FOR CONSTRUCTION')
+        rows = (rows + [new])[-n_rows:]
+        for n in range(1, n_rows + 1):
+            r = rows[n - 1] if n <= len(rows) else {}
+            for s in suffixes:
+                if f"{n}{s}" in attrs:
+                    self._safe_set_text(attrs[f"{n}{s}"], r.get(s, ''))
+        print(f"    标题栏: 修订表已满({n_rows}行) → 按日期滚动: "
+              + " | ".join(r.get('REV', '') for r in rows))
+
     def _update_title_block(self, attrs: Dict, ifc_rev: int, personnel: Dict, date_str: str):
         """Update title block attributes for IFC conversion.
 
@@ -6510,6 +6687,13 @@ class IFCManager(IFCStampMixin):
                 target_row = existing_ifc_row
             else:
                 target_row = last_ifr_row + 1
+            # Table FULL (frame has fewer rows than REV_ROWS, e.g. GG38 009 = 4): writing
+            # row N+1 would silently hit a missing tag. Roll instead: rows by date (designers
+            # reuse slots cyclically: D,C,F,E), drop the oldest, IFC row last.
+            n_rows = max([int(k[:-3]) for k in attrs if k.endswith('REV') and k[:-3].isdigit()] or [0])
+            if existing_ifc_row == 0 and n_rows and target_row > n_rows:
+                self._roll_rev_rows(attrs, n_rows, ifc_rev, personnel, date_str, all_suffixes)
+                return
         elif ifc_rev == 0:
             # Clear all IFR history rows (Tatua behavior)
             for row_num in range(1, self.REV_ROWS + 1):
@@ -7196,6 +7380,15 @@ class IFCManager(IFCStampMixin):
             if pdf_ok:
                 result['pdf_path'] = str(ifc_pdf_path)
                 result['success'] = True
+                try:  # freshness provenance: which IFR this IFC came from
+                    _k = _doc_key(Path(dwg_path).name) or doc_id.upper()
+                    _src = _latest_ifr_pdfs(self.project_path).get(_k)
+                    if _src is not None and _letter_rev(_src.stem) != str(dwg_info['latest_ifr_rev']).upper():
+                        _src = None
+                    _ifc_source_record(self.project_path, _k, _src, str(dwg_info['latest_ifr_rev']).upper(),
+                                       Path(ifc_pdf_path).name)
+                except Exception as _e_src:
+                    print(f"    ⚠ IFC 来源记录失败: {_e_src}")
                 # Stamp-overlap auto-fix — same cure as the AS BUILT path, now
                 # milestone-agnostic: if the FOR CONSTRUCTION / COLOUR box lands on
                 # content only visible in the published PDF (e.g. through a
@@ -8605,6 +8798,91 @@ def _extract_doc_id_standalone(filename: str, allow_fallback: bool = True) -> Op
     return None
 
 
+# ── IFC freshness (PM 2026-10-22: GG38 009/005/006/017 IFCs went stale unnoticed) ──
+# Each IFC records the IFR PDF it was converted from (rev + size + mtime) in
+# 8. Deliverables/Transmittal/ifc_source.json. Before re-conversion is skipped or an
+# IFC is synced to the client, compare with the CURRENT latest IFR in 2. IFR_internal:
+# newer rev letter, or same letter re-saved with different content → stale.
+# IFC-vs-IFR mtime alone is NOT the test (republishing an old IFC refreshes its mtime);
+# it is only the fallback when no source record exists.
+_IFC_SOURCE_REL = "Design/Engineering/8. Deliverables/Transmittal/ifc_source.json"
+_IFR_INTERNAL_REL = "Design/Engineering/1. Drawings/2. IFR_internal"
+
+
+def _letter_rev(stem: str) -> str:
+    m = _RE_IFR_FILE.search(_RE_APPROVED_SUFFIX.sub('', stem))
+    return m.group(1).upper() if m else ''
+
+
+def _doc_key(name: str) -> Optional[str]:
+    """doc-ID + sheet suffix: 002-1 / 002-2 / 002-3 are different drawings."""
+    did = _extract_doc_id_standalone(name)
+    if not did:
+        return None
+    i = name.upper().find(did.upper())
+    m = re.match(r'-\d+(?=[_\s.])', name[i + len(did):]) if i >= 0 else None
+    return (did + (m.group(0) if m else '')).upper()
+
+
+def _latest_ifr_pdfs(project_path: Path) -> Dict[str, Path]:
+    """{doc_key: newest-letter-rev PDF} from the top level of 2. IFR_internal."""
+    latest: Dict[str, Path] = {}
+    d = to_long_path(Path(project_path) / _IFR_INTERNAL_REL)
+    try:
+        for f in d.iterdir():
+            if (f.is_file() and f.suffix.lower() == '.pdf' and not f.name.startswith('~$')
+                    and not _RE_APPROVED_SUFFIX.search(f.stem)):
+                k, rev = _doc_key(f.name), _letter_rev(f.stem)
+                if k and rev and (k not in latest or rev > _letter_rev(latest[k].stem)):
+                    latest[k] = f
+    except (OSError, PermissionError):
+        pass
+    return latest
+
+
+def _ifc_source_load(project_path: Path) -> Dict:
+    p = to_long_path(Path(project_path) / _IFC_SOURCE_REL)
+    try:
+        with open(str(p), encoding='utf-8') as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def _ifc_source_record(project_path: Path, key: str, ifr_pdf: Optional[Path], rev: str, ifc_pdf_name: str):
+    data = _ifc_source_load(project_path)
+    st = ifr_pdf.stat() if ifr_pdf and ifr_pdf.exists() else None
+    data[key] = {'rev': rev, 'ifr_pdf': ifr_pdf.name if ifr_pdf else None,
+                 'size': st.st_size if st else None, 'mtime': st.st_mtime if st else None,
+                 'ifc_pdf': ifc_pdf_name, 'at': datetime.now().isoformat(timespec='seconds')}
+    p = to_long_path(Path(project_path) / _IFC_SOURCE_REL)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(str(p), 'w', encoding='utf-8') as fh:
+        json.dump(data, fh, indent=2, ensure_ascii=False, sort_keys=True)
+
+
+def ifc_stale_reason(project_path: Path, ifc_pdf: Path, latest: Optional[Dict] = None,
+                     sources: Optional[Dict] = None) -> Optional[str]:
+    """None = fresh (or no IFR to compare); else a one-line reason the IFC is stale."""
+    key = _doc_key(ifc_pdf.name)
+    latest = _latest_ifr_pdfs(project_path) if latest is None else latest
+    src = latest.get(key) if key else None
+    if not src:
+        return None
+    rec = (_ifc_source_load(project_path) if sources is None else sources).get(key)
+    new_rev, st = _letter_rev(src.stem), src.stat()
+    if rec:
+        if new_rev > (rec.get('rev') or ''):
+            return f"源 Rev{rec.get('rev')} → 现有 Rev{new_rev}"
+        if new_rev == rec.get('rev') and rec.get('size') is not None and (
+                st.st_size != rec['size'] or st.st_mtime > rec['mtime'] + 2):
+            return f"Rev{new_rev} 原地修改过 ({datetime.fromtimestamp(st.st_mtime):%m-%d %H:%M})"
+        return None
+    if st.st_mtime > ifc_pdf.stat().st_mtime + 2:  # no record: timestamp fallback
+        return f"无来源记录; IFR Rev{new_rev} ({datetime.fromtimestamp(st.st_mtime):%m-%d %H:%M}) 晚于 IFC"
+    return None
+
+
 class FileHealthChecker:
     """Scan project folders for anomalous files that need attention.
 
@@ -9302,6 +9580,11 @@ class ApprovedIFCManager(IFCStampMixin):
                     continue
                 f_doc_id = _extract_doc_id_standalone(f.name)
                 if f_doc_id and f_doc_id.upper() == doc_id.upper():
+                    why = ifc_stale_reason(self.project_path, f)
+                    if why:
+                        dwg_info['stale_ifc'] = (f, why)
+                        print(f"    {doc_id}: IFC 已过期({why}) → 重新转换")
+                        return False
                     return True
 
         return False
@@ -9452,6 +9735,27 @@ class ApprovedIFCManager(IFCStampMixin):
                 print(f"    [{idx}/{len(result['native_mapped'])}] {doc_id}: "
                       f"跳过(IFC PDF 已存在且为最新)")
                 continue
+
+            # Stale IFC never sent to the client → regenerate at the same rev (backup old first)
+            if dwg_info.get('stale_ifc') and dwg_info.get('existing_ifc_rev') is not None:
+                _old_pdf = dwg_info['stale_ifc'][0]
+                _sent = set(IFCTransmittalManager(self.project_path, dry_run=True)
+                            .get_last_run_state().get('transmitted_files', []))
+                if _old_pdf.name not in _sent:
+                    _old_dwg = dwg_info['folder'] / (_old_pdf.stem + '.dwg')
+                    _tag = f".pre-Rev{dwg_info['latest_ifr_rev']}"
+                    if not self.dry_run:
+                        for _f in (_old_dwg, _old_pdf):
+                            if _f.exists():
+                                (_f.parent / 'SS').mkdir(exist_ok=True)
+                                _bk = _f.parent / 'SS' / (_f.stem + _tag + _f.suffix)
+                                if _f.suffix.lower() == '.dwg':
+                                    shutil.move(str(to_long_path(_f)), str(to_long_path(_bk)))
+                                else:
+                                    shutil.copy2(str(to_long_path(_f)), str(to_long_path(_bk)))
+                    dwg_info['existing_ifc_rev'] = (dwg_info['existing_ifc_rev'] - 1
+                                                    if dwg_info['existing_ifc_rev'] > 0 else None)
+                    print(f"    {doc_id}: 未发出过的 IFC → 同版本重出, 旧件备份 SS/*{_tag}.*")
 
             # Cleanup old DWGs
             cleaned = self._cleanup_native_folder(dwg_info)
@@ -12871,6 +13175,17 @@ class AsBuiltManager(IFCManager):
                 # avoid). Geometry-only ⇒ colour-/project-agnostic; the same
                 # _stamp_overlaps_content / _rect_hits_tb the QA gate uses vet each
                 # candidate, so the relocator can never pick a spot QA rejects.
+                # Text line pressed into the group's TOP edge from above (SHX notes =
+                # glyph strokes, invisible to the word/cell/through-line signals;
+                # GG38 C-PLN-009 note 18): nudge the group DOWN just enough, staying
+                # in the home corner, before considering the mirror corner.
+                ndy = self._glyph_nudge_down(page, boxes, tb_box)
+                if ndy:
+                    out[pi] = {'dx': 0.0, 'dy': ndy, 'forced': False,
+                               'scale_ref_h': max(b.height for b in boxes),
+                               'scale_ref_w': gx1 - gx0, 'boxes': tuple(boxes)}
+                    continue
+
                 home_bad = (self._stamp_overlaps_content(page, boxes)
                             or self._rect_hits_tb(boxes, tb_box))
                 if not home_bad:
@@ -12897,6 +13212,36 @@ class AsBuiltManager(IFCManager):
         finally:
             doc.close()
         return out
+
+    def _glyph_nudge_down(self, page, boxes, tb_box):
+        """PDF dy (>0 = down) that clears small unfilled glyph strokes straddling the
+        stamp group's top edge, or 0. Re-checks after each step (lower strokes of the
+        same text line then straddle the new edge); cap = half the tallest box; the
+        nudged group must stay clear of the title block and other content."""
+        import fitz as _fitz
+        pw = page.rect.width
+        gx0 = min(b.x0 for b in boxes); gx1 = max(b.x1 for b in boxes)
+        gy0 = min(b.y0 for b in boxes)
+        cap = 0.5 * max(b.height for b in boxes)
+        margin = 0.1 * min(b.height for b in boxes)
+        glyphs = [dr['rect'] for dr in page.get_drawings()
+                  if dr.get('fill') is None and max(dr['rect'].width, dr['rect'].height) < pw * 0.015
+                  and dr['rect'].x1 > gx0 and dr['rect'].x0 < gx1]
+        dy = 0.0
+        for _ in range(12):
+            top = gy0 + dy
+            hit = [r for r in glyphs if r.y0 < top - 0.5 and r.y1 > top + 0.5]
+            if len(hit) < (3 if dy == 0 else 1):
+                break
+            dy = max(r.y1 for r in hit) - gy0 + margin
+            if dy > cap:
+                return 0.0
+        if not dy:
+            return 0.0
+        moved = [_fitz.Rect(b.x0, b.y0 + dy, b.x1, b.y1 + dy) for b in boxes]
+        if self._rect_hits_tb(moved, tb_box) or self._stamp_overlaps_content(page, moved):
+            return 0.0
+        return dy
 
     def _publish_layout_order(self, doc):
         """Layout names in the same order _publish_single_pdf emits PDF pages:
@@ -14854,6 +15199,8 @@ class PipelineOrchestrator:
                 parts = [f"复制={sp_result['copied']}"]
                 if sp_result.get('archived', 0) > 0:
                     parts.append(f"归档={sp_result['archived']}")
+                if sp_result.get('refreshed', 0) > 0:
+                    parts.append(f"Approved换新={sp_result['refreshed']}")
                 parts.append(f"跳过={sp_result['skipped']}")
                 parts.append(f"已审批跳过={sp_result['skipped_approved']}")
                 UIHelper.print_success(f"Sharepoint同步完成: {', '.join(parts)}")
