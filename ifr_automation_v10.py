@@ -1785,6 +1785,26 @@ class IFRAutomation:
         pairs = [(eng / "1. Drawings/2. IFR_internal", "1.Drawing", "2.Drawing"),
                  (ifr_client_base / "2.Reports", "2.Reports", "1.Report")]
 
+        # IFR_internal keeps ONE current PDF per drawing: older letter revs → Superseded/
+        # (GG38 005: RevC stayed beside RevD → IFR count 17 vs IFC 16)
+        ifr_int = self._to_long_path(eng / "1. Drawings/2. IFR_internal")
+        latest_int = _latest_ifr_pdfs(project_path)
+        if ifr_int.exists():
+            for f in [x for x in ifr_int.iterdir() if x.is_file() and x.suffix.lower() == '.pdf']:
+                k = _doc_key(f.name)
+                cur = latest_int.get(k) if k else None
+                if not cur or cur.name == f.name or not _letter_rev(f.stem)                         or _letter_rev(f.stem) >= _letter_rev(cur.stem):
+                    continue
+                dest = ifr_int / "Superseded" / f.name
+                msg = f"IFR_internal 旧版 → Superseded: {f.name} (当前 {cur.name})"
+                result["details"].append(msg)
+                if self.dry_run or dest.exists():
+                    print(f"    [{'预览' if self.dry_run else '跳过-已存在'}] {msg}")
+                    continue
+                dest.parent.mkdir(exist_ok=True)
+                shutil.move(str(f), str(dest))
+                self.logger.info(msg)
+
         for source_dir, ifr_sub, sp_sub in pairs:
             int_dir = self._to_long_path(ifr_client_base / ifr_sub / "Approved to IFC")
             sp_dir = self._to_long_path(sharepoint_base / sp_sub / "Approved to IFC")
@@ -4132,7 +4152,13 @@ class IFCTransmittalManager:
 
     def __init__(self, project_path, config=None, dry_run=False):
         self.project_path = Path(project_path)
-        self.config = config or {}
+        if config is None:  # callers like ApprovedIFCManager Step 4b pass none → sync_targets
+            try:            # was [] and IFC PDFs silently never reached Client Sharepoint
+                with open(Path(__file__).parent / "config.json", encoding="utf-8") as fh:
+                    config = json.load(fh)
+            except Exception:
+                config = {}
+        self.config = config
         self.dry_run = dry_run
         self.logger = logging.getLogger(self.__class__.__name__)
 
@@ -4170,7 +4196,9 @@ class IFCTransmittalManager:
                 continue
             if f.name.startswith('~$'):
                 continue
-            doc_id = self._extract_doc_id(f.name)
+            # doc-ID + sheet suffix: 002-1/002-2/002-3 are separate drawings, not old
+            # versions of one (GG38 10-23: Step 4b moved 002-1 & 002-2 to SS)
+            doc_id = _doc_key(f.name) or self._extract_doc_id(f.name)
             if doc_id:
                 grouped[doc_id].append(f)
         return dict(grouped)
@@ -5153,6 +5181,13 @@ class IFCStampMixin:
             except Exception:
                 pass
 
+        def _stamp_text(plain, phrases):
+            # A stamp is the phrase plus at most a few words ("FOR CONSTRUCTION REV 0").
+            # Plain substring matching deleted whole NOTES MText that merely mention it
+            # (GG38 C-PLN-017 note 2 "...AND FOR CONSTRUCTION ONLY" → notes 1-4 vanished).
+            return plain in phrases or any(p in plain and len(plain) <= 2 * len(p) + 10
+                                           for p in phrases)
+
         # Pass 2: delete legacy MText with EXACT stamp content (filtered to MTEXT only)
         # Only delete if the entire text (after stripping formatting) matches a stamp phrase.
         _STAMP_PHRASES = {'FOR CONSTRUCTION', 'ISSUED FOR REVIEW', 'FOR REVIEW',
@@ -5175,8 +5210,7 @@ class IFCStampMixin:
                     text = entity.TextString
                     if text:
                         plain = self._strip_mtext_formatting(text).upper().strip()
-                        if plain in _STAMP_PHRASES or any(
-                                p in plain for p in _STAMP_PHRASES):
+                        if _stamp_text(plain, _STAMP_PHRASES):
                             entity.Delete()
                 except Exception:
                     pass
@@ -5239,8 +5273,7 @@ class IFCStampMixin:
                                 text = entity.TextString
                                 if text:
                                     plain = self._strip_mtext_formatting(text).upper().strip()
-                                    if plain in _STAMP_PHRASES_UPPER or any(
-                                            p in plain for p in _STAMP_PHRASES_UPPER):
+                                    if _stamp_text(plain, _STAMP_PHRASES_UPPER):
                                         to_delete.append(entity)
                             except Exception:
                                 pass
@@ -6625,6 +6658,18 @@ class IFCManager(IFCStampMixin):
                     return info
         return {}
 
+    def _fix_placeholder_drgno(self, attrs, doc_id):
+        """DRAWINGNUMBER left as a template placeholder (GG38-C-PLN-00X) → the real doc-ID.
+        Only placeholder digits ('X') are replaced; sheet suffixes like 009-01 are untouched."""
+        at = attrs.get('DRAWINGNUMBER')
+        if at is None or not doc_id:
+            return
+        old = self._safe_get_text(at)
+        m = re.fullmatch(r'(\s*)([A-Z0-9]+-[A-Z]-[A-Z]{3}-)(\d*X+\d*)(\s*)', old, re.IGNORECASE)
+        if m and doc_id.upper().startswith(m.group(2).upper()):
+            self._safe_set_text(at, m.group(1) + doc_id + m.group(4))
+            print(f"    标题栏: 图号占位符 {old.strip()!r} → {doc_id}")
+
     def _roll_rev_rows(self, attrs, n_rows, ifc_rev, personnel, date_str, suffixes):
         """Full revision table: keep the newest n_rows-1 IFR rows (by DATE, then rev),
         rewrite them oldest→newest into rows 1..n-1 and put the IFC row in row n."""
@@ -7206,6 +7251,7 @@ class IFCManager(IFCStampMixin):
                 layout_name = tb_item[3] if len(tb_item) > 3 else None
                 print(f"    Sheet {tb_idx}/{len(all_tbs)}: 更新 title block + FOR CONSTRUCTION...")
                 self._update_title_block(attrs, ifc_rev, personnel, date_str)
+                self._fix_placeholder_drgno(attrs, doc_id)
                 if block_ref and space:
                     self._stamp_via_com_draw(doc, block_ref, space,
                                              has_colour=has_colour,
@@ -9749,6 +9795,8 @@ class ApprovedIFCManager(IFCStampMixin):
                             if _f.exists():
                                 (_f.parent / 'SS').mkdir(exist_ok=True)
                                 _bk = _f.parent / 'SS' / (_f.stem + _tag + _f.suffix)
+                                if _bk.exists():
+                                    _bk = _bk.with_name(f"{_bk.stem}.{datetime.now():%Y%m%d%H%M%S}{_bk.suffix}")
                                 if _f.suffix.lower() == '.dwg':
                                     shutil.move(str(to_long_path(_f)), str(to_long_path(_bk)))
                                 else:

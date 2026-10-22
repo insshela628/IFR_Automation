@@ -152,6 +152,11 @@ for lname in layout_names:
 - `ifc_stale_reason()`: stale if 2. IFR_internal has a newer letter rev, or the same letter re-saved with different content (GG38 017 RevA edited in place). No record → fallback: IFR mtime > IFC PDF mtime. **Never IFC-vs-IFR mtime as the primary test** — republishing an old IFC refreshes its mtime (GG38 009 RevE IFC looked newer than RevF).
 - Used by `_check_incremental` (stale → reconvert; never-transmitted IFC keeps its rev, old DWG/PDF → SS/*.pre-Rev<X>) and `_sync_ifc_files_to_sharepoint` (stale PDF is NOT synced, logged as error).
 - `refresh_approved_to_latest()` (Stage 5, before sync): every `Approved to IFC` (IFR(Client) + Client Sharepoint) holds the latest IFR of each approved doc; old copy → `3. IFR(Client)/<sub>/Approved to IFC/SS/`, nothing created on the client side. Letter revs only. IFC never delivered (not in `transmitted_files`) → old rev RETIRES: no `-Approved` tag kept in SS (identical duplicate removed); delivered → old `-Approved` kept as record.
+- Stamp removal text match: phrase AND short text only (`len <= 2*len(phrase)+10`) — plain substring deleted NOTES MText containing "FOR CONSTRUCTION ONLY" (GG38 017 notes 1-4 vanished).
+- `_fix_placeholder_drgno`: IFC DRAWINGNUMBER placeholder (`GG38-C-PLN-00X`) → real doc-ID; sheet suffixes untouched.
+- IFC grouping (`scan_ifc_files`) uses `_doc_key` (doc-ID + sheet suffix): 002-1/-2/-3 were treated as old versions and moved to SS.
+- `IFCTransmittalManager(config=None)` loads config.json → Step 4b sync no longer silently has no targets.
+- `refresh_approved_to_latest` first moves older letter revs in 2. IFR_internal to Superseded/ (one current PDF per drawing).
 - Stamp nudge (`_glyph_nudge_down`, raster path): SHX glyph strokes straddling the stamp group's top edge → shift group down (re-check each step, cap half box height, must clear TB) before the two-corner mirror. Coleambally2 85 PDFs: 0 hits.
 
 ### Doc-ID Matching (FILE NO vs FILE NAME)
