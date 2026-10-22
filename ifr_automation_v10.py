@@ -5397,20 +5397,7 @@ class IFCStampMixin:
         # removed. Same identify-by-content pattern as _remove_ifc_stamp.
         if redraw:
             def _is_colour_note_block(blk_name):
-                try:
-                    bdef = doc.Blocks.Item(blk_name)
-                    if bdef.Count > 10:
-                        return False
-                    for j in range(bdef.Count):
-                        be = bdef.Item(j)
-                        if be.EntityName in ('AcDbMText', 'AcDbText'):
-                            bt = self._strip_mtext_formatting(
-                                self._com_retry(lambda ent=be: ent.TextString) or '').upper()
-                            if 'PRINT' in bt and ('COLOUR' in bt or 'COLOR' in bt):
-                                return True
-                except Exception:
-                    pass
-                return False
+                return self._is_colour_note_block_def(doc, blk_name)
 
             _ins_to_del = []
             if layout_name and layout_name.lower() != 'model':
@@ -5575,6 +5562,93 @@ class IFCStampMixin:
             print(f"    印章: COLOUR 边框已重绘 (cw={cw:.2f}, 清除旧框={_deleted_count})")
         except Exception as e:
             print(f"    印章: COLOUR 边框绘制失败 ({e})")
+
+    def _is_colour_note_block_def(self, doc, blk_name):
+        """True if block `blk_name` is a dedicated COLOUR note (def ≤10 entities
+        with baked PRINT + COLOUR/COLOR text). Identify by content, not by name."""
+        try:
+            bdef = doc.Blocks.Item(blk_name)
+            if bdef.Count > 10:
+                return False
+            for j in range(bdef.Count):
+                be = bdef.Item(j)
+                if be.EntityName in ('AcDbMText', 'AcDbText'):
+                    bt = self._strip_mtext_formatting(
+                        self._com_retry(lambda ent=be: ent.TextString) or '').upper()
+                    if 'PRINT' in bt and ('COLOUR' in bt or 'COLOR' in bt):
+                        return True
+        except Exception:
+            pass
+        return False
+
+    def _align_colour_note_block(self, doc, stamp_left, stamp_right, stamp_top,
+                                 gap, scale, layout_name=None):
+        """Frame-baked COLOUR note BLOCK just above the stamp slot (GG38 Waterloo).
+
+        The MText scan misses COLOUR text baked inside a block insert, so the zone
+        read as 'overlap' and the block stayed where the frame put it: unaligned,
+        and thicker than FOR CONSTRUCTION. If such a block is found, move it so its
+        border's right edge = stamp_right and its bottom = stamp_top + gap.
+        Returns (found, border_width_or_None). No block → (False, None), no-op.
+        """
+        import pythoncom as _pycom
+        pt = lambda x, y: win32com.client.VARIANT(
+            _pycom.VT_ARRAY | _pycom.VT_R8, [x, y, 0.0])
+        y_lo, y_hi = stamp_top - 5.0 * scale, stamp_top + 80.0 * scale
+        cands = []
+        try:
+            if layout_name and layout_name.lower() != 'model':
+                for layout in doc.Layouts:
+                    if layout.Name == layout_name:
+                        block = layout.Block
+                        for i in range(block.Count):
+                            try:
+                                e = block.Item(i)
+                                if e.EntityName == 'AcDbBlockReference':
+                                    cands.append(e)
+                            except Exception:
+                                continue
+                        break
+            else:
+                ss = doc.SelectionSets.Add(f"_ColAln_{int(time.time()*1000) % 1_000_000}")
+                ft = win32com.client.VARIANT(_pycom.VT_ARRAY | _pycom.VT_I2, [0])
+                fv = win32com.client.VARIANT(_pycom.VT_ARRAY | _pycom.VT_VARIANT, ["INSERT"])
+                ss.Select(1, pt(stamp_left - 15.0 * scale, y_lo),
+                          pt(stamp_right + 15.0 * scale, y_hi + 40.0 * scale), ft, fv)
+                cands = [ss.Item(i) for i in range(ss.Count)]
+                ss.Delete()
+        except Exception:
+            return False, None
+        for e in cands:
+            try:
+                mn, mx = e.GetBoundingBox()
+                if not (mn[0] < stamp_right and mx[0] > stamp_left and y_lo < mn[1] < y_hi):
+                    continue
+                if not self._is_colour_note_block_def(doc, e.Name):
+                    continue
+                s = e.XScaleFactor
+                if abs(e.Rotation) > 1e-6 or abs(e.YScaleFactor - s) > 1e-9:
+                    continue
+                bdef = doc.Blocks.Item(e.Name)
+                pls = [bdef.Item(j) for j in range(bdef.Count)
+                       if bdef.Item(j).EntityName == 'AcDbPolyline']
+                if not pls:
+                    continue
+                def _bb(p):
+                    c = p.Coordinates
+                    return min(c[0::2]), min(c[1::2]), max(c[0::2]), max(c[1::2])
+                pl = max(pls, key=lambda p: (_bb(p)[2] - _bb(p)[0]) * (_bb(p)[3] - _bb(p)[1]))
+                _, ly0, lx1, _ = _bb(pl)
+                ins = e.InsertionPoint
+                dx = stamp_right - (ins[0] + s * lx1)
+                dy = stamp_top + gap - (ins[1] + s * ly0)
+                e.Move(pt(0.0, 0.0), pt(dx, dy))
+                cw = pl.ConstantWidth * s
+                print(f"    印章: COLOUR 注释块 {e.Name} 对齐 dx={dx:.2f} dy={dy:.2f}, cw={cw:.2f}")
+                return True, (cw if cw > 0 else None)
+            except Exception:
+                continue
+        return False, None
 
     def _stamp_via_com_draw(self, doc, block_ref, space, has_colour=True,
                             layout_name=None):
@@ -5809,7 +5883,18 @@ class IFCStampMixin:
             pline.Closed = True
             pline.Layer = self.STAMP_LAYER
             pline.color = _stamp_color  # explicit (ByLayer might inherit other)
-            _cw = self._STAMP_CW if self._STAMP_CW is not None else (0.5 * scale)
+            # IFC border: thick on every sheet (single-stamp sheets match the
+            # 2-stamp COLOUR look). Subclass _STAMP_CW (AsBuilt) still wins.
+            _cw = self._STAMP_CW if self._STAMP_CW is not None else (2.0 * scale)
+            # if the frame carries a COLOUR note BLOCK above the slot → align it
+            # to FOR CONSTRUCTION and draw FOR CONSTRUCTION at its border width
+            _col_blk = False
+            if not has_colour and not getattr(self, '_FORCE_COLOUR', False):
+                _col_blk, _blk_cw = self._align_colour_note_block(
+                    doc, stamp_left_x, stamp_right_x, stamp_top_y,
+                    _ref_colour_gap * scale, scale, layout_name=layout_name)
+                if _blk_cw:
+                    _cw = _blk_cw
             pline.ConstantWidth = _cw
 
             center_pt = win32com.client.VARIANT(
@@ -5843,6 +5928,8 @@ class IFCStampMixin:
                 _draw_colour = True
                 print(f"    印章: COLOUR → 重绘对齐 (has_colour={has_colour}, "
                       f"force={getattr(self, '_FORCE_COLOUR', False)})")
+            elif _col_blk:
+                print(f"    印章: 图框自带 COLOUR 注释块 → 已对齐 FOR CONSTRUCTION (cw={_cw:.2f})")
             elif self._check_colour_overlap(doc, stamp_left_x, stamp_right_x,
                                              colour_bottom_y, colour_top_y,
                                              layout_name=layout_name):
@@ -5851,10 +5938,11 @@ class IFCStampMixin:
                 _draw_colour = True
 
             # Reconcile old COLOUR entities (delete-if-redraw, keep-if-not).
-            self._ensure_colour_has_border(
-                doc, draw_space, stamp_left_x, stamp_right_x,
-                colour_bottom_y, colour_top_y, _cw,
-                layout_name=layout_name, redraw=_draw_colour)
+            if not _col_blk:
+                self._ensure_colour_has_border(
+                    doc, draw_space, stamp_left_x, stamp_right_x,
+                    colour_bottom_y, colour_top_y, _cw,
+                    layout_name=layout_name, redraw=_draw_colour)
 
             if _draw_colour:
 
@@ -5886,6 +5974,8 @@ class IFCStampMixin:
             doc.Regen(1)
             if has_colour:
                 stamp_label = "FOR CONSTRUCTION (COLOUR 保留原DWG)"
+            elif _col_blk:
+                stamp_label = "FOR CONSTRUCTION (COLOUR 注释块已对齐)"
             elif _draw_colour:
                 stamp_label = "FOR CONSTRUCTION + COLOUR"
             else:
