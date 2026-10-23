@@ -6836,38 +6836,44 @@ class IFCManager(IFCStampMixin):
 
             # Detect ALL non-Model layouts, sorted by TabOrder (correct page sequence)
             # Skip empty layouts (only default viewport, no real content) to avoid blank pages
-            layout_info = []  # [(tab_order, name), ...]
-            try:
-                for layout in doc.Layouts:
-                    if layout.Name.lower() != 'model':
-                        try:
-                            tab_order = layout.TabOrder
-                        except Exception:
-                            tab_order = 999
-                        # Check if layout has real content (>= 2 entities means
-                        # more than just the default viewport)
-                        try:
-                            block = layout.Block
-                            entity_count = block.Count
-                            if entity_count <= 1:
-                                print(f"    跳过空布局: {layout.Name} ({entity_count} entities)")
-                                continue
-                        except Exception:
-                            pass  # if can't check, include it
-                        # Skip phantom layouts with no plot configuration
-                        # (can appear after XREF bind adds entities to previously-empty layouts)
-                        try:
-                            config = layout.ConfigName
-                            if not config or config.strip() == '' or config.strip().lower() == 'none':
-                                print(f"    跳过无打印配置布局: {layout.Name}")
-                                continue
-                        except Exception:
-                            pass
-                        layout_info.append((tab_order, layout.Name))
-            except Exception:
-                pass
-            layout_info.sort(key=lambda x: x[0])
-            layout_names = [name for _, name in layout_info]
+            # Big xref/aerial DWGs may not be ready yet: Layouts iteration then fails
+            # silently and only 'Model' gets published (GG38 001 IFR). Retry before giving up.
+            for _lay_try in range(4):
+                layout_info = []  # [(tab_order, name), ...]
+                try:
+                    for layout in doc.Layouts:
+                        if layout.Name.lower() != 'model':
+                            try:
+                                tab_order = layout.TabOrder
+                            except Exception:
+                                tab_order = 999
+                            # Check if layout has real content (>= 2 entities means
+                            # more than just the default viewport)
+                            try:
+                                block = layout.Block
+                                entity_count = block.Count
+                                if entity_count <= 1:
+                                    print(f"    跳过空布局: {layout.Name} ({entity_count} entities)")
+                                    continue
+                            except Exception:
+                                pass  # if can't check, include it
+                            # Skip phantom layouts with no plot configuration
+                            # (can appear after XREF bind adds entities to previously-empty layouts)
+                            try:
+                                config = layout.ConfigName
+                                if not config or config.strip() == '' or config.strip().lower() == 'none':
+                                    print(f"    跳过无打印配置布局: {layout.Name}")
+                                    continue
+                            except Exception:
+                                pass
+                            layout_info.append((tab_order, layout.Name))
+                except Exception:
+                    pass
+                layout_info.sort(key=lambda x: x[0])
+                layout_names = [name for _, name in layout_info]
+                if layout_names:
+                    break
+                time.sleep(5)
             if not layout_names:
                 layout_names = ['Model']
             print(f"    PDF Layouts (sorted): {layout_names}")
@@ -7214,6 +7220,26 @@ class IFCManager(IFCStampMixin):
                 return result
             print(f"    Found {len(all_tbs)} title block(s)")
 
+            # Xref changed after the IFR PDF was issued (GG38 001/002-x: base 09-29, survey
+            # 10-02 > IFR 09-17/09-21) → IFC (current xrefs) ≠ approved IFR PDF. Report it.
+            try:
+                _ifr_pdf = _latest_ifr_pdfs(self.project_path).get(_doc_key(Path(dwg_path).name) or '')
+                if _ifr_pdf is not None:
+                    _t = _ifr_pdf.stat().st_mtime
+                    _newer = []
+                    for _bi in range(doc.Blocks.Count):
+                        _b = doc.Blocks.Item(_bi)
+                        if getattr(_b, 'IsXRef', False):
+                            _xp = Path(_b.Path) if Path(_b.Path).is_absolute() else Path(doc.Path) / _b.Path
+                            if _xp.exists() and _xp.stat().st_mtime > _t + 60:
+                                _newer.append(f"{_b.Name} ({datetime.fromtimestamp(_xp.stat().st_mtime):%m-%d})")
+                    if _newer:
+                        msg = f"参照图晚于 IFR PDF ({_ifr_pdf.name}): {', '.join(_newer)} → IFR PDF 需按当前 DWG 重出"
+                        print(f"    ⚠ {msg}")
+                        result['errors'].append(msg)
+            except Exception as _e_x:
+                print(f"    参照图时间检查跳过 ({_e_x})")
+
             # Read personnel from first title block with valid IFR row
             personnel = {}
             for _tb_item in all_tbs:
@@ -7460,6 +7486,19 @@ class IFCManager(IFCStampMixin):
                         print(f"    印章: 栅格检测到 {_fixed} 页与图面重叠 → 已避让并重出 PDF")
                 except Exception as _e_rf:
                     print(f"    印章: 栅格避让跳过 ({_e_rf})")
+                try:  # extra never-issued layouts → keep only pages matching the IFR
+                    _ref = _latest_ifr_pdfs(self.project_path).get(_doc_key(Path(ifc_pdf_path).name) or '')
+                    _tn = trim_pdf_to_reference(Path(ifc_pdf_path), _ref) if _ref else None
+                    if _tn:
+                        print(f"    页面: {_tn}")
+                        if '未截页' in _tn:
+                            result['errors'].append(f"页面: {_tn}")
+                except Exception as _e_tr:
+                    print(f"    页面: 截页跳过 ({_e_tr})")
+                _lost = ifc_content_check(self.project_path, Path(ifc_pdf_path))
+                if _lost:
+                    result['errors'].append(f"内容QA: IFC 比 IFR 少内容 {_lost} (疑似参照图未加载/文字被删)")
+                    print(f"    ✗ 内容QA: IFC 比 IFR 少内容 {_lost} — 需检查")
             else:
                 result['errors'].append(
                     f"PDF PUBLISH 导出失败: {ifc_pdf_path.name} (DWG已保存)")
@@ -8927,6 +8966,68 @@ def ifc_stale_reason(project_path: Path, ifc_pdf: Path, latest: Optional[Dict] =
     if st.st_mtime > ifc_pdf.stat().st_mtime + 2:  # no record: timestamp fallback
         return f"无来源记录; IFR Rev{new_rev} ({datetime.fromtimestamp(st.st_mtime):%m-%d %H:%M}) 晚于 IFC"
     return None
+
+
+def trim_pdf_to_reference(pdf: Path, ref_pdf: Path, min_sim: float = 0.95) -> Optional[str]:
+    """DWG has more publishable layouts than were ever issued (GG38 002-1: 3 vs 1): keep only
+    the pages that match the reference PDF's pages one-to-one (thumbnail similarity >= min_sim),
+    in reference order. Original saved as SS/<stem>.untrimmed.pdf. Returns a note, or None if
+    nothing to do; ambiguous match → untouched + note (never guesses)."""
+    import fitz
+    with fitz.open(str(ref_pdf)) as r, fitz.open(str(pdf)) as d:
+        if len(d) <= len(r):
+            return None
+        def vec(pg):
+            pm = pg.get_pixmap(matrix=fitz.Matrix(256 / pg.rect.width, 256 / pg.rect.width), colorspace=fitz.csGRAY)
+            return pm.samples, (pm.width, pm.height)
+        def sim(a, b):
+            return 0 if a[1] != b[1] else 1 - sum(abs(x - y) for x, y in zip(a[0], b[0])) / 255 / len(a[0])
+        dv = [vec(x) for x in d]
+        keep = []
+        for rp in r:
+            rv = vec(rp); sc = [sim(x, rv) for x in dv]; best = max(range(len(sc)), key=sc.__getitem__)
+            keep.append((best, sc[best]))
+    if not all(s >= min_sim for _, s in keep) or len({b for b, _ in keep}) != len(keep):
+        return f"页数多于参照且无法一一对应 {[(b + 1, round(s, 3)) for b, s in keep]}, 未截页"
+    ss = pdf.parent / "SS"; ss.mkdir(exist_ok=True)
+    bk = ss / (pdf.stem + ".untrimmed.pdf")
+    shutil.copy2(str(pdf), str(bk))
+    with fitz.open(str(bk)) as src:
+        out = fitz.open()
+        for b, _ in keep:
+            out.insert_pdf(src, from_page=b, to_page=b)
+        out.save(str(pdf)); out.close()
+    return f"截页 {len(dv)}→{len(keep)} (保留第 {[b + 1 for b, _ in keep]} 页)"
+
+
+def ifc_content_check(project_path: Path, ifc_pdf: Path, threshold: float = 0.1) -> List[str]:
+    """Pages where ink present in the latest IFR PDF is missing from the IFC (outside the
+    bottom-right stamp/title zone), as 'p<n> x.xx%'. Empty = OK / nothing to compare.
+    Catches dropped xrefs (GG38 002-1/002-2) and deleted notes (GG38 017) at publish time."""
+    try:
+        import fitz, numpy as np
+    except ImportError:
+        return []
+    src = _latest_ifr_pdfs(project_path).get(_doc_key(ifc_pdf.name) or '')
+    if not src or not ifc_pdf.exists():
+        return []
+    def _g(pg):
+        pm = pg.get_pixmap(dpi=40, colorspace=fitz.csGRAY)
+        return np.frombuffer(pm.samples, np.uint8).reshape(pm.height, pm.width)
+    out = []
+    with fitz.open(str(src)) as da, fitz.open(str(ifc_pdf)) as di:
+        if len(da) != len(di):
+            out.append(f"页数 IFR {len(da)} ≠ IFC {len(di)}")
+        for i in range(min(len(da), len(di))):
+            a, b = _g(da[i]), _g(di[i])
+            h, w = min(a.shape[0], b.shape[0]), min(a.shape[1], b.shape[1])
+            a, b = a[:h, :w].astype(int), b[:h, :w].astype(int)
+            m = (np.abs(a - b) > 60) & (a < b)
+            m[int(h * .76):, int(w * .40):] = False
+            pct = m.mean() * 100
+            if pct > threshold:
+                out.append(f"p{i + 1} {pct:.2f}%")
+    return out
 
 
 class FileHealthChecker:
@@ -13564,8 +13665,14 @@ class AsBuiltManager(IFCManager):
         try:
             link_root = (Path(tempfile.gettempdir())
                          / f"abj_{int(time.time() * 1000) % 1_000_000}")
+            # Link the GRANDPARENT and open via <link>/<parent>/<file>: relative xrefs
+            # like '..\ExRef-…\Base.dwg' then still resolve. Linking the parent made
+            # '..' land in TEMP → xref silently dropped (GG38 002-1/002-2 IFC had no basemap).
+            anchor, sub = dwg_path.parent.parent, dwg_path.parent.name
+            if len(str(link_root / sub / dwg_path.name)) > 240:
+                anchor, sub = dwg_path.parent, ''
             r = subprocess.run(
-                ['cmd', '/c', 'mklink', '/J', str(link_root), str(dwg_path.parent)],
+                ['cmd', '/c', 'mklink', '/J', str(link_root), str(anchor)],
                 capture_output=True, text=True, timeout=30)
             if not link_root.exists():
                 print(f"    ⚠ 短路径 junction 创建失败: {r.stderr.strip() or r.stdout.strip()}")
@@ -13574,7 +13681,7 @@ class AsBuiltManager(IFCManager):
             print(f"    ⚠ 短路径 junction 异常: {e}")
             return noop
 
-        short = str(link_root / dwg_path.name)
+        short = str(link_root / sub / dwg_path.name) if sub else str(link_root / dwg_path.name)
 
         def _cleanup():
             try:

@@ -157,6 +157,10 @@ for lname in layout_names:
 - IFC grouping (`scan_ifc_files`) uses `_doc_key` (doc-ID + sheet suffix): 002-1/-2/-3 were treated as old versions and moved to SS.
 - `IFCTransmittalManager(config=None)` loads config.json → Step 4b sync no longer silently has no targets.
 - `refresh_approved_to_latest` first moves older letter revs in 2. IFR_internal to Superseded/ (one current PDF per drawing).
+- `ifc_content_check()` runs after every IFC publish: ink in the latest IFR missing from the IFC (outside stamp/TB zone, >0.1%) or page-count mismatch → result error. Caught GG38 017 deleted notes and 001/002-x xref drift. Known intentional: E-BLD-001 (info block removed), E-BLD-003 (IP table moved).
+- `trim_pdf_to_reference()`: DWG publishes more layouts than were issued (002-1: 3 vs 1) → keep pages matching the IFR one-to-one (sim ≥0.95), else leave + report. Backup SS/*.untrimmed.pdf.
+- Xref newer than the IFR PDF (checked in `convert_to_ifc`) → reported: the IFR PDF must be republished from the current DWG (GG38 001/002-1/002-2: base 09-29, survey 10-02 after IFR issue; IFC was right, IFR PDF stale).
+- `_shortpath_open_target` links the GRANDPARENT so `..\ExRef` relative xrefs resolve (linking the parent dropped xrefs). `_publish_single_pdf` retries layout detection (slow xref loads fell back to 'Model').
 - Stamp nudge (`_glyph_nudge_down`, raster path): SHX glyph strokes straddling the stamp group's top edge → shift group down (re-check each step, cap half box height, must clear TB) before the two-corner mirror. Coleambally2 85 PDFs: 0 hits.
 
 ### Doc-ID Matching (FILE NO vs FILE NAME)
