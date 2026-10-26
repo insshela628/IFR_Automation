@@ -1778,7 +1778,7 @@ class IFRAutomation:
         import filecmp
         sent = {_doc_key(n) for n in IFCTransmittalManager(project_path, dry_run=True)
                 .get_last_run_state().get('transmitted_files', [])}
-        result = {"refreshed": 0, "errors": [], "details": []}
+        result = {"refreshed": 0, "errors": [], "details": [], "items": []}
         eng = project_path / "Design/Engineering"
         ifr_client_base = eng / "1. Drawings/3. IFR(Client)"
         sharepoint_base = eng / "13. Client Sharepoint/1.IFR"
@@ -1798,6 +1798,8 @@ class IFRAutomation:
                 dest = ifr_int / "Superseded" / f.name
                 msg = f"IFR_internal 旧版 → Superseded: {f.name} (当前 {cur.name})"
                 result["details"].append(msg)
+                result["items"].append({"doc_key": k, "side": "ifr_internal", "old": f.name,
+                                        "new": cur.name, "why": "superseded"})
                 if self.dry_run or dest.exists():
                     print(f"    [{'预览' if self.dry_run else '跳过-已存在'}] {msg}")
                     continue
@@ -1837,6 +1839,8 @@ class IFRAutomation:
                     why = "同版本原地修改" if resaved else f"Rev{old_rev}→Rev{new_rev}"
                     msg = f"Approved to IFC 换新({sp_sub if suffix else ifr_sub}, {why}): {f.name} → {new.name}"
                     result["details"].append(msg)
+                    result["items"].append({"doc_key": k, "side": "client" if suffix else "internal",
+                                            "old": f.name, "new": new.name, "why": why})
                     if self.dry_run:
                         print(f"    [预览] {msg}")
                         result["refreshed"] += 1
@@ -1892,6 +1896,7 @@ class IFRAutomation:
         # Step 0b: Approved to IFC → latest IFR rev (so newer revs replace, not queue as pending IFR)
         refresh_result = self.refresh_approved_to_latest(project_path)
         result["refreshed"] = refresh_result["refreshed"]
+        result["refresh_items"] = refresh_result.get("items", [])
         result["errors"].extend(refresh_result["errors"])
 
         # Mapping: (source_path_relative, sharepoint_subfolder, ifr_client_subfolder_for_approved_check)
@@ -8968,6 +8973,27 @@ def ifc_stale_reason(project_path: Path, ifc_pdf: Path, latest: Optional[Dict] =
     return None
 
 
+def ifc_freshness_report(project_path: Path) -> Dict:
+    """Read-only daily check (no COM): every IFC in 4. IFC(Client) vs its latest IFR source.
+    stale[].transmitted=True → already delivered: needs a Rev bump (PM call), not an in-place Rev0 redo."""
+    ifc_dir = project_path / "Design/Engineering/1. Drawings/4. IFC(Client)"
+    out = {"checked": 0, "stale": [], "ifc_dir": ifc_dir.exists()}
+    if not ifc_dir.exists():
+        return out
+    latest, sources = _latest_ifr_pdfs(project_path), _ifc_source_load(project_path)
+    sent = {_doc_key(n) for n in IFCTransmittalManager(project_path, dry_run=True)
+            .get_last_run_state().get('transmitted_files', [])}
+    for f in sorted(ifc_dir.iterdir()):
+        if not f.is_file() or f.suffix.lower() != '.pdf' or f.name.startswith('~$'):
+            continue
+        out["checked"] += 1
+        why = ifc_stale_reason(project_path, f, latest, sources)
+        if why:
+            k = _doc_key(f.name)
+            out["stale"].append({"doc_key": k, "file": f.name, "why": why, "transmitted": k in sent})
+    return out
+
+
 def trim_pdf_to_reference(pdf: Path, ref_pdf: Path, min_sim: float = 0.95) -> Optional[str]:
     """DWG has more publishable layouts than were ever issued (GG38 002-1: 3 vs 1): keep only
     the pages that match the reference PDF's pages one-to-one (thumbnail similarity >= min_sim),
@@ -15190,6 +15216,13 @@ class PipelineOrchestrator:
                     results['ifc_transmittal'] = {'error': str(e)}
             else:
                 results['ifc_transmittal'] = {'skipped': True, 'reason': 'IFC(Client)不存在'}
+            try:
+                results['ifc_freshness'] = ifc_freshness_report(project_path)
+                n_st = len(results['ifc_freshness']['stale'])
+                if n_st:
+                    UIHelper.print_warning(f"IFC 过期 {n_st} 件 (源 IFR 已更新)")
+            except Exception as e:
+                results['ifc_freshness'] = {'error': f"{type(e).__name__}: {e}"}
 
         # Stage 4: AS BUILT 版本管理 (placed AFTER IFC — AS BUILT is derived from
         # IFC, so IFC version control settles first). ONE unified AS BUILT version

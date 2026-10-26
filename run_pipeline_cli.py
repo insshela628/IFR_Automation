@@ -13,6 +13,12 @@ Usage:
   python run_pipeline_cli.py "<keyword>"            # dry-run preview (safe)
   python run_pipeline_cli.py "<keyword>" --execute  # real run (moves files → Superseded/)
   python run_pipeline_cli.py "<keyword>" --stages deliverable asbuilt_version   # subset
+  python run_pipeline_cli.py "<keyword>" --refresh-approved   # ONLY latest-wins Approved to IFC swap (real)
+
+--refresh-approved: the one real write the daily patrol (auto_drain ④.8) is allowed. Runs
+IFRAutomation.refresh_approved_to_latest alone (PM 2026-10-22: "以后不能这样一个个问了，你要自动
+换成最新"): Approved to IFC (internal + client) → latest IFR, old copy → SS, IFR_internal
+old letters → Superseded. No AutoCAD, no IFC copy to Sharepoint (those stay human-triggered).
 
 Stage subset (`--stages`): `PipelineOrchestrator` has always accepted a `stages`
 list; only this CLI never exposed it. Note it is a MEMBERSHIP FILTER, not a
@@ -92,6 +98,7 @@ def main(argv):
     args = [a for a in argv if a]
     execute = "--execute" in args
     do_list = "--list" in args
+    refresh_only = "--refresh-approved" in args
     # --stages s1 s2 ... : everything after the flag until the next --flag.
     stages = None
     if "--stages" in args:
@@ -141,6 +148,19 @@ def main(argv):
         return 2
 
     project = matches[0]
+    if refresh_only:
+        try:
+            cfg = _get_config()
+            au = IFRAutomation(root_path=cfg.get("default_root_path", str(_HERE)),
+                               config=cfg, dry_run=False, interactive=False)
+            r = au.refresh_approved_to_latest(Path(project.project_path))
+        except Exception as e:
+            _emit("error", stage="refresh_approved", project=project.project_name, message=str(e))
+            return 1
+        for d in r.get("details", []):
+            print("  " + d)
+        _emit("ok", project=project.project_name, refresh_approved=r)
+        return 0
     mode = "执行 (真实落盘, 可逆→Superseded)" if execute else "预览 (dry-run, 不动文件)"
     print("=" * 60)
     print(f"  IFR Pipeline — {mode}")
