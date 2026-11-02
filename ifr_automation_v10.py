@@ -49,6 +49,7 @@ Version: 7.0
 """
 
 import os
+import filecmp
 import sys
 import uuid
 import argparse
@@ -10717,7 +10718,7 @@ _RE_AB_EXP_MARK = re.compile(r'[_\-\s]exp\b', re.IGNORECASE)
 # Dead-versions folder name recogniser (canonical = 'Superseded'). Matches every
 # drift seen across projects so we reuse ONE archive, never spawn a second.
 _RE_DEAD_DIR = re.compile(
-    r'^(superseded|superceded|ss|old\s*revision|old\s*version|archive|previous|prev)\b',
+    r'^(super[sc]e+[dc]e+d|ss|old\s*revision|old\s*version|archive|previous|prev)\b',
     re.IGNORECASE)
 # Loose-DWG version-control classifier support (asbuilt-native-folder-standard).
 # Doc-ID recognition delegates to _extract_doc_id_standalone(allow_fallback=False)
@@ -11622,6 +11623,44 @@ class AsBuiltManager(IFCManager):
     # ── Native doc-folder loose-file version control ─────────────────────
     # Junk/stray extensions that NEVER belong loose in a 1. Native/ doc folder.
     _NATIVE_JUNK_EXT = {'.bak', '.dwl', '.dwl2', '.tmp', '.log', '.err', '.sv$'}
+    _LIVE_LOCK_SEC = 24 * 3600
+    _RE_COPY_NAME = re.compile(r'^(?:copy of\s+)?(?P<base>.+?)(?:\s*-\s*copy(?:\s*\(\d+\))?|\s*\(\d+\))?$',
+                               re.IGNORECASE)
+
+    def _open_dwg_stems(self, doc_folder: Path) -> set:
+        """Lower-cased stems whose .dwl/.dwl2 lock is younger than _LIVE_LOCK_SEC."""
+        now = time.time(); out = set()
+        try:
+            for e in os.scandir(doc_folder):
+                low = e.name.lower()
+                if e.is_file() and (low.endswith('.dwl') or low.endswith('.dwl2')):
+                    if now - e.stat().st_mtime < self._LIVE_LOCK_SEC:
+                        out.add(os.path.splitext(e.name)[0].lower())
+        except OSError:
+            pass
+        return out
+
+    def _identical_copy_dwgs(self, doc_folder: Path) -> Dict[str, str]:
+        """{copy_name: original_name} for copy-named DWGs byte-identical to a sibling."""
+        out: Dict[str, str] = {}
+        try:
+            dwgs = {e.name: e for e in os.scandir(doc_folder)
+                    if e.is_file() and e.name.lower().endswith('.dwg')}
+        except OSError:
+            return out
+        lower = {n.lower(): n for n in dwgs}
+        for n, e in dwgs.items():
+            m = self._RE_COPY_NAME.match(n[:-4])
+            base = (m.group('base') + '.dwg') if m else None
+            if not base or base.lower() == n.lower() or base.lower() not in lower:
+                continue
+            orig = lower[base.lower()]
+            try:
+                if e.stat().st_size == dwgs[orig].stat().st_size and                         filecmp.cmp(e.path, dwgs[orig].path, shallow=False):
+                    out[n] = orig
+            except OSError:
+                pass
+        return out
 
     def _native_folder_for(self, doc_id: str) -> Optional[Path]:
         """The 1. Native/ doc-ID folder matching doc_id (flat or 1-level nested),
@@ -11686,6 +11725,14 @@ class AsBuiltManager(IFCManager):
             if not doc_id or not re.search(r'-\d{2,3}', doc_id):
                 continue
             ss_dir = self._ab_superseded_dir(doc_folder)
+            # LIVE-LOCK GUARD: a fresh .dwl means someone has that drawing OPEN
+            # right now (Forbes 2026-11-03: the daily patrol would have moved the
+            # ACE machine's live PLN-002 lock). Leave its lock files AND the DWG
+            # alone until the lock goes stale (AutoCAD deletes it on close).
+            open_stems = self._open_dwg_stems(doc_folder)
+            # Byte-identical '<X> - Copy.dwg' / 'Copy of <X>.dwg' / '<X> (1).dwg'
+            # next to <X>.dwg is a pure duplicate, not a rev tie → Superseded/.
+            dup_copies = self._identical_copy_dwgs(doc_folder)
             # Version-control verdict for the loose DWGs (asbuilt-native-folder-
             # standard): who is master vs a safe-to-supersede older rev vs an
             # ambiguous/mis-filed file that must be FLAGGED, not moved.
@@ -11705,6 +11752,14 @@ class AsBuiltManager(IFCManager):
                                         'path': str(child), 'moved': moved})
                     continue
                 ext = child.suffix.lower()
+                if child.stem.lower() in open_stems:
+                    continue                      # drawing is open — touch nothing of it
+                if child.name in dup_copies:
+                    moved = True if report_only else self._move_to_ss(child, ss_dir)
+                    actions.append({'doc_id': doc_id, 'kind': 'identical_copy',
+                                    'path': str(child), 'moved': moved,
+                                    'why': f'byte-identical to {dup_copies[child.name]}'})
+                    continue
                 if ext in self._NATIVE_JUNK_EXT:
                     moved = True if report_only else self._move_to_ss(child, ss_dir)
                     actions.append({'doc_id': doc_id, 'kind': 'stray_bak',
