@@ -11421,7 +11421,7 @@ class AsBuiltManager(IFCManager):
                 rev = (ord(m.group(1).upper()) - ord('A')) if m else -1.0
         return (rank, rev)
 
-    def classify_loose_dwgs(self, doc_folder: Path) -> List[Tuple[str, str, str]]:
+    def classify_loose_dwgs(self, doc_folder: Path, exclude=()) -> List[Tuple[str, str, str]]:
         """Classify loose DWGs at a Native doc-folder root vs the standard.
 
         Returns [(filename, category, why)] where category ∈ {KEEP-MASTER,
@@ -11436,7 +11436,7 @@ class AsBuiltManager(IFCManager):
         try:
             loose = [e.name for e in os.scandir(doc_folder)
                      if e.is_file() and e.name.lower().endswith('.dwg')
-                     and not e.name.startswith('~$')]
+                     and not e.name.startswith('~$') and e.name not in exclude]
         except OSError:
             return []
         if len(loose) <= 1:
@@ -11737,7 +11737,10 @@ class AsBuiltManager(IFCManager):
             # standard): who is master vs a safe-to-supersede older rev vs an
             # ambiguous/mis-filed file that must be FLAGGED, not moved.
             verdicts = {n: (cat, why)
-                        for n, cat, why in self.classify_loose_dwgs(doc_folder)}
+                        for n, cat, why in self.classify_loose_dwgs(
+                            # copies leave first: a '- Copy' title must not trip the
+                            # cross-title guard and freeze the real revs (2026-11-03).
+                            doc_folder, exclude=set(dup_copies))}
             try:
                 children = list(doc_folder.iterdir())
             except (OSError, PermissionError):
