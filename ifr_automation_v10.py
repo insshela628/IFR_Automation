@@ -3154,6 +3154,8 @@ class DeliverableManager:
     #   worse than the bug it fixes.
     _RE_RETIRED = re.compile(r'\.superseded[-.]|\bsuperse?e?ded\b|\bobsolete\b',
                              re.IGNORECASE)
+    _RE_CLIENT_EDITION = re.compile(r'\bfor[ _-]client\b|\bclient[ _-](edition|copy)\b',
+                                    re.IGNORECASE)
 
     def _find_excel_in_folder(self, folder: Path) -> Optional[Path]:
         """Find the CURRENT deliverable Excel in a folder.
@@ -3172,6 +3174,13 @@ class DeliverableManager:
                 if not (f.is_file() and f.suffix.lower() in ('.xlsx', '.xlsm')):
                     continue
                 if f.name.startswith('~$') or self._RE_RETIRED.search(f.stem):
+                    continue
+                # Client edition parked beside the internal DLV (PM keeps
+                # "<name> for client.xlsx" in 8. Deliverables, 2026-11-06): it is a
+                # build output with columns deleted — picking it as the master
+                # sends every engine write into the client file (GG38: it won
+                # on mtime the moment it was copied there).
+                if self._RE_CLIENT_EDITION.search(f.stem):
                     continue
                 if named_only and not ('dlv' in f.name.lower()
                                        or 'deliverable' in f.name.lower()):
