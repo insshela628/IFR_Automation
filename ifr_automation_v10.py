@@ -4312,10 +4312,17 @@ class IFCTransmittalManager:
                 if not cell_val:
                     continue
                 doc_id = str(cell_val).strip()
-                if doc_id not in ifc_files:
-                    continue
-
-                rev_num = ifc_files[doc_id]["revision"]
+                if doc_id in ifc_files:
+                    rev_num = ifc_files[doc_id]["revision"]
+                else:
+                    # Register row = parent drawing, IFC map keyed by sheet (_doc_key):
+                    # DLV 'GG38-C-PLN-002' ← 002-1/-2/-3. Parent takes the highest sheet rev.
+                    kids = [v_ for k_, v_ in ifc_files.items()
+                            if re.fullmatch(re.escape(doc_id) + r'-\d+', k_)]
+                    if not kids:
+                        continue
+                    revs = [k_.get("revision") for k_ in kids if k_.get("revision") is not None]
+                    rev_num = max(revs) if revs else None
                 # Write IFC numerical revision to K column (0, 1, 2, 3...)
                 if rev_num is not None:
                     ws.cell(row=row, column=layout.rev_col, value=str(rev_num))
@@ -4330,6 +4337,12 @@ class IFCTransmittalManager:
                 updated += 1
 
             if updated > 0:
+                # Header "Last Updated" too — cross_check / update_ifc_deliverables
+                # already do; this IFC path left it stale (GG38 stuck at 20/10/26).
+                try:
+                    ws[layout.last_updated_cell].value = datetime.now().strftime('%d/%m/%y')
+                except Exception:
+                    pass
                 # Version the deliverable: move old to SS, save new
                 self._version_and_save_deliverable(wb, excel_path)
             else:
@@ -4718,8 +4731,18 @@ class IFCTransmittalManager:
                     best_rev = rev
                     best_file = f
             if best_file:
+                # _extract_revision_number() defaults to 0 when no numeric rev: a report
+                # issued at its approved LETTER rev (GG38 C-RPT-001_..._RevA_IFC.pdf) would
+                # stamp DLV rev col '0'. Numeric if present, else the letter, else None
+                # (None → update_deliverable_ifc_status leaves the rev cell alone).
+                _stem = Path(best_file.name).stem
+                if self.RE_IFC_REV.search(_stem):
+                    _rev = best_rev
+                else:
+                    _lm = re.search(r'[_\s-]Rev\.?\s*([A-Z]{1,2})(?=[_.\s-]|$)', _stem, re.IGNORECASE)
+                    _rev = _lm.group(1).upper() if _lm else None
                 all_ifc_map[doc_id] = {
-                    "revision": best_rev,
+                    "revision": _rev,
                     "filename": best_file.name,
                 }
 
@@ -9703,12 +9726,15 @@ class ApprovedIFCManager(IFCStampMixin):
         if not to_move:
             return []
 
-        ss_folder = dwg_info['folder'] / 'SS'
+        # ONE superseded folder per Native doc folder (asbuilt-native-folder-standard):
+        # reuse an existing Superseded/Superceded/SS — a hardcoded 'SS' minted a 2nd
+        # archive beside 'Superseded' (GG38 003/005/017, 2026-11-06).
+        ss_folder = VersionManager._find_ss_folder(dwg_info['folder'])
         moved = []
 
         if self.dry_run:
             for f in to_move:
-                print(f"    [预览] 移动旧版: {f.name} → SS/")
+                print(f"    [预览] 移动旧版: {f.name} → {ss_folder.name}/")
                 moved.append(f.name)
             return moved
 
@@ -9921,8 +9947,9 @@ class ApprovedIFCManager(IFCStampMixin):
                     if not self.dry_run:
                         for _f in (_old_dwg, _old_pdf):
                             if _f.exists():
-                                (_f.parent / 'SS').mkdir(exist_ok=True)
-                                _bk = _f.parent / 'SS' / (_f.stem + _tag + _f.suffix)
+                                _ss = VersionManager._find_ss_folder(_f.parent)  # Native: reuse Superseded
+                                _ss.mkdir(exist_ok=True)
+                                _bk = _ss / (_f.stem + _tag + _f.suffix)
                                 if _bk.exists():
                                     _bk = _bk.with_name(f"{_bk.stem}.{datetime.now():%Y%m%d%H%M%S}{_bk.suffix}")
                                 if _f.suffix.lower() == '.dwg':
