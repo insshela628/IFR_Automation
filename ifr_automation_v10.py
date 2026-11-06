@@ -4069,16 +4069,156 @@ class DeliverableManager:
             except Exception as e:
                 print(f"    [!] 主同步失败: {e}")
 
-        # Secondary sync target (only if exists)
+        # Secondary sync target = CLIENT face: never the raw internal DLV (template
+        # leftovers, N/A/hidden rows, Assignee, internal comments) — build the client
+        # edition (GG38 PM 2026-11-06). Build failure → skip + warn, never fall back to copy.
         secondary_target = self.project_path / self.SECONDARY_SYNC
         if secondary_target.exists():
             dest = secondary_target / new_file.name
             try:
                 self._supersede_old_versions_in_folder(secondary_target, new_file.name)
-                shutil.copy2(str(to_long_path(new_file)), str(to_long_path(dest)))
-                print(f"    [v] 已同步到 Client Sharepoint: {new_file.name}")
+                if self.build_client_dlv(new_file, dest):
+                    print(f"    [v] 客户版 DLV 已同步到 Client Sharepoint: {new_file.name}")
+                else:
+                    print(f"    [!] 客户版 DLV 生成失败 — Client Sharepoint 未更新 (不回退为复制内部版)")
             except Exception as e:
                 print(f"    [!] 次要同步失败: {e}")
+
+    # Top-level section headers of the GGE DLV template; every other text-only row
+    # in the data block (CIVIL / ELECTRICAL / SCHEDULE …) is a sub-section header.
+    _CLIENT_TOP_HEADERS = {'REPORT', 'REPORTS', 'DRAWING', 'DRAWINGS'}
+    _CLIENT_DROP_COL_HEADERS = ('assignee', 'gge comment', 'helper')
+
+    def build_client_dlv(self, src: Path, dst: Path, keep_status: str = "Approved IFC") -> bool:
+        """Client edition of a DLV (PM rule, GG38 2026-11-06): ONLY rows whose Status is
+        `keep_status` (the green ones). Template leftovers — N/A/orange, hidden, not-started,
+        internal blocks, stray rows under the footer — are DELETED, not hidden; hidden /
+        internal columns (Assignee, GGE COMMENT, HELPER) deleted; legend trimmed; the
+        Milestone-column counters (always #DIV/0! — column unused) recount on Status.
+        Excel COM (format-preserving). Returns False on any failure — caller must NOT
+        fall back to copying the internal file."""
+        import tempfile
+        try:
+            import win32com.client as _w
+        except Exception:
+            return False
+        try:
+            wb0 = openpyxl.load_workbook(str(to_long_path(src)))
+            ws0 = wb0.active
+            sheet_name = ws0.title
+            lay = self.detect_layout(ws0)
+            idc, stc = lay.doc_id_col, lay.status_col
+            txt = lambda r, c: str(ws0.cell(r, c).value or '').strip()
+            note_row = next((r for r in range(lay.header_row + 1, ws0.max_row + 1)
+                             if txt(r, idc).upper() == 'NOTE'), ws0.max_row + 1)
+            date_row = next((r for r in range(note_row, ws0.max_row + 1)
+                             if txt(r, idc).lower().startswith('date')), None)
+            # classify the data block
+            kind = {}
+            for r in range(lay.header_row + 1, note_row):
+                b = txt(r, idc)
+                if not b:
+                    kind[r] = 'blank'
+                elif _extract_doc_id_standalone(b) and b.upper().startswith(
+                        (_extract_doc_id_standalone(b) or '').upper()):
+                    kind[r] = 'keep' if txt(r, stc) == keep_status else 'drop'
+                elif not txt(r, lay.desc_col):
+                    kind[r] = 'top' if b.upper() in self._CLIENT_TOP_HEADERS else 'sub'
+                else:
+                    kind[r] = 'drop'      # text item rows (internal blocks)
+            rows = sorted(kind)
+            for i, r in enumerate(rows):
+                if kind[r] not in ('top', 'sub'):
+                    continue
+                stop = ('top',) if kind[r] == 'top' else ('top', 'sub')
+                has = False
+                for r2 in rows[i + 1:]:
+                    if kind[r2] in stop:
+                        break
+                    has = has or kind[r2] == 'keep'
+                kind[r] = 'keep_h' if has else 'drop'
+            drop_rows = [r for r in rows if kind[r] in ('drop', 'blank')]
+            if date_row:
+                drop_rows += list(range(date_row + 1, ws0.max_row + 1))
+            # columns: hidden + internal-only headers
+            hdr_rows = range(1, lay.header_row + 3)
+            drop_cols = set()
+            for c in range(1, ws0.max_column + 1):
+                L = openpyxl.utils.get_column_letter(c)
+                if ws0.column_dimensions[L].hidden and c not in (idc, stc, lay.rev_col, lay.date_col):
+                    drop_cols.add(c)
+                for r in hdr_rows:
+                    v = str(ws0.cell(r, c).value or '').strip().lower()
+                    if v and any(v.startswith(k) for k in self._CLIENT_DROP_COL_HEADERS):
+                        drop_cols.add(c)
+            ms_col = next((c for c in range(1, ws0.max_column + 1) for r in hdr_rows
+                           if str(ws0.cell(r, c).value or '').strip().lower() == 'milestone'
+                           and c < lay.rev_col), None)
+            wb0.close()
+        except Exception as e:
+            print(f"    [!] build_client_dlv: 读取布局失败: {e}")
+            return False
+
+        S = openpyxl.utils.get_column_letter(stc)
+        M = openpyxl.utils.get_column_letter(ms_col) if ms_col else None
+        tmp = Path(tempfile.mkdtemp(prefix="dlvclient_")) / src.name
+        shutil.copy2(str(to_long_path(src)), str(tmp))
+        xl = None
+        try:
+            xl = _w.DispatchEx("Excel.Application"); xl.Visible = False; xl.DisplayAlerts = False
+            wb = xl.Workbooks.Open(str(tmp))
+            ws = wb.Worksheets(sheet_name)
+            try:
+                ws.AutoFilterMode = False
+            except Exception:
+                pass
+            ws.Rows.Hidden = False
+            # 1. counters: Milestone-column COUNTIFS → recount on Status (before any deletion,
+            #    Excel then shifts the ranges itself)
+            if M:
+                cells = [c for c in ws.UsedRange
+                         if isinstance(c.Formula, str) and c.Formula.startswith('=')]
+                top_re = rf'COUNTIFS\(\$?{M}\$?\d+:\$?{M}\$?\d+,"IFR",(\$?{S}\$?\d+:\$?{S}\$?\d+),'
+                rng = next((m.group(1) for c in cells for m in [re.search(top_re, c.Formula)] if m), None)
+                for cell in cells:
+                    f = cell.Formula
+                    nf = re.sub(top_re, r'COUNTIF(\1,', f)
+                    # denominator: SAME range as the numerators (template's I12:I98 skipped the
+                    # first rows → GG38 client copy read 26/25 = 104%)
+                    if rng:
+                        nf = re.sub(rf'COUNTIF\(\$?{M}\$?\d+:\$?{M}\$?\d+,"IFR"\)',
+                                    f'(COUNTIF({rng},"{keep_status}")+COUNTIF({rng},"Submitted"))', nf)
+                    if nf != f:
+                        cell.Formula = nf
+            # 2. legend: only the keep_status swatch stays
+            for r in range(1, lay.header_row):
+                for c in range(1, 20):
+                    v = str(ws.Cells(r, c).Value or '').strip()
+                    if v and v != keep_status and (v.lower() in ('submitted',) or 'not applicable' in v.lower()):
+                        ws.Cells(r, c).Value = None
+                        ws.Cells(r, c).Interior.ColorIndex = -4142
+            # 3. rows bottom-up, 4. columns right-to-left
+            for r in sorted(set(drop_rows), reverse=True):
+                ws.Rows(r).Delete()
+            for c in sorted(drop_cols, reverse=True):
+                ws.Columns(c).Delete()
+            ws.Columns.Hidden = False
+            out = tmp.parent / ("client_" + dst.name)
+            wb.SaveAs(str(out), 51)
+            wb.Close(False)
+            shutil.move(str(out), str(to_long_path(dst)))
+            print(f"    客户版 DLV: 删行 {len(set(drop_rows))}, 删列 {len(drop_cols)} → {dst.name}")
+            return True
+        except Exception as e:
+            print(f"    [!] build_client_dlv 失败: {e}")
+            return False
+        finally:
+            try:
+                if xl is not None:
+                    xl.Quit()
+            except Exception:
+                pass
+            shutil.rmtree(str(tmp.parent), ignore_errors=True)
 
     def _supersede_old_versions_in_folder(self, folder: Path, new_filename: str):
         """Move old versions of the deliverable in a folder to SS."""
