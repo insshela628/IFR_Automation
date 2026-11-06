@@ -9,3 +9,4 @@ test_output/
 test_output.dwg
 test_logs/
 .env
+_state/

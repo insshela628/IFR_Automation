@@ -233,6 +233,46 @@ def to_long_path(path: Path) -> Path:
     return path
 
 
+# ── Machine state never lives in Dropbox (PM 2026-11-06, hard rule) ──
+# Pipeline state / sidecars / backups (ifc_source.json, ifc_state.json, *.untrimmed.pdf)
+# are the pipeline's own working memory, not company deliverables: they live in this repo's
+# _state/<project folder name>/ (git-ignored). A file found at a legacy in-Dropbox location
+# is moved here on first touch. Second line: the Python-wide Dropbox write gate (desk_guard
+# import gate; rule table = claude-config/guard/policy.json "dropbox") refuses these types.
+_STATE_ROOT = Path(__file__).resolve().parent / "_state"
+
+
+def machine_state_dir(project_path: Path) -> Path:
+    d = _STATE_ROOT / Path(project_path).name
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def machine_state_file(project_path: Path, name: str, legacy: Optional[Path] = None) -> Path:
+    """Local path for a pipeline state file; migrates (moves) a legacy in-Dropbox copy once."""
+    p = machine_state_dir(project_path) / name
+    if legacy is not None:
+        try:
+            lg = to_long_path(Path(legacy))
+            if lg.exists():
+                if not p.exists() or lg.stat().st_mtime > p.stat().st_mtime:
+                    shutil.copy2(str(lg), str(p))
+                if p.stat().st_mtime >= lg.stat().st_mtime:      # local copy is at least as new
+                    os.remove(str(lg))
+        except OSError:
+            pass
+    return p
+
+
+def publish_job_file(name: str) -> Path:
+    """AutoCAD -PUBLISH job (.dsd) goes to local temp, never beside the DWG in Dropbox
+    (DWG paths inside the DSD are absolute, so where the DSD sits is free)."""
+    import tempfile
+    d = Path(tempfile.gettempdir()) / "ifr_publish"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / name
+
+
 # IFC/IFR classification patterns
 _RE_IFC_FILE = re.compile(r'[_\s-](?:[Rr]ev|[Rr])\.?\s*(\d+)(?:[_\s-]?IFC)?(?=[_.\s]|$)', re.IGNORECASE)
 _RE_IFR_FILE = re.compile(r'[_\s-](?:[Rr]ev|[Rr])\.?\s*([A-Z])(?=[_.\s]|$)', re.IGNORECASE)
@@ -4334,7 +4374,8 @@ class IFCTransmittalManager:
 
         self.ifc_dir = self.project_path / self.IFC_CLIENT_REL
         self.transmittal_dir = self.project_path / self.transmittal_rel
-        self.state_file = self.transmittal_dir / self.state_file_name
+        self.state_file = machine_state_file(self.project_path, self.state_file_name,
+                                             legacy=self.transmittal_dir / self.state_file_name)
 
     # ── 2a. Version Management ──
 
@@ -4838,7 +4879,6 @@ class IFCTransmittalManager:
             "transmitted_files": sorted(existing),
         }
         try:
-            self.transmittal_dir.mkdir(parents=True, exist_ok=True)
             with open(str(to_long_path(self.state_file)), 'w', encoding='utf-8') as f:
                 json.dump(new_state, f, indent=2, ensure_ascii=False)
         except Exception as e:
@@ -7101,7 +7141,7 @@ class IFCManager(IFCStampMixin):
             to_long_path(pdf_path.parent).mkdir(parents=True, exist_ok=True)
             if _use_temp:
                 _temp_dir.mkdir(parents=True, exist_ok=True)
-            dsd_path = actual_dwg.parent / f"{sheet_name}.dsd"
+            dsd_path = publish_job_file(f"{sheet_name}.dsd")
             dsd_path.write_text(dsd_content, encoding='utf-8')
 
             # Suppress all dialogs for silent PUBLISH
@@ -8581,7 +8621,7 @@ class PanelIFCManager(IFCStampMixin):
 
             # Build DSD file with detected layout name
             dsd_content = self._build_dsd(pages, pdf_path, dwg_folder, layout_name)
-            dsd_path = dwg_folder / f"{doc_no}_IFC.dsd"
+            dsd_path = publish_job_file(f"{doc_no}_IFC.dsd")
             dsd_path.write_text(dsd_content, encoding='utf-8')
 
             # Need an open document to run PUBLISH
@@ -8646,6 +8686,10 @@ class PanelIFCManager(IFCStampMixin):
 
             try:
                 doc.Close(False)
+            except Exception:
+                pass
+            try:
+                dsd_path.unlink()
             except Exception:
                 pass
 
@@ -9063,12 +9107,17 @@ def _extract_doc_id_standalone(filename: str, allow_fallback: bool = True) -> Op
 
 # ── IFC freshness (PM 2026-10-22: GG38 009/005/006/017 IFCs went stale unnoticed) ──
 # Each IFC records the IFR PDF it was converted from (rev + size + mtime) in
-# 8. Deliverables/Transmittal/ifc_source.json. Before re-conversion is skipped or an
+# the local machine-state dir (_state/<project>/ifc_source.json — never Dropbox). Before re-conversion is skipped or an
 # IFC is synced to the client, compare with the CURRENT latest IFR in 2. IFR_internal:
 # newer rev letter, or same letter re-saved with different content → stale.
 # IFC-vs-IFR mtime alone is NOT the test (republishing an old IFC refreshes its mtime);
 # it is only the fallback when no source record exists.
-_IFC_SOURCE_REL = "Design/Engineering/8. Deliverables/Transmittal/ifc_source.json"
+_IFC_SOURCE_LEGACY_REL = "Design/Engineering/8. Deliverables/Transmittal/ifc_source.json"
+
+
+def _ifc_source_path(project_path: Path) -> Path:
+    return machine_state_file(project_path, "ifc_source.json",
+                              legacy=Path(project_path) / _IFC_SOURCE_LEGACY_REL)
 _IFR_INTERNAL_REL = "Design/Engineering/1. Drawings/2. IFR_internal"
 
 
@@ -9104,7 +9153,7 @@ def _latest_ifr_pdfs(project_path: Path) -> Dict[str, Path]:
 
 
 def _ifc_source_load(project_path: Path) -> Dict:
-    p = to_long_path(Path(project_path) / _IFC_SOURCE_REL)
+    p = _ifc_source_path(project_path)
     try:
         with open(str(p), encoding='utf-8') as fh:
             return json.load(fh)
@@ -9118,8 +9167,7 @@ def _ifc_source_record(project_path: Path, key: str, ifr_pdf: Optional[Path], re
     data[key] = {'rev': rev, 'ifr_pdf': ifr_pdf.name if ifr_pdf else None,
                  'size': st.st_size if st else None, 'mtime': st.st_mtime if st else None,
                  'ifc_pdf': ifc_pdf_name, 'at': datetime.now().isoformat(timespec='seconds')}
-    p = to_long_path(Path(project_path) / _IFC_SOURCE_REL)
-    p.parent.mkdir(parents=True, exist_ok=True)
+    p = _ifc_source_path(project_path)
     with open(str(p), 'w', encoding='utf-8') as fh:
         json.dump(data, fh, indent=2, ensure_ascii=False, sort_keys=True)
 
@@ -9170,7 +9218,7 @@ def ifc_freshness_report(project_path: Path) -> Dict:
 def trim_pdf_to_reference(pdf: Path, ref_pdf: Path, min_sim: float = 0.95) -> Optional[str]:
     """DWG has more publishable layouts than were ever issued (GG38 002-1: 3 vs 1): keep only
     the pages that match the reference PDF's pages one-to-one (thumbnail similarity >= min_sim),
-    in reference order. Original saved as SS/<stem>.untrimmed.pdf. Returns a note, or None if
+    in reference order. Original saved as _state/<project>/untrimmed/<stem>.untrimmed.pdf (local). Returns a note, or None if
     nothing to do; ambiguous match → untouched + note (never guesses)."""
     import fitz
     with fitz.open(str(ref_pdf)) as r, fitz.open(str(pdf)) as d:
@@ -9188,7 +9236,9 @@ def trim_pdf_to_reference(pdf: Path, ref_pdf: Path, min_sim: float = 0.95) -> Op
             keep.append((best, sc[best]))
     if not all(s >= min_sim for _, s in keep) or len({b for b, _ in keep}) != len(keep):
         return f"页数多于参照且无法一一对应 {[(b + 1, round(s, 3)) for b, s in keep]}, 未截页"
-    ss = pdf.parent / "SS"; ss.mkdir(exist_ok=True)
+    # project root = the folder holding "Design" above this PDF; backup stays local, never Dropbox
+    proj = next((a for a in pdf.parents if (a / "Design").is_dir()), pdf.parent)
+    ss = machine_state_dir(proj) / "untrimmed"; ss.mkdir(exist_ok=True)
     bk = ss / (pdf.stem + ".untrimmed.pdf")
     shutil.copy2(str(pdf), str(bk))
     with fitz.open(str(bk)) as src:
@@ -14689,7 +14739,7 @@ class AsBuiltManager(IFCManager):
                 'BlockTmplFilePath=',
             ])
             dsd_content = '\n'.join(dsd_lines)
-            dsd_path = dwg_folder / f"{doc_id}_AB.dsd"
+            dsd_path = publish_job_file(f"{doc_id}_AB.dsd")
             dsd_path.write_text(dsd_content, encoding='utf-8')
 
             # Open first DWG to run PUBLISH

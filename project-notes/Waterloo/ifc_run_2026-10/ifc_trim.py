@@ -1,5 +1,5 @@
 # Keep only the IFC pages that match a page the client approved in the IFR PDF (extra layouts in the DWG were never issued).
-# Original IFC PDF backed up to 4. IFC(Client)\SS\<name>.untrimmed.pdf first.
+# Original IFC PDF backed up to <repo>/_state/Waterloo/untrimmed/<name>.untrimmed.pdf first (never Dropbox).
 import sys, shutil, fitz
 from pathlib import Path
 E = Path(r"C:\Users\ACE\GREEN GOLD ENERGY Dropbox\Projects\Project (EPC)\2.SA\Waterloo\Design\Engineering")
@@ -21,7 +21,7 @@ for p in sorted(ifc_dir.glob("*_Rev0_IFC.pdf")):
     ok = all(sc >= 0.95 for _, sc in keep) and len({b for b, _ in keep}) == len(keep)
     print(doc, f"{d.page_count}->{len(keep)} keep={keep}", "OK" if ok else "AMBIGUOUS-skip")
     if APPLY and ok:
-        d.close(); ss = ifc_dir / "SS"; ss.mkdir(exist_ok=True)
+        d.close(); ss = Path(__file__).resolve().parents[3] / "_state" / "Waterloo" / "untrimmed"; ss.mkdir(parents=True, exist_ok=True)
         bk = ss / (p.stem + ".untrimmed.pdf"); shutil.copy2(p, bk)
         src = fitz.open(bk); out = fitz.open()
         for b, _ in keep: out.insert_pdf(src, from_page=b, to_page=b)
