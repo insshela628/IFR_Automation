@@ -7717,6 +7717,11 @@ class IFCManager(IFCStampMixin):
                 if _lost:
                     result['errors'].append(f"内容QA: IFC 比 IFR 少内容 {_lost} (疑似参照图未加载/文字被删)")
                     print(f"    ✗ 内容QA: IFC 比 IFR 少内容 {_lost} — 需检查")
+                try:  # DWG-side freshness baseline, after every post-publish re-save
+                    ifc_source_mark_dwg(self.project_path,
+                                        _doc_key(Path(ifc_pdf_path).name) or doc_id.upper(), Path(ifc_dwg_path))
+                except Exception as _e_md:
+                    print(f"    ⚠ DWG 基线记录失败: {_e_md}")
             else:
                 result['errors'].append(
                     f"PDF PUBLISH 导出失败: {ifc_pdf_path.name} (DWG已保存)")
@@ -9172,15 +9177,70 @@ def _ifc_source_record(project_path: Path, key: str, ifr_pdf: Optional[Path], re
         json.dump(data, fh, indent=2, ensure_ascii=False, sort_keys=True)
 
 
+_DWG_SKIP_DIRS = {'ss', 'superseded', 'superceded', '_ifc_temp', '13. client sharepoint', '8. deliverables'}
+
+
+def _latest_doc_dwgs(project_path: Path) -> Dict[str, Path]:
+    """{doc_key: newest-mtime DWG} across Design/Engineering (Native + report folders), metadata only.
+    The designer's edit lands in a DWG first — an IFR-PDF-only check is blind to it
+    (GG38 E-BLD-002 2026-11-06: IFC DWG edited after its PDF, no IFR re-plot)."""
+    out: Dict[str, Path] = {}
+    root = to_long_path(Path(project_path) / "Design" / "Engineering")
+    for dp, dn, fn in os.walk(str(root)):
+        dn[:] = [d for d in dn if d.lower() not in _DWG_SKIP_DIRS and 'bak' not in d.lower()]
+        for f in fn:
+            if not f.lower().endswith('.dwg') or f.startswith('~$') or 'bakcheck' in f.lower():
+                continue
+            k = _doc_key(f)
+            if not k:
+                continue
+            p = Path(dp) / f
+            try:
+                if k not in out or p.stat().st_mtime > out[k].stat().st_mtime:
+                    out[k] = p
+            except OSError:
+                pass
+    return out
+
+
+def ifc_source_mark_dwg(project_path: Path, key: str, dwg: Path, note: Optional[str] = None):
+    """Baseline the DWG side after publish/QA: later DWG saves with no content change
+    (post-publish re-save, GG38 SLD-001 11-06: replot diff 0.000%) must not read as edits."""
+    data = _ifc_source_load(project_path)
+    r = data.setdefault(key, {})
+    r['dwg_mtime'] = Path(to_long_path(dwg)).stat().st_mtime
+    if note:
+        r['note'] = note
+    with open(str(_ifc_source_path(project_path)), 'w', encoding='utf-8') as fh:
+        json.dump(data, fh, indent=2, ensure_ascii=False, sort_keys=True)
+
+
 def ifc_stale_reason(project_path: Path, ifc_pdf: Path, latest: Optional[Dict] = None,
-                     sources: Optional[Dict] = None) -> Optional[str]:
-    """None = fresh (or no IFR to compare); else a one-line reason the IFC is stale."""
+                     sources: Optional[Dict] = None, dwgs: Optional[Dict] = None) -> Optional[str]:
+    """None = fresh (or no IFR to compare); else a one-line reason the IFC is stale.
+    Two halves: IFR PDF side (rev bump / in-place re-plot) and DWG side (edited, not re-plotted)."""
     key = _doc_key(ifc_pdf.name)
     latest = _latest_ifr_pdfs(project_path) if latest is None else latest
     src = latest.get(key) if key else None
-    if not src:
-        return None
-    rec = (_ifc_source_load(project_path) if sources is None else sources).get(key)
+    rec = (_ifc_source_load(project_path) if sources is None else sources).get(key) if key else None
+    why = _ifc_stale_ifr(ifc_pdf, src, rec) if src else None
+    if why or not key:
+        return why
+    dw = (_latest_doc_dwgs(project_path) if dwgs is None else dwgs).get(key)
+    if dw is not None:
+        ref = max(ifc_pdf.stat().st_mtime, (rec or {}).get('dwg_mtime') or 0)
+        try:  # a PM acceptance/conversion record after the PDF moves the baseline
+            ref = max(ref, datetime.fromisoformat(rec['at']).timestamp()) if rec and rec.get('at') else ref
+        except ValueError:
+            pass
+        m = dw.stat().st_mtime
+        if m > ref + 60:
+            return (f"DWG 改过还没重出图 (`{dw.name}` {datetime.fromtimestamp(m):%m-%d %H:%M}, "
+                    f"IFC PDF {datetime.fromtimestamp(ifc_pdf.stat().st_mtime):%m-%d %H:%M})")
+    return None
+
+
+def _ifc_stale_ifr(ifc_pdf: Path, src: Path, rec: Optional[Dict]) -> Optional[str]:
     new_rev, st = _letter_rev(src.stem), src.stat()
     if rec:
         if new_rev > (rec.get('rev') or ''):
@@ -9202,16 +9262,25 @@ def ifc_freshness_report(project_path: Path) -> Dict:
     if not ifc_dir.exists():
         return out
     latest, sources = _latest_ifr_pdfs(project_path), _ifc_source_load(project_path)
+    dwgs = _latest_doc_dwgs(project_path)
     sent = {_doc_key(n) for n in IFCTransmittalManager(project_path, dry_run=True)
             .get_last_run_state().get('transmitted_files', [])}
+    have = set()
     for f in sorted(ifc_dir.iterdir()):
         if not f.is_file() or f.suffix.lower() != '.pdf' or f.name.startswith('~$'):
             continue
         out["checked"] += 1
-        why = ifc_stale_reason(project_path, f, latest, sources)
+        k = _doc_key(f.name)
+        have.add(k)
+        why = ifc_stale_reason(project_path, f, latest, sources, dwgs)
         if why:
-            k = _doc_key(f.name)
             out["stale"].append({"doc_key": k, "file": f.name, "why": why, "transmitted": k in sent})
+    # designer already named a DWG "...IFC" but no IFC PDF exists for that doc (GG38 E-PLN-002 r0-IFC)
+    out["unissued"] = [{"doc_key": k, "dwg": p.name,
+                        "mtime": f"{datetime.fromtimestamp(p.stat().st_mtime):%m-%d %H:%M}"}
+                       for k, p in sorted(dwgs.items())
+                       if 'ifc' in p.stem.lower() and k not in have
+                       and not any(h and h.startswith(k + '-') for h in have)]
     return out
 
 
