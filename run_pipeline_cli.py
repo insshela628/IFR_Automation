@@ -14,6 +14,12 @@ Usage:
   python run_pipeline_cli.py "<keyword>" --execute  # real run (moves files → Superseded/)
   python run_pipeline_cli.py "<keyword>" --stages deliverable asbuilt_version   # subset
   python run_pipeline_cli.py "<keyword>" --refresh-approved   # ONLY latest-wins Approved to IFC swap (real)
+  python run_pipeline_cli.py "<keyword>" --ifc-status [--execute]  # internal DLV ← issued IFC PDFs
+
+--ifc-status: new IFC PDF in 4. IFC(Client) → its INTERNAL DLV row becomes Approved IFC
++ numeric rev + date, stale to-do comment cleared. Idempotent (unchanged rows untouched).
+Never rebuilds the client DLV — a PDF in the folder is not a transmittal. Driven by
+auto_drain's IFC-PDF watch every round (PM 2026-11-09: 出了 IFC PDF 就要更新台账).
 
 --refresh-approved: the one real write the daily patrol (auto_drain ④.8) is allowed. Runs
 IFRAutomation.refresh_approved_to_latest alone (PM 2026-10-22: "以后不能这样一个个问了，你要自动
@@ -99,6 +105,7 @@ def main(argv):
     execute = "--execute" in args
     do_list = "--list" in args
     refresh_only = "--refresh-approved" in args
+    ifc_status = "--ifc-status" in args
     # --stages s1 s2 ... : everything after the flag until the next --flag.
     stages = None
     if "--stages" in args:
@@ -148,6 +155,37 @@ def main(argv):
         return 2
 
     project = matches[0]
+    if ifc_status:
+        # Internal DLV only: rows whose doc has a current IFC PDF in 4. IFC(Client) (or an
+        # Approved-to-IFC report) → Approved IFC + rev + date. No Sharepoint/client write.
+        try:
+            from ifr_automation_v10 import DeliverableManager, IFCTransmittalManager
+            pp = Path(project.project_path)
+            ifc_map = DeliverableManager(pp, dry_run=True).scan_ifc_folder()
+            tm = IFCTransmittalManager(pp, config=_get_config(), dry_run=not execute)
+            n = tm.update_deliverable_ifc_status(ifc_map, sync=False)
+        except Exception as e:
+            _emit("error", stage="ifc_status", project=project.project_name, message=str(e))
+            return 1
+        if ifc_map and not getattr(tm, "last_excel", None) and not getattr(tm, "last_error", None):
+            print("  ⚠ 找不到 DLV (8. Deliverables / 3.Deliverables) — 本项目没写, 不是没变化")
+            _emit("no_dlv", project=project.project_name, ifc_pdfs=len(ifc_map))
+            return 0
+        if getattr(tm, "last_error", None):
+            _emit("error", stage="ifc_status", project=project.project_name,
+                  message=tm.last_error)
+            return 1
+        for c in tm.last_changes:
+            print(f"  {c['doc_id']}: {c['old_status'] or '(空)'} Rev{c['old_rev'] or '-'}"
+                  f" → Approved IFC Rev{c['new_rev']}"
+                  + (f"  (清掉 comment: {c['cleared_comment']})" if c['cleared_comment'] else ""))
+        print(f"{'已写' if execute else '预览'} {n} 行 → "
+              f"{getattr(tm, 'last_excel', None) and tm.last_excel.name}")
+        _emit("ok", project=project.project_name, dry_run=not execute, updated=n,
+              changes=tm.last_changes,
+              excel=str(getattr(tm, "last_excel", "") or ""),
+              ifc_pdfs=sorted(v.get("filename", "") for v in ifc_map.values()))
+        return 0
     if refresh_only:
         try:
             cfg = _get_config()

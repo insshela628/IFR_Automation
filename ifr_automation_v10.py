@@ -3120,8 +3120,10 @@ class DeliverableManager:
     _RE_DOC_ID_GENERIC = re.compile(r'^([A-Z0-9][\w]+-[A-Z]+-[A-Z]*-?\d{3})', re.IGNORECASE)
 
     # Revision extraction from filename
-    _RE_REV_LETTER = re.compile(r'[_\s-](?:[Rr]ev|[Rr])\.?\s*([A-Z])(?=[_.\s]|$)', re.IGNORECASE)
-    _RE_REV_NUMBER = re.compile(r'[_\s-](?:[Rr]ev|[Rr])\.?\s*(\d+)(?=[_.\s]|$)', re.IGNORECASE)
+    # Lookahead allows '-' too: designers save `GG38-E-PLN-002-Rev0-IFC.pdf`; without it
+    # Rev1-IFC read as no-rev → 0 (IFC status / DLV rev).
+    _RE_REV_LETTER = re.compile(r'[_\s-](?:[Rr]ev|[Rr])\.?\s*([A-Z])(?=[_.\s-]|$)', re.IGNORECASE)
+    _RE_REV_NUMBER = re.compile(r'[_\s-](?:[Rr]ev|[Rr])\.?\s*(\d+)(?=[_.\s-]|$)', re.IGNORECASE)
 
     # Header pattern to detect column layout
     HEADER_KEYWORDS = ['revision', 'submission date', 'status']
@@ -3561,12 +3563,26 @@ class DeliverableManager:
                 for f in ifc_dir.rglob("*.pdf"):
                     if f.name.startswith('~$'):
                         continue
+                    # Archived copies (4. IFC(Client)/SS/...) are not current IFC —
+                    # rglob used to count them, so a superseded-only doc read as issued.
+                    if any(p.lower() in ('ss', 'superseded', 'superceded')
+                           for p in f.relative_to(ifc_dir).parts[:-1]):
+                        continue
                     doc_id = self.extract_doc_id(f.name)
                     if not doc_id:
                         continue
+                    # Reports/schedules go IFC at their approved LETTER rev
+                    # (`..._RevA_IFC.pdf`); reading those as 0 would knock the DLV
+                    # back from RevA to Rev0. Numeric first, then letter.
                     m = self._RE_REV_NUMBER.search(f.name)
-                    rev_num = int(m.group(1)) if m else 0
-                    if doc_id not in ifc_info or rev_num > ifc_info[doc_id]['revision']:
+                    if m:
+                        rev_num = int(m.group(1))
+                    else:
+                        ml = self._RE_REV_LETTER.search(f.name)
+                        rev_num = ml.group(1).upper() if ml else 0
+                    prev = ifc_info.get(doc_id)
+                    if prev is None or ((isinstance(rev_num, int), rev_num) >
+                                        (isinstance(prev['revision'], int), prev['revision'])):
                         ifc_info[doc_id] = {'revision': rev_num, 'filename': f.name}
             except (OSError, PermissionError):
                 pass
@@ -4455,15 +4471,30 @@ class IFCTransmittalManager:
 
     # ── 2b. Deliverable Update ──
 
-    def update_deliverable_ifc_status(self, ifc_files: Dict[str, Dict]) -> int:
+    # PM to-do tags in GGE COMMENT that an IFC issue discharges (DLV comment style:
+    # issued rows carry a blank comment). Anything else (N/A notes, provenance) is kept.
+    _RE_DISCHARGED_TODO = re.compile(
+        r'^\s*(TO PRODUCE|UPDATE(\s+REQUIRED)?|REVIEW NEEDED|IN PROGRESS)\b', re.IGNORECASE)
+
+    def update_deliverable_ifc_status(self, ifc_files: Dict[str, Dict],
+                                      sync: bool = True) -> int:
         """Update deliverable Excel column L with IFC revision numbers.
 
         Args:
             ifc_files: {doc_id: {revision: int, filename: str}}
+            sync: also mirror to 3.Deliverables + rebuild the CLIENT DLV in Client
+                Sharepoint. The unattended patrol passes False: a PDF landing in
+                4. IFC(Client) is not a transmittal, so the client edition must not
+                show it as Approved IFC yet (outbound stays human-triggered).
+
+        Idempotent: a row already `Approved IFC` at the same rev is left alone (date
+        untouched) — before, every run re-stamped today's date on every IFC row.
+        `self.last_changes` lists what was written (doc_id, old/new rev+status, comment).
 
         Returns:
             Number of rows updated.
         """
+        self.last_changes = []
         if not ifc_files:
             return 0
 
@@ -4473,29 +4504,24 @@ class IFCTransmittalManager:
             self.logger.warning("Deliverable Excel not found")
             return 0
 
-        if self.dry_run:
-            # In dry-run, just count matches
-            try:
-                wb = openpyxl.load_workbook(str(to_long_path(excel_path)))
-                ws = wb.active
-                layout = dm.detect_layout(ws)
-                count = 0
-                for row in range(layout.header_row + 1, ws.max_row + 1):
-                    cell_val = ws.cell(row=row, column=layout.doc_id_col).value
-                    if cell_val and str(cell_val).strip() in ifc_files:
-                        count += 1
-                wb.close()
-                return count
-            except Exception as e:
-                self.logger.error(f"Dry-run deliverable scan failed: {e}")
-                return 0
-
-        # Actual update
+        # One path for dry-run and real: the preview lists exactly the rows the write
+        # would change (the old dry-run counted every doc-ID match, changed or not).
         try:
             wb = openpyxl.load_workbook(str(to_long_path(excel_path)))
             ws = wb.active
             layout = dm.detect_layout(ws)
             updated = 0
+            # GGE COMMENT sits on the merged top header (row 4), not on the
+            # Revision/Date/Status row that detect_layout calls header_row (row 6).
+            comment_col = None
+            for hr in range(layout.header_row, 0, -1):
+                for c in range(1, ws.max_column + 1):
+                    hv = ws.cell(row=hr, column=c).value
+                    if hv and 'gge comment' in str(hv).lower():
+                        comment_col = c
+                        break
+                if comment_col:
+                    break
 
             for row in range(layout.header_row + 1, ws.max_row + 1):
                 cell_val = ws.cell(row=row, column=layout.doc_id_col).value
@@ -4512,7 +4538,22 @@ class IFCTransmittalManager:
                     if not kids:
                         continue
                     revs = [k_.get("revision") for k_ in kids if k_.get("revision") is not None]
-                    rev_num = max(revs) if revs else None
+                    rev_num = max(revs, key=lambda r: (isinstance(r, int), r)) if revs else None
+                old_status = str(ws.cell(row=row, column=layout.status_col).value or '').strip()
+                old_rev = str(ws.cell(row=row, column=layout.rev_col).value or '').strip()
+                if (old_status.lower() == 'approved ifc'
+                        and (rev_num is None or old_rev == str(rev_num))):
+                    continue                     # already there — don't re-date it
+                old_cmt = (str(ws.cell(row=row, column=comment_col).value or '').strip()
+                           if comment_col else '')
+                clear_cmt = bool(old_cmt and self._RE_DISCHARGED_TODO.match(old_cmt))
+                self.last_changes.append({
+                    'doc_id': doc_id, 'row': row,
+                    'old_rev': old_rev, 'new_rev': '' if rev_num is None else str(rev_num),
+                    'old_status': old_status, 'cleared_comment': old_cmt if clear_cmt else ''})
+                updated += 1
+                if self.dry_run:
+                    continue
                 # Write IFC numerical revision to K column (0, 1, 2, 3...)
                 if rev_num is not None:
                     ws.cell(row=row, column=layout.rev_col, value=str(rev_num))
@@ -4524,9 +4565,10 @@ class IFCTransmittalManager:
                 ws.cell(row=row, column=layout.rev_col).fill = self.IFC_APPROVED_FILL
                 ws.cell(row=row, column=layout.date_col).fill = self.IFC_APPROVED_FILL
                 ws.cell(row=row, column=layout.status_col).fill = self.IFC_APPROVED_FILL
-                updated += 1
+                if clear_cmt:
+                    ws.cell(row=row, column=comment_col).value = None
 
-            if updated > 0:
+            if updated > 0 and not self.dry_run:
                 # Header "Last Updated" too — cross_check / update_ifc_deliverables
                 # already do; this IFC path left it stale (GG38 stuck at 20/10/26).
                 try:
@@ -4534,16 +4576,18 @@ class IFCTransmittalManager:
                 except Exception:
                     pass
                 # Version the deliverable: move old to SS, save new
-                self._version_and_save_deliverable(wb, excel_path)
+                self._version_and_save_deliverable(wb, excel_path, sync=sync)
             else:
                 wb.close()
 
+            self.last_excel = excel_path
             return updated
         except Exception as e:
             self.logger.error(f"Deliverable update failed: {e}")
+            self.last_error = str(e)
             return 0
 
-    def _version_and_save_deliverable(self, wb, excel_path: Path):
+    def _version_and_save_deliverable(self, wb, excel_path: Path, sync: bool = True):
         """Save workbook, versioning old file to SS/, then sync to all deliverable locations."""
         ss_folder = excel_path.parent / "SS"
         ss_folder.mkdir(exist_ok=True)
@@ -4570,7 +4614,7 @@ class IFCTransmittalManager:
 
         # Sync to all deliverable locations (same as DeliverableManager._sync_deliverable)
         dm = DeliverableManager(self.project_path, dry_run=self.dry_run)
-        if not self.dry_run:
+        if not self.dry_run and sync:
             dm._sync_deliverable(excel_path)
 
     # ── 2c. Transmittal Generation ──
