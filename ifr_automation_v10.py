@@ -3111,6 +3111,22 @@ class DeliverableCrossCheckResult:
     errors: List[str] = field(default_factory=list)
 
 
+def _stamp_dlv_updated(ws, layout, when: Optional[datetime] = None) -> None:
+    """Every DLV write stamps BOTH dates: header 'Last Updated' (dd/mm/yy) and the
+    signature-block 'Date：' cell under the notes (YYYY-MM-DD text, template style).
+    Only the header was stamped → GG38 footer sat at 2026-07-07 (PM 2026-11-10)."""
+    when = when or datetime.now()
+    ws[layout.last_updated_cell].value = when.strftime('%d/%m/%y')
+    for r in range(layout.header_row + 1, ws.max_row + 1):
+        v = ws.cell(r, layout.doc_id_col).value
+        if isinstance(v, str) and v.replace(' ', '').strip().rstrip('：:').strip().upper() == 'DATE':
+            try:
+                ws.cell(r, layout.doc_id_col + 1).value = when.strftime('%Y-%m-%d')
+            except Exception:      # merged/readonly cell → header stamp still done
+                pass
+            return
+
+
 class DeliverableManager:
     """Cross-check and update deliverable Excel files against project folders."""
 
@@ -3985,21 +4001,12 @@ class DeliverableManager:
             ws.cell(row=row, column=14).fill = self.CHANGE_MARKER_FILL
             check_result.rows_updated += 1
 
-        # Insert new items
+        # Folder items with no DLV row are REPORTED, never written. Appending at
+        # ws.max_row+1 landed them under the notes/signature block as junk rows
+        # (GG38 rows 93-99: "Appendix A…", "Site Plan - 344…", PM 2026-11-10).
+        # A real new deliverable goes into its category block by hand.
         for item in check_result.items_in_folders_not_excel:
-            insert_row = ws.max_row + 1
-            ws.cell(row=insert_row, column=layout.doc_id_col).value = item['doc_id']
-            ws.cell(row=insert_row, column=layout.desc_col).value = item['description']
-            if item['revision']:
-                ws.cell(row=insert_row, column=layout.rev_col).value = item['revision']
-            # Marker highlights on J and N
-            ws.cell(row=insert_row, column=10).fill = self.CHANGE_MARKER_FILL
-            ws.cell(row=insert_row, column=14).fill = self.CHANGE_MARKER_FILL
-            # Status-based fill on K-M
-            ws.cell(row=insert_row, column=layout.rev_col).fill = self.STATUS_SUBMITTED_FILL
-            ws.cell(row=insert_row, column=layout.date_col).fill = self.STATUS_SUBMITTED_FILL
-            ws.cell(row=insert_row, column=layout.status_col).fill = self.STATUS_SUBMITTED_FILL
-            check_result.rows_inserted += 1
+            print(f"  ⚠ 不在 DLV (仅报告, 不写入): {item['doc_id']} {item['description']}")
 
         # Update file revision and last updated date
         old_file_rev = ws[layout.file_rev_cell].value
@@ -4011,7 +4018,7 @@ class DeliverableManager:
             ws[layout.file_rev_cell].value = f"{prefix_match.group(1)}{new_file_rev}"
         else:
             ws[layout.file_rev_cell].value = new_file_rev
-        ws[layout.last_updated_cell].value = datetime.now().strftime('%d/%m/%y')
+        _stamp_dlv_updated(ws, layout)
         check_result.new_file_rev = str(new_file_rev)
 
         if not self.dry_run:
@@ -4572,7 +4579,7 @@ class IFCTransmittalManager:
                 # Header "Last Updated" too — cross_check / update_ifc_deliverables
                 # already do; this IFC path left it stale (GG38 stuck at 20/10/26).
                 try:
-                    ws[layout.last_updated_cell].value = datetime.now().strftime('%d/%m/%y')
+                    _stamp_dlv_updated(ws, layout)
                 except Exception:
                     pass
                 # Version the deliverable: move old to SS, save new
@@ -7923,7 +7930,7 @@ class IFCManager(IFCStampMixin):
             ws[layout.file_rev_cell].value = f"{prefix_match.group(1)}{new_file_rev}"
         else:
             ws[layout.file_rev_cell].value = new_file_rev
-        ws[layout.last_updated_cell].value = date_str
+        _stamp_dlv_updated(ws, layout)
 
         if not self.dry_run:
             new_path = self._dm._get_new_filename(excel_path, new_file_rev)
