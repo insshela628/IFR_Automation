@@ -1812,12 +1812,13 @@ class IFRAutomation:
           IFR(Client)/<sub>/Approved to IFC        old → Approved to IFC/SS/, new copied in
           Client Sharepoint/<sub>/Approved to IFC  old → the internal SS above, new as <stem>-Approved.pdf
         Numeric revs (Rev1/Rev2 schedules) have no letter rev → untouched.
-        IFC never delivered (not in ifc_state transmitted_files) → the old rev RETIRES: its
+        IFC never submitted (no row in the submissions ledger, `ifc_submissions`) → the old rev RETIRES: its
         '-Approved' tag is dropped in SS, and a byte-identical duplicate is removed (PM 10-22:
         still in Transmittal 01 → no "RevE approved" record). Delivered → old -Approved kept.
         """
         import filecmp
-        sent = {_doc_key(n) for n in ifc_delivered_names(project_path)}
+        _led = ifc_submissions(project_path)
+        sent = {_doc_key(n) for n in _led['files']}   # ledger unknown → keep every old -Approved
         result = {"refreshed": 0, "errors": [], "details": [], "items": []}
         eng = project_path / "Design/Engineering"
         ifr_client_base = eng / "1. Drawings/3. IFR(Client)"
@@ -1887,7 +1888,7 @@ class IFRAutomation:
                         continue
                     try:
                         ss_dir.mkdir(parents=True, exist_ok=True)
-                        retire = suffix and k not in sent
+                        retire = suffix and not _led['error'] and k not in sent
                         bak = ss_dir / (_RE_APPROVED_SUFFIX.sub('', f.stem) + f.suffix if retire else f.name)
                         if retire and bak.exists() and filecmp.cmp(str(f), str(bak), shallow=False):
                             f.unlink()  # identical retired copy already in SS
@@ -4890,6 +4891,7 @@ class IFCTransmittalManager:
                 continue
             synced = 0
             _latest, _srcs = _latest_ifr_pdfs(self.project_path), _ifc_source_load(self.project_path)
+            _led = None
             for pdf in self.ifc_dir.glob("*.pdf"):
                 if pdf.name.startswith('~$'):
                     continue
@@ -4905,6 +4907,19 @@ class IFCTransmittalManager:
                     dst_stat = dest.stat()
                     if abs(src_stat.st_size - dst_stat.st_size) < 2 and abs(src_stat.st_mtime - dst_stat.st_mtime) < 2:
                         continue
+                    if filecmp.cmp(str(to_long_path(pdf)), str(to_long_path(dest)), shallow=False):
+                        continue
+                    # same name already client-visible → QA vs the submissions ledger first (PM 11-12)
+                    if _led is None:
+                        _led = ifc_submissions(self.project_path, max_age_h=1, refresh=True)
+                    no = sharepoint_overwrite(self.project_path, pdf, dest, _led,
+                                              _srcs.get(_doc_key(pdf.name) or ''))
+                    if no:
+                        self.logger.error(f"13 不覆盖: {pdf.name} ({no})")
+                        print(f"    ✗ 13 不覆盖 {pdf.name}: {no}")
+                    else:
+                        synced += 1
+                    continue
                 try:
                     shutil.copy2(str(to_long_path(pdf)), str(to_long_path(dest)))
                     synced += 1
@@ -9390,31 +9405,121 @@ def _ifc_stale_ifr(ifc_pdf: Path, src: Path, rec: Optional[Dict]) -> Optional[st
     return None
 
 
-def ifc_delivered_names(project_path: Path) -> set:
-    """IFC PDF filenames the client already has: the transmittal ledger (ifc_state transmitted_files)
-    PLUS every PDF in 13. Client Sharepoint/2.IFC (client-visible = delivered). The ledger alone
-    missed GG38 TSMT-01 (sent 11-06 from transmittal_gen, not IFCTransmittalManager) → 4 submitted
-    Rev0s were re-plotted in place on 11-12 instead of bumped to Rev1 (PM: 给客户 submit 过就要升版)."""
-    names = set(IFCTransmittalManager(project_path, dry_run=True)
-                .get_last_run_state().get('transmitted_files', []))
-    sp = project_path / "Design/Engineering/13. Client Sharepoint/2.IFC"
+# ── Client submission = ONE truth source (PM 2026-11-12) ─────────────────────────────────
+# `_state/<project>/submissions.json`, kept by pm-automation `submission_ledger.py` (auto_drain
+# every round): her SENT transmittal emails (SentOn) × the TSMT xlsx attached to them. NOT
+# 13. Client Sharepoint presence, NOT ifc_state transmitted_files (generated ≠ sent).
+# Rule: a change ≤ SUBMIT_GRACE_H after SentOn = contingency → same rev, in place, 13 overwritten
+# (GG38 TSMT-01 11-06 13:33: next-day change, client hadn't looked yet). Later → Rev bump (PM call).
+# Ledger missing / stale / errored = unknown → nothing in place, nothing overwritten.
+SUBMIT_GRACE_H = 24
+_PM_REPO = Path(os.environ.get('PM_AUTOMATION_REPO', r'D:\1.dev\work\L04-decision\pm-automation'))
+
+
+def ifc_submissions(project_path: Path, max_age_h: float = 26, refresh: bool = False) -> Dict:
+    """{'files': {file stem lower: {'ref','sent_at'} (earliest send)}, 'error': str|None}.
+    refresh=True re-reads Sent Items first (pre-export QA wants the ledger as of now)."""
+    cmd = f'python "{_PM_REPO / "submission_ledger.py"}" "{project_path}"'
+    if refresh:
+        import subprocess
+        try:
+            subprocess.run([sys.executable, str(_PM_REPO / "submission_ledger.py"), str(project_path)],
+                           capture_output=True, timeout=300, cwd=str(_PM_REPO))
+        except Exception:
+            pass
+    p = machine_state_dir(project_path) / "submissions.json"
     try:
-        names.update(f.name for f in sp.iterdir() if f.is_file() and f.suffix.lower() == '.pdf')
+        led = json.loads(p.read_text(encoding='utf-8'))
+        age = (datetime.now() - datetime.fromisoformat(led['checked_at'])).total_seconds() / 3600
+    except Exception:
+        return {'files': {}, 'error': f"交付台账没有/读不了 → `{cmd}`"}
+    files: Dict[str, Dict] = {}
+    for s in sorted(led.get('submissions') or [], key=lambda s: s['sent_at']):
+        for f in s.get('files') or []:
+            files.setdefault(f.lower(), {'ref': s['ref'], 'sent_at': s['sent_at']})
+    err = led.get('error') or (f"交付台账 {age:.0f}h 没刷新 → `{cmd}`" if age > max_age_h else None)
+    return {'files': files, 'error': err}
+
+
+def ifc_submit_status(ifc_name: str, change_ts: Optional[float], led: Dict) -> Dict:
+    """Verdict for redoing `ifc_name` at the SAME rev: unsubmitted / contingency → in_place_ok;
+    bump (change > grace after send) / unknown (ledger error) → not."""
+    if led.get('error'):
+        return {'verdict': 'unknown', 'in_place_ok': False, 'note': led['error']}
+    rec = led['files'].get(Path(ifc_name).stem.lower()) or led['files'].get(ifc_name.lower())
+    if not rec:
+        return {'verdict': 'unsubmitted', 'in_place_ok': True}
+    sent = datetime.fromisoformat(rec['sent_at']).timestamp()
+    ok = change_ts is not None and change_ts <= sent + SUBMIT_GRACE_H * 3600
+    return {'verdict': 'contingency' if ok else 'bump', 'in_place_ok': ok,
+            'ref': rec['ref'], 'sent_at': rec['sent_at'], 'change_ts': change_ts}
+
+
+def _ifc_change_ts(ifc_pdf: Path, why: Optional[str], latest: Dict, dwgs: Dict,
+                   rec: Optional[Dict] = None) -> Optional[float]:
+    """When the source changed. Stale: the DWG / IFR PDF that moved. Fresh: the latest of the
+    publish-time source mtimes and the PDF's own mtime — leans late (toward bump), because a
+    designer re-publishing straight into 4. IFC(Client) leaves no source record behind."""
+    key = _doc_key(ifc_pdf.name) or ''
+    try:
+        if why and why.startswith("DWG 改过") and dwgs.get(key):
+            return dwgs[key].stat().st_mtime
+        if why and latest.get(key):
+            return latest[key].stat().st_mtime
+        return max((rec or {}).get('dwg_mtime') or 0, (rec or {}).get('mtime') or 0,
+                   Path(to_long_path(ifc_pdf)).stat().st_mtime)
     except OSError:
-        pass
-    return names
+        return None
+
+
+def sharepoint_overwrite_check(project_path: Path, pdf: Path, dest: Path, led: Dict,
+                               rec: Optional[Dict] = None, change_ts: Optional[float] = None) -> Optional[str]:
+    """Pre-overwrite QA for an existing 13. Client Sharepoint copy. None = OK to overwrite;
+    else the reason it must not be (reported, file left as the client has it).
+    change_ts: when the source changed, if the caller knows (replot_stale); else inferred."""
+    st = ifc_submit_status(pdf.name, change_ts or _ifc_change_ts(pdf, None, {}, {}, rec), led)
+    if not st['in_place_ok']:
+        return (f"{st['verdict']}: " + (st.get('note') or
+                f"{st['ref']} {st['sent_at']} 已交客户, 改动在 {SUBMIT_GRACE_H}h contingency 之后 → 升版"))
+    lost = ifc_content_check(project_path, pdf)
+    if lost:
+        return f"内容QA: IFC 比 IFR 少内容 {lost}"
+    try:
+        import fitz
+        with fitz.open(str(to_long_path(pdf))) as a, fitz.open(str(to_long_path(dest))) as b:
+            if len(a) != len(b):
+                return f"页数 {len(b)}→{len(a)} (同版本不该变页数)"
+    except Exception as e:
+        return f"读 PDF 失败: {e}"
+    return None
+
+
+def sharepoint_overwrite(project_path: Path, pdf: Path, dest: Path, led: Dict,
+                         rec: Optional[Dict] = None, change_ts: Optional[float] = None) -> Optional[str]:
+    """QA-gated overwrite of the 13 copy; old client copy backed up to _state/<project>/replot/."""
+    why = sharepoint_overwrite_check(project_path, pdf, dest, led, rec, change_ts)
+    if why:
+        return why
+    bk = machine_state_dir(project_path) / "replot"
+    bk.mkdir(exist_ok=True)
+    shutil.copy2(str(to_long_path(dest)), str(bk / f"{dest.stem}.{datetime.now():%Y%m%d_%H%M%S}.13old.pdf"))
+    shutil.copy2(str(to_long_path(pdf)), str(to_long_path(dest)))
+    return None
 
 
 def ifc_freshness_report(project_path: Path) -> Dict:
     """Read-only daily check (no COM): every IFC in 4. IFC(Client) vs its latest IFR source.
-    stale[].transmitted=True → already delivered: needs a Rev bump (PM call), not an in-place Rev0 redo."""
+    stale[].submit = `ifc_submit_status` vs the submissions ledger: in_place_ok (never sent, or
+    changed within SUBMIT_GRACE_H of sending) → same-rev re-plot; bump / unknown → PM call.
+    stale[].transmitted kept for old readers = sent at all."""
     ifc_dir = project_path / "Design/Engineering/1. Drawings/4. IFC(Client)"
     out = {"checked": 0, "stale": [], "ifc_dir": ifc_dir.exists()}
     if not ifc_dir.exists():
         return out
     latest, sources = _latest_ifr_pdfs(project_path), _ifc_source_load(project_path)
     dwgs = _latest_doc_dwgs(project_path)
-    sent = {_doc_key(n) for n in ifc_delivered_names(project_path)}
+    led = ifc_submissions(project_path)
+    out["ledger_error"] = led['error']
     have = set()
     for f in sorted(ifc_dir.iterdir()):
         if not f.is_file() or f.suffix.lower() != '.pdf' or f.name.startswith('~$'):
@@ -9424,7 +9529,9 @@ def ifc_freshness_report(project_path: Path) -> Dict:
         have.add(k)
         why = ifc_stale_reason(project_path, f, latest, sources, dwgs)
         if why:
-            out["stale"].append({"doc_key": k, "file": f.name, "why": why, "transmitted": k in sent})
+            st = ifc_submit_status(f.name, _ifc_change_ts(f, why, latest, dwgs), led)
+            out["stale"].append({"doc_key": k, "file": f.name, "why": why, "submit": st,
+                                 "transmitted": st['verdict'] != 'unsubmitted'})
     # designer already named a DWG "...IFC" but no IFC PDF exists for that doc (GG38 E-PLN-002 r0-IFC)
     out["unissued"] = [{"doc_key": k, "dwg": p.name,
                         "mtime": f"{datetime.fromtimestamp(p.stat().st_mtime):%m-%d %H:%M}"}
@@ -10257,14 +10364,23 @@ class ApprovedIFCManager(IFCStampMixin):
                     self.logger.error(f"重命名失败: {f.name} - {e}")
         return renamed
 
-    def _backup_stale_ifc(self, dwg_info: Dict) -> None:
-        """Stale IFC never sent to the client → regenerate at the same rev (backup old first)."""
+    def _backup_stale_ifc(self, dwg_info: Dict) -> Optional[str]:
+        """Stale IFC that may be redone at the same rev (never sent, or changed within the
+        SUBMIT_GRACE_H contingency after sending) → regenerate in place (backup old first).
+        bump → returns None and the caller converts to the next rev. Ledger unknown → returns
+        the reason: don't convert at all (neither in place nor a guessed bump)."""
         if not (dwg_info.get('stale_ifc') and dwg_info.get('existing_ifc_rev') is not None):
-            return
+            return None
         _old_pdf = dwg_info['stale_ifc'][0]
-        _sent = ifc_delivered_names(self.project_path)
-        if _old_pdf.name in _sent:
-            return
+        _why = dwg_info['stale_ifc'][1] if len(dwg_info['stale_ifc']) > 1 else None
+        _st = ifc_submit_status(_old_pdf.name, _ifc_change_ts(
+            _old_pdf, _why, _latest_ifr_pdfs(self.project_path), _latest_doc_dwgs(self.project_path)),
+            ifc_submissions(self.project_path, max_age_h=1, refresh=True))
+        if _st['verdict'] == 'unknown':
+            return f"交付状态不明, 不重出: {_st['note']}"
+        if not _st['in_place_ok']:
+            print(f"    {dwg_info['doc_id']}: {_st['ref']} {_st['sent_at']} 已交客户且超 contingency → 升版")
+            return None
         _old_dwg = dwg_info['folder'] / (_old_pdf.stem + '.dwg')
         _tag = f".pre-Rev{dwg_info['latest_ifr_rev']}"
         if not self.dry_run:
@@ -10281,28 +10397,36 @@ class ApprovedIFCManager(IFCStampMixin):
                         shutil.copy2(str(to_long_path(_f)), str(to_long_path(_bk)))
         dwg_info['existing_ifc_rev'] = (dwg_info['existing_ifc_rev'] - 1
                                         if dwg_info['existing_ifc_rev'] > 0 else None)
-        print(f"    {dwg_info['doc_id']}: 未发出过的 IFC → 同版本重出, 旧件备份 SS/*{_tag}.*")
+        print(f"    {dwg_info['doc_id']}: {_st['verdict']} → 同版本重出, 旧件备份 SS/*{_tag}.*")
+        return None
 
     # ── Re-plot stale IFC (PM 2026-11-12: 「这个永远都是优先改的」) ──────────
 
     def replot_stale(self, keys: Optional[set] = None) -> Dict:
-        """Bring every stale, never-transmitted IFC PDF back in line with its source.
+        """Bring every stale IFC PDF that may be redone at the SAME rev back in line with its source.
 
         Two cures, chosen per item from `ifc_freshness_report` (same criteria as the patrol):
           - designer edited the *IFC DWG* itself → publish a fresh PDF from that DWG as-is
             (no reconvert: the IFR DWG doesn't hold their edit);
           - IFR side moved (new letter / same letter re-saved) → reconvert from the IFR DWG.
-        Transmitted IFCs are never touched (Rev bump = PM call). No Client Sharepoint copy
-        (13 differences stay report-only, PM 11-10). Every replaced PDF is diffed against the
-        old one → `_state/<project>/replot/*.png` so the PM sees who changed what.
+        Same rev only when the submissions ledger (refreshed from Sent Items first) says never
+        sent, or changed within SUBMIT_GRACE_H of sending (contingency); bump / unknown → skipped,
+        Rev bump = PM call. After a QA pass (`sharepoint_overwrite_check`) the 13. Client
+        Sharepoint copy is overwritten too, old one backed up locally. Every replaced PDF is
+        diffed against the old one → `_state/<project>/replot/*.png` (who changed what).
         Refuses to run while acad.exe is up — the engine would attach to the PM's session."""
-        res = {'replotted': [], 'reconverted': [], 'skipped': [], 'errors': [], 'diffs': []}
+        res = {'replotted': [], 'reconverted': [], 'skipped': [], 'errors': [], 'diffs': [],
+               'sharepoint': []}
+        led = ifc_submissions(self.project_path, max_age_h=1, refresh=True)   # QA vs truth, as of now
         fr = ifc_freshness_report(self.project_path)
         want = [s for s in fr.get('stale') or [] if not keys or s['doc_key'] in keys]
         for s in want:
-            if s.get('transmitted'):
-                res['skipped'].append(f"{s['doc_key']}: 已交付过 → 要升版, PM 定")
-        want = [s for s in want if not s.get('transmitted')]
+            st = s.get('submit') or {}
+            if not st.get('in_place_ok'):
+                res['skipped'].append(f"{s['doc_key']}: {s['why']} —— " + (
+                    f"交付状态不明 → 不动 ({st.get('note')})" if st.get('verdict') == 'unknown' else
+                    f"{st.get('ref')} {st.get('sent_at')} 已交客户, 改动超 {SUBMIT_GRACE_H}h contingency → 要升版, PM 定"))
+        want = [s for s in want if (s.get('submit') or {}).get('in_place_ok')]
         if not want:
             return res
         ifc_dir = self.project_path / "Design/Engineering/1. Drawings/4. IFC(Client)"
@@ -10315,7 +10439,7 @@ class ApprovedIFCManager(IFCStampMixin):
             plan.append((s, pdf, dw, mode))
             print(f"    {s['doc_key']}: {s['why']} → {'原样重出 ' + dw.name if mode == 'replot' else '从 IFR DWG 重转'}")
         if self.dry_run:
-            res['plan'] = [(s['doc_key'], m) for s, _, _, m in plan]
+            res['plan'] = [(s['doc_key'], m, s['why'], s['submit']['verdict']) for s, _, _, m in plan]
             return res
         if _acad_running():
             res['errors'].append("AutoCAD 正开着 —— 不接管你的会话, 关掉后再跑")
@@ -10350,7 +10474,11 @@ class ApprovedIFCManager(IFCStampMixin):
                         res['errors'].append(f"{key}: 找不到 Native IFR DWG")
                         continue
                     info['stale_ifc'] = (pdf, s['why'])
-                    self._backup_stale_ifc(info)
+                    _rev0 = info.get('existing_ifc_rev')
+                    _hold = self._backup_stale_ifc(info)
+                    if _hold or info.get('existing_ifc_rev') == _rev0:   # unchanged = it ruled bump
+                        res['errors'].append(f"{key}: {_hold or '台账复核 = 要升版, 这里不重出, PM 定'}")
+                        continue
                     r = ifc_mgr.convert_to_ifc(info)
                     if not r.get('success'):
                         res['errors'].append(f"{key}: {'; '.join(r.get('errors') or ['转换失败'])}")
@@ -10361,6 +10489,12 @@ class ApprovedIFCManager(IFCStampMixin):
                 if lost:
                     res['errors'].append(f"{key}: 内容QA IFC 比 IFR 少内容 {lost}")
                 res['diffs'].append(_pdf_change_map(old, pdf, bk_dir / f"{pdf.stem}.{ts}"))
+                dest = self.project_path / "Design/Engineering/13. Client Sharepoint/2.IFC" / pdf.name
+                if Path(to_long_path(dest)).exists() and not lost:
+                    no = sharepoint_overwrite(self.project_path, pdf, dest, led,
+                                              change_ts=s['submit'].get('change_ts'))
+                    res['sharepoint' if not no else 'errors'].append(
+                        f"{key}: 13 已覆盖 ({s['submit']['verdict']})" if not no else f"{key}: 13 没覆盖 — {no}")
             except Exception as e:
                 res['errors'].append(f"{key}: {e}")
         # AutoCAD wasn't running at start (guard above) → this instance is ours; quit it,
@@ -10476,7 +10610,11 @@ class ApprovedIFCManager(IFCStampMixin):
                       f"跳过(IFC PDF 已存在且为最新)")
                 continue
 
-            self._backup_stale_ifc(dwg_info)
+            _hold = self._backup_stale_ifc(dwg_info)
+            if _hold:
+                result['errors'].append(f"{doc_id}: {_hold}")
+                print(f"    [{idx}/{len(result['native_mapped'])}] {doc_id}: {_hold}")
+                continue
 
             # Cleanup old DWGs
             cleaned = self._cleanup_native_folder(dwg_info)

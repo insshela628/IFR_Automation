@@ -17,9 +17,11 @@ Usage:
   python run_pipeline_cli.py "<keyword>" --ifc-status [--execute]  # internal DLV ← issued IFC PDFs
   python run_pipeline_cli.py "<keyword>" --replot-stale [--execute] [--only KEY ...]  # stale IFC → fresh PDF
 
---replot-stale: every stale, never-transmitted IFC (patrol's `ifc_stale`) is brought back in line:
-designer-edited IFC DWG → re-published as-is; IFR moved → reconverted. Old PDF + red change map
-kept in _state/<project>/replot/. Refuses while AutoCAD is open. PM 2026-11-12: always first to fix.
+--replot-stale: every stale IFC that may be redone at the SAME rev (submissions ledger: never sent,
+or changed within 24h of sending = contingency) is brought back in line: designer-edited IFC DWG →
+re-published as-is; IFR moved → reconverted; then the 13. Client Sharepoint copy is overwritten
+after QA. Later changes → skipped, Rev bump = PM. Old PDF + change map in _state/<project>/replot/.
+Refuses while AutoCAD is open. PM 2026-11-12: always first to fix.
 
 --ifc-status: new IFC PDF in 4. IFC(Client) → its INTERNAL DLV row becomes Approved IFC
 + numeric rev + date, stale to-do comment cleared. Idempotent (unchanged rows untouched).
@@ -177,7 +179,7 @@ def main(argv):
         except Exception as e:
             _emit("error", stage="replot_stale", project=project.project_name, message=str(e))
             return 1
-        for k in ("replotted", "reconverted", "skipped", "errors"):
+        for k in ("replotted", "reconverted", "sharepoint", "skipped", "errors"):
             for x in r.get(k) or []:
                 print(f"  [{k}] {x}")
         for d in r.get("diffs") or []:
