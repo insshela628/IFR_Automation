@@ -9481,6 +9481,11 @@ def sharepoint_overwrite_check(project_path: Path, pdf: Path, dest: Path, led: D
     if not st['in_place_ok']:
         return (f"{st['verdict']}: " + (st.get('note') or
                 f"{st['ref']} {st['sent_at']} 已交客户, 改动在 {SUBMIT_GRACE_H}h contingency 之后 → 升版"))
+    try:
+        if Path(to_long_path(dest)).stat().st_mtime > Path(to_long_path(pdf)).stat().st_mtime + 120:
+            return "13 那份比 4. IFC(Client) 还新 — 不拿旧的盖新的, 查谁直接改了 13"
+    except OSError as e:
+        return f"读不到时间戳: {e}"
     lost = ifc_content_check(project_path, pdf)
     if lost:
         return f"内容QA: IFC 比 IFR 少内容 {lost}"
@@ -9505,6 +9510,36 @@ def sharepoint_overwrite(project_path: Path, pdf: Path, dest: Path, led: Dict,
     shutil.copy2(str(to_long_path(dest)), str(bk / f"{dest.stem}.{datetime.now():%Y%m%d_%H%M%S}.13old.pdf"))
     shutil.copy2(str(to_long_path(pdf)), str(to_long_path(dest)))
     return None
+
+
+def sharepoint_reconcile(project_path: Path, execute: bool = False) -> Dict:
+    """4. IFC(Client) ⇄ 13. Client Sharepoint/2.IFC, same name, different bytes → QA vs the
+    submissions ledger (`sharepoint_overwrite_check`) → overwrite the 13 copy (execute) or say it
+    would. A stale IFC is never pushed out. Missing-in-13 is not handled here (mirror = auto_drain).
+    → {'overwritten'|'would_overwrite': [name], 'refused': [[name, reason]]}"""
+    eng = project_path / "Design/Engineering"
+    ifc, mir = eng / "1. Drawings/4. IFC(Client)", eng / "13. Client Sharepoint/2.IFC"
+    out = {'overwritten': [], 'would_overwrite': [], 'refused': []}
+    if not ifc.is_dir() or not mir.is_dir():
+        return out
+    latest, srcs, led = _latest_ifr_pdfs(project_path), _ifc_source_load(project_path), None
+    for pdf in sorted(ifc.glob("*.pdf")):
+        dest = mir / pdf.name
+        if pdf.name.startswith('~$') or not dest.exists() or filecmp.cmp(
+                str(to_long_path(pdf)), str(to_long_path(dest)), shallow=False):
+            continue
+        why = ifc_stale_reason(project_path, pdf, latest, srcs)
+        if why:
+            out['refused'].append([pdf.name, f"IFC 本身过期, 先重出: {why}"])
+            continue
+        led = led or ifc_submissions(project_path, max_age_h=1, refresh=True)
+        rec = srcs.get(_doc_key(pdf.name) or '')
+        no = (sharepoint_overwrite if execute else sharepoint_overwrite_check)(project_path, pdf, dest, led, rec)
+        if no:
+            out['refused'].append([pdf.name, no])
+        else:
+            out['overwritten' if execute else 'would_overwrite'].append(pdf.name)
+    return out
 
 
 def ifc_freshness_report(project_path: Path) -> Dict:
