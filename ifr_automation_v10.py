@@ -4900,7 +4900,8 @@ class IFCTransmittalManager:
                     self.logger.error(f"IFC 已过期, 不同步: {pdf.name} ({why})")
                     print(f"    ✗ IFC 已过期, 不同步到 {rel_target}: {pdf.name} ({why})")
                     continue
-                dest = target_dir / pdf.name
+                # 13 copy may live in a dated submission folder (`<date> <REF>/`, PM 11-12)
+                dest = sharepoint_locate(target_dir, pdf.name) or target_dir / pdf.name
                 # Only copy if newer or different size (idempotent)
                 if dest.exists():
                     src_stat = pdf.stat()
@@ -4920,6 +4921,14 @@ class IFCTransmittalManager:
                     else:
                         synced += 1
                     continue
+                if _led is None:
+                    _led = ifc_submissions(self.project_path, max_age_h=1, refresh=True)
+                no, notes = sharepoint_archive_for(target_dir, pdf, _led, execute=True)
+                if no:
+                    print(f"    ✗ 13 不加 {pdf.name}: {no}")
+                    continue
+                for n in notes:
+                    print(f"    13 升版归档: {n}")
                 try:
                     shutil.copy2(str(to_long_path(pdf)), str(to_long_path(dest)))
                     synced += 1
@@ -9434,11 +9443,14 @@ def ifc_submissions(project_path: Path, max_age_h: float = 26, refresh: bool = F
     except Exception:
         return {'files': {}, 'error': f"交付台账没有/读不了 → `{cmd}`"}
     files: Dict[str, Dict] = {}
-    for s in sorted(led.get('submissions') or [], key=lambda s: s['sent_at']):
+    subs = sorted(led.get('submissions') or [], key=lambda s: s['sent_at'])
+    for s in subs:
         for f in s.get('files') or []:
             files.setdefault(f.lower(), {'ref': s['ref'], 'sent_at': s['sent_at']})
     err = led.get('error') or (f"交付台账 {age:.0f}h 没刷新 → `{cmd}`" if age > max_age_h else None)
-    return {'files': files, 'error': err}
+    return {'files': files, 'error': err,
+            'subs': [{'ref': s['ref'], 'sent_at': s['sent_at'],
+                      'files': {f.lower() for f in s.get('files') or []}} for s in subs]}
 
 
 def ifc_submit_status(ifc_name: str, change_ts: Optional[float], led: Dict) -> Dict:
@@ -9512,27 +9524,85 @@ def sharepoint_overwrite(project_path: Path, pdf: Path, dest: Path, led: Dict,
     return None
 
 
+# 13. Client Sharepoint/2.IFC layout (PM 2026-11-12): root = the current / next submission. On a Rev
+# bump, the WHOLE previous submission (the files its TSMT email listed) moves into
+# `<SentOn date> <REF>/` (e.g. `2026-11-06 GG38-TSMT-01`), and the new rev goes into root = next
+# submission. Never an overwrite across revs. Same-rev contingency (≤24h) still overwrites in place.
+_SP_SUBMISSION_DIR = re.compile(r'^\d{4}-\d{2}-\d{2} \S+-TSMT-\d+$', re.I)
+
+
+def sharepoint_locate(mir: Path, name: str) -> Optional[Path]:
+    """The 13 copy of `name`: root first, then the dated submission folders (never SS)."""
+    for d in [mir] + (sorted((x for x in mir.iterdir() if x.is_dir() and _SP_SUBMISSION_DIR.match(x.name)),
+                             reverse=True) if mir.is_dir() else []):
+        if (d / name).is_file():
+            return d / name
+    return None
+
+
+def sharepoint_archive_for(mir: Path, pdf: Path, led: Dict, execute: bool) -> Tuple[Optional[str], List[str]]:
+    """Before a NEW name for a doc enters 13 root: if root holds another rev of that doc that went
+    out in a submission → move that submission's root files into `<date> <REF>/`.
+    → (refusal or None, notes). Earlier rev never sent → nothing here (VersionManager → SS)."""
+    key = _doc_key(pdf.name)
+    olds = [f for f in mir.glob("*.pdf") if f.name != pdf.name and _doc_key(f.name) == key]
+    if not olds:
+        return None, []
+    if led.get('error'):
+        return f"交付台账不明, 不动 13 ({led['error']})", []
+    notes = []
+    for old in olds:
+        sub = next((x for x in reversed(led['subs']) if old.stem.lower() in x['files']), None)
+        if not sub or not old.exists():
+            continue
+        dest = mir / f"{sub['sent_at'][:10]} {sub['ref']}"
+        members = [f for f in mir.glob("*.pdf") if f.stem.lower() in sub['files']]
+        notes.append(f"{sub['ref']} ({sub['sent_at']}) 的 {len(members)} 份 → `{dest.name}/`")
+        if execute:
+            dest.mkdir(exist_ok=True)
+            for f in members:
+                t = dest / f.name
+                if t.exists():
+                    t = t.with_name(f"{t.stem}.{datetime.now():%Y%m%d%H%M%S}{t.suffix}")
+                shutil.move(str(to_long_path(f)), str(to_long_path(t)))
+    return None, notes
+
+
 def sharepoint_reconcile(project_path: Path, execute: bool = False) -> Dict:
     """4. IFC(Client) ⇄ 13. Client Sharepoint/2.IFC, same name, different bytes → QA vs the
     submissions ledger (`sharepoint_overwrite_check`) → overwrite the 13 copy (execute) or say it
     would. A stale IFC is never pushed out. Missing-in-13 is not handled here (mirror = auto_drain).
-    → {'overwritten'|'would_overwrite': [name], 'refused': [[name, reason]]}"""
+    Also: a 4. IFC PDF that 13 doesn't have at all → copied into root (= next submission); if it is
+    a Rev bump of a submitted doc, the previous submission is archived to `<date> <REF>/` first.
+    → {'overwritten'|'would_overwrite'|'added'|'would_add'|'archived': [..], 'refused': [[name, reason]]}"""
     eng = project_path / "Design/Engineering"
     ifc, mir = eng / "1. Drawings/4. IFC(Client)", eng / "13. Client Sharepoint/2.IFC"
-    out = {'overwritten': [], 'would_overwrite': [], 'refused': []}
+    out = {'overwritten': [], 'would_overwrite': [], 'added': [], 'would_add': [], 'archived': [],
+           'refused': []}
     if not ifc.is_dir() or not mir.is_dir():
         return out
     latest, srcs, led = _latest_ifr_pdfs(project_path), _ifc_source_load(project_path), None
     for pdf in sorted(ifc.glob("*.pdf")):
-        dest = mir / pdf.name
-        if pdf.name.startswith('~$') or not dest.exists() or filecmp.cmp(
-                str(to_long_path(pdf)), str(to_long_path(dest)), shallow=False):
+        if pdf.name.startswith('~$'):
+            continue
+        dest = sharepoint_locate(mir, pdf.name)
+        if dest and filecmp.cmp(str(to_long_path(pdf)), str(to_long_path(dest)), shallow=False):
             continue
         why = ifc_stale_reason(project_path, pdf, latest, srcs)
         if why:
             out['refused'].append([pdf.name, f"IFC 本身过期, 先重出: {why}"])
             continue
         led = led or ifc_submissions(project_path, max_age_h=1, refresh=True)
+        if dest is None:                       # new to 13 → next submission (archive prev if bump)
+            no, notes = sharepoint_archive_for(mir, pdf, led, execute)
+            if no:
+                out['refused'].append([pdf.name, no])
+                continue
+            out['archived'] += notes
+            if execute:
+                shutil.copy2(str(to_long_path(pdf)), str(to_long_path(mir / pdf.name)))
+            out['added' if execute else 'would_add'].append(pdf.name)
+            continue
         rec = srcs.get(_doc_key(pdf.name) or '')
         no = (sharepoint_overwrite if execute else sharepoint_overwrite_check)(project_path, pdf, dest, led, rec)
         if no:

@@ -27,6 +27,8 @@ Refuses while AutoCAD is open. PM 2026-11-12: always first to fix.
 --sync-13: 4. IFC(Client) PDFs whose same-name 13. Client Sharepoint copy differs → QA against the
 submissions ledger (never sent / changed within 24h of sending; content QA; same page count) →
 overwrite the 13 copy (old one backed up to _state/<project>/replot/). Else reported, untouched.
+PDFs 13 doesn't have → copied into 2.IFC root (= next submission); if one is a Rev bump of a
+submitted doc, that previous submission is first moved to `2.IFC/<SentOn date> <TSMT ref>/`.
 
 --ifc-status: new IFC PDF in 4. IFC(Client) → its INTERNAL DLV row becomes Approved IFC
 + numeric rev + date, stale to-do comment cleared. Idempotent (unchanged rows untouched).
@@ -184,7 +186,7 @@ def main(argv):
         except Exception as e:
             _emit("error", stage="sync_13", project=project.project_name, message=str(e))
             return 1
-        for k in ("overwritten", "would_overwrite", "refused"):
+        for k in ("archived", "added", "would_add", "overwritten", "would_overwrite", "refused"):
             for x in r.get(k) or []:
                 print(f"  [{k}] {x}")
         _emit("ok", project=project.project_name, dry_run=not execute, sync_13=r)
