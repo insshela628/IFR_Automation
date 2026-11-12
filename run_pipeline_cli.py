@@ -15,6 +15,11 @@ Usage:
   python run_pipeline_cli.py "<keyword>" --stages deliverable asbuilt_version   # subset
   python run_pipeline_cli.py "<keyword>" --refresh-approved   # ONLY latest-wins Approved to IFC swap (real)
   python run_pipeline_cli.py "<keyword>" --ifc-status [--execute]  # internal DLV ← issued IFC PDFs
+  python run_pipeline_cli.py "<keyword>" --replot-stale [--execute] [--only KEY ...]  # stale IFC → fresh PDF
+
+--replot-stale: every stale, never-transmitted IFC (patrol's `ifc_stale`) is brought back in line:
+designer-edited IFC DWG → re-published as-is; IFR moved → reconverted. Old PDF + red change map
+kept in _state/<project>/replot/. Refuses while AutoCAD is open. PM 2026-11-12: always first to fix.
 
 --ifc-status: new IFC PDF in 4. IFC(Client) → its INTERNAL DLV row becomes Approved IFC
 + numeric rev + date, stale to-do comment cleared. Idempotent (unchanged rows untouched).
@@ -106,6 +111,16 @@ def main(argv):
     do_list = "--list" in args
     refresh_only = "--refresh-approved" in args
     ifc_status = "--ifc-status" in args
+    replot = "--replot-stale" in args
+    only = None
+    if "--only" in args:
+        i = args.index("--only")
+        only = set()
+        for a in args[i + 1:]:
+            if a.startswith("--"):
+                break
+            only.add(a.upper())
+        args = args[:i] + args[i + 1 + len(only):]
     # --stages s1 s2 ... : everything after the flag until the next --flag.
     stages = None
     if "--stages" in args:
@@ -155,6 +170,21 @@ def main(argv):
         return 2
 
     project = matches[0]
+    if replot:
+        try:
+            from ifr_automation_v10 import ApprovedIFCManager
+            r = ApprovedIFCManager(Path(project.project_path), dry_run=not execute).replot_stale(only)
+        except Exception as e:
+            _emit("error", stage="replot_stale", project=project.project_name, message=str(e))
+            return 1
+        for k in ("replotted", "reconverted", "skipped", "errors"):
+            for x in r.get(k) or []:
+                print(f"  [{k}] {x}")
+        for d in r.get("diffs") or []:
+            print(f"  [diff] {d['file']}: 每页变化% {d['pages']} {d.get('pages_count', '')}")
+        _emit("error" if r.get("errors") else "ok", project=project.project_name,
+              dry_run=not execute, **r)
+        return 1 if r.get("errors") else 0
     if ifc_status:
         # Internal DLV only: rows whose doc has a current IFC PDF in 4. IFC(Client) (or an
         # Approved-to-IFC report) → Approved IFC + rev + date. No Sharepoint/client write.

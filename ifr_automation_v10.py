@@ -7060,7 +7060,21 @@ class IFCManager(IFCStampMixin):
         """
         doc = None
         _temp_dir = None
+        # AutoCAD rejects the \\?\ prefix ("Invalid file name") — callers holding
+        # scan results (_latest_doc_dwgs returns \\?\ paths) must not reach Open with it.
+        dwg_path = Path(str(dwg_path).removeprefix('\\\\?\\'))
+        pdf_path = Path(str(pdf_path).removeprefix('\\\\?\\'))
         try:
+            # Dropbox online-only placeholder (OFFLINE / RECALL_ON_DATA_ACCESS):
+            # hydrate before Open so AutoCAD doesn't wait on a Dropbox recall mid-COM
+            # (GG38 2026-11-12: designer-edited IFC DWGs 001/002-1/BLD-001 were online-only).
+            try:
+                if os.stat(dwg_path).st_file_attributes & 0x401000:
+                    with open(to_long_path(dwg_path), 'rb') as _fh:
+                        while _fh.read(1 << 20):
+                            pass
+            except Exception as _he:
+                print(f"    ⚠ DWG 占位文件下载失败: {_he}")
             # PUBLISH SendCommand fails silently on non-ASCII paths (e.g. √)
             _use_temp = not str(dwg_path).isascii() or not str(pdf_path).isascii()
             actual_dwg = dwg_path
@@ -9291,6 +9305,78 @@ def ifc_stale_reason(project_path: Path, ifc_pdf: Path, latest: Optional[Dict] =
     return None
 
 
+def _ifc_dwg_edited(project_path: Path, ifc_pdf: Path, why: Optional[str],
+                    dwgs: Optional[Dict] = None) -> bool:
+    """Stale because the designer saved the *IFC* DWG after its PDF → the cure is a plain
+    re-publish of that DWG; reconverting from the IFR DWG would drop their edit."""
+    if not why or not why.startswith("DWG 改过"):
+        return False
+    dw = (_latest_doc_dwgs(project_path) if dwgs is None else dwgs).get(_doc_key(ifc_pdf.name) or '')
+    return dw is not None and 'ifc' in dw.stem.lower()
+
+
+def _acad_running() -> bool:
+    import subprocess
+    try:
+        out = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq acad.exe', '/NH'],
+                             capture_output=True, text=True, timeout=15).stdout
+        return 'acad.exe' in out.lower()
+    except Exception:
+        return True          # can't tell → assume it is (never hijack her session)
+
+
+def _pdf_change_map(old_pdf: Path, new_pdf: Path, out_stem: Path) -> Dict:
+    """Per-page % of pixels that changed old→new; pages with change get a PNG of the new
+    page at <out_stem>_p<n>.png — red = only in new, blue = only in old, each change boxed.
+    For the PM's 'who changed what' check. A pixel counts only if NO pixel in the other
+    render's 3x3 neighbourhood matches it: re-publishing the same DWG shifts anti-aliasing
+    by ~1px, and a plain per-pixel diff turned every hatch/glyph into red noise (GG38 11-12)."""
+    import fitz, numpy as np
+
+    def _rng(g):  # 3x3 local min / max
+        pad = np.pad(g, 1, mode='edge')
+        st = [pad[y:y + g.shape[0], x:x + g.shape[1]] for y in range(3) for x in range(3)]
+        return np.min(st, axis=0), np.max(st, axis=0)
+
+    out = {'file': new_pdf.name, 'pages': [], 'png': []}
+    with fitz.open(str(old_pdf)) as a, fitz.open(str(new_pdf)) as b:
+        if len(a) != len(b):
+            out['pages_count'] = f"{len(a)}→{len(b)}"
+        for i in range(min(len(a), len(b))):
+            pa = a[i].get_pixmap(dpi=100, colorspace=fitz.csGRAY)
+            pb = b[i].get_pixmap(dpi=100, colorspace=fitz.csRGB)
+            ga = np.frombuffer(pa.samples, np.uint8).reshape(pa.height, pa.width).astype(int)
+            rb = np.frombuffer(pb.samples, np.uint8).reshape(pb.height, pb.width, 3).copy()
+            h, w = min(ga.shape[0], rb.shape[0]), min(ga.shape[1], rb.shape[1])
+            ga, gb = ga[:h, :w], rb[:h, :w].mean(axis=2).astype(int)
+            amin, amax = _rng(ga)
+            bmin, bmax = _rng(gb)
+            added = (gb < amin - 80)            # new ink where old had none nearby
+            gone = (ga < bmin - 80)             # old ink with nothing nearby in new
+            m = added | gone
+            pct = round(float(m.mean() * 100), 3)
+            out['pages'].append(pct)
+            if pct > 0:
+                img = rb[:h, :w]
+                img[gone] = (0, 90, 255)
+                img[added] = (255, 0, 0)
+                # box each change cluster (coarse 20px grid) so small edits are findable
+                cell = 20
+                gh, gw = (h + cell - 1) // cell, (w + cell - 1) // cell
+                grid = np.zeros((gh * cell, gw * cell), bool)
+                grid[:h, :w] = m
+                hit = grid.reshape(gh, cell, gw, cell).sum(axis=(1, 3)) >= 3
+                for gy, gx in zip(*np.nonzero(hit)):
+                    y0, x0 = gy * cell, gx * cell
+                    y1, x1 = min(y0 + cell, h) - 1, min(x0 + cell, w) - 1
+                    img[y0, x0:x1] = img[y1, x0:x1] = (255, 0, 255)
+                    img[y0:y1, x0] = img[y0:y1, x1] = (255, 0, 255)
+                png = Path(f"{out_stem}_p{i + 1}.png")
+                fitz.Pixmap(fitz.csRGB, w, h, img.tobytes(), False).save(str(png))
+                out['png'].append(str(png))
+    return out
+
+
 def _ifc_stale_ifr(ifc_pdf: Path, src: Path, rec: Optional[Dict]) -> Optional[str]:
     new_rev, st = _letter_rev(src.stem), src.stat()
     if rec:
@@ -10100,6 +10186,11 @@ class ApprovedIFCManager(IFCStampMixin):
                 f_doc_id = _extract_doc_id_standalone(f.name)
                 if f_doc_id and f_doc_id.upper() == doc_id.upper():
                     why = ifc_stale_reason(self.project_path, f)
+                    if why and _ifc_dwg_edited(self.project_path, f, why):
+                        # Designer edited the IFC DWG itself: reconverting from the IFR DWG
+                        # would push their edit to Superseded (GG38 001/002-1/BLD-001 11-12).
+                        print(f"    {doc_id}: IFC DWG 被直接改过 → 走 replot_stale 原样重出, 这里不重转")
+                        return True
                     if why:
                         dwg_info['stale_ifc'] = (f, why)
                         print(f"    {doc_id}: IFC 已过期({why}) → 重新转换")
@@ -10152,6 +10243,124 @@ class ApprovedIFCManager(IFCStampMixin):
                 except Exception as e:
                     self.logger.error(f"重命名失败: {f.name} - {e}")
         return renamed
+
+    def _backup_stale_ifc(self, dwg_info: Dict) -> None:
+        """Stale IFC never sent to the client → regenerate at the same rev (backup old first)."""
+        if not (dwg_info.get('stale_ifc') and dwg_info.get('existing_ifc_rev') is not None):
+            return
+        _old_pdf = dwg_info['stale_ifc'][0]
+        _sent = set(IFCTransmittalManager(self.project_path, dry_run=True)
+                    .get_last_run_state().get('transmitted_files', []))
+        if _old_pdf.name in _sent:
+            return
+        _old_dwg = dwg_info['folder'] / (_old_pdf.stem + '.dwg')
+        _tag = f".pre-Rev{dwg_info['latest_ifr_rev']}"
+        if not self.dry_run:
+            for _f in (_old_dwg, _old_pdf):
+                if _f.exists():
+                    _ss = VersionManager._find_ss_folder(_f.parent)  # Native: reuse Superseded
+                    _ss.mkdir(exist_ok=True)
+                    _bk = _ss / (_f.stem + _tag + _f.suffix)
+                    if _bk.exists():
+                        _bk = _bk.with_name(f"{_bk.stem}.{datetime.now():%Y%m%d%H%M%S}{_bk.suffix}")
+                    if _f.suffix.lower() == '.dwg':
+                        shutil.move(str(to_long_path(_f)), str(to_long_path(_bk)))
+                    else:
+                        shutil.copy2(str(to_long_path(_f)), str(to_long_path(_bk)))
+        dwg_info['existing_ifc_rev'] = (dwg_info['existing_ifc_rev'] - 1
+                                        if dwg_info['existing_ifc_rev'] > 0 else None)
+        print(f"    {dwg_info['doc_id']}: 未发出过的 IFC → 同版本重出, 旧件备份 SS/*{_tag}.*")
+
+    # ── Re-plot stale IFC (PM 2026-11-12: 「这个永远都是优先改的」) ──────────
+
+    def replot_stale(self, keys: Optional[set] = None) -> Dict:
+        """Bring every stale, never-transmitted IFC PDF back in line with its source.
+
+        Two cures, chosen per item from `ifc_freshness_report` (same criteria as the patrol):
+          - designer edited the *IFC DWG* itself → publish a fresh PDF from that DWG as-is
+            (no reconvert: the IFR DWG doesn't hold their edit);
+          - IFR side moved (new letter / same letter re-saved) → reconvert from the IFR DWG.
+        Transmitted IFCs are never touched (Rev bump = PM call). No Client Sharepoint copy
+        (13 differences stay report-only, PM 11-10). Every replaced PDF is diffed against the
+        old one → `_state/<project>/replot/*.png` so the PM sees who changed what.
+        Refuses to run while acad.exe is up — the engine would attach to the PM's session."""
+        res = {'replotted': [], 'reconverted': [], 'skipped': [], 'errors': [], 'diffs': []}
+        fr = ifc_freshness_report(self.project_path)
+        want = [s for s in fr.get('stale') or [] if not keys or s['doc_key'] in keys]
+        for s in want:
+            if s.get('transmitted'):
+                res['skipped'].append(f"{s['doc_key']}: 已交付过 → 要升版, PM 定")
+        want = [s for s in want if not s.get('transmitted')]
+        if not want:
+            return res
+        ifc_dir = self.project_path / "Design/Engineering/1. Drawings/4. IFC(Client)"
+        dwgs = _latest_doc_dwgs(self.project_path)
+        plan = []
+        for s in want:
+            pdf = ifc_dir / s['file']
+            dw = dwgs.get(s['doc_key'])
+            mode = 'replot' if _ifc_dwg_edited(self.project_path, pdf, s['why'], dwgs) else 'reconvert'
+            plan.append((s, pdf, dw, mode))
+            print(f"    {s['doc_key']}: {s['why']} → {'原样重出 ' + dw.name if mode == 'replot' else '从 IFR DWG 重转'}")
+        if self.dry_run:
+            res['plan'] = [(s['doc_key'], m) for s, _, _, m in plan]
+            return res
+        if _acad_running():
+            res['errors'].append("AutoCAD 正开着 —— 不接管你的会话, 关掉后再跑")
+            return res
+        bk_dir = machine_state_dir(self.project_path) / "replot"
+        bk_dir.mkdir(exist_ok=True)
+        ts = f"{datetime.now():%Y%m%d_%H%M%S}"
+        ifc_mgr = IFCManager(self.project_path, dry_run=False, title_block_name=self.title_block_name,
+                             native_root=self.native_root, ifc_output=self.ifc_output, preserve_ifr=True)
+        for s, pdf, dw, mode in plan:
+            key = s['doc_key']
+            old = bk_dir / f"{pdf.stem}.{ts}.old.pdf"
+            shutil.copy2(str(to_long_path(pdf)), str(old))
+            try:
+                if mode == 'replot':
+                    acad = ifc_mgr._get_acad()
+                    ok = ifc_mgr._publish_single_pdf(acad, dw, pdf)
+                    if not ok:
+                        shutil.copy2(str(old), str(to_long_path(pdf)))
+                        res['errors'].append(f"{key}: PUBLISH 失败, 旧 PDF 已放回")
+                        continue
+                    tn = trim_pdf_to_reference(pdf, old)
+                    if tn and '未截页' in tn:
+                        res['errors'].append(f"{key}: {tn}")
+                    ifc_source_mark_dwg(self.project_path, key, dw, note=f"replot {ts}")
+                    res['replotted'].append(key)
+                else:
+                    doc_id = _extract_doc_id_standalone(pdf.name) or key
+                    folder = self._find_native_folder(doc_id)
+                    info = self._scan_native_dwgs(folder, doc_id) if folder else None
+                    if not info:
+                        res['errors'].append(f"{key}: 找不到 Native IFR DWG")
+                        continue
+                    info['stale_ifc'] = (pdf, s['why'])
+                    self._backup_stale_ifc(info)
+                    r = ifc_mgr.convert_to_ifc(info)
+                    if not r.get('success'):
+                        res['errors'].append(f"{key}: {'; '.join(r.get('errors') or ['转换失败'])}")
+                        continue
+                    res['errors'].extend(f"{key}: {e}" for e in r.get('errors') or [])
+                    res['reconverted'].append(key)
+                lost = ifc_content_check(self.project_path, pdf)
+                if lost:
+                    res['errors'].append(f"{key}: 内容QA IFC 比 IFR 少内容 {lost}")
+                res['diffs'].append(_pdf_change_map(old, pdf, bk_dir / f"{pdf.stem}.{ts}"))
+            except Exception as e:
+                res['errors'].append(f"{key}: {e}")
+        # AutoCAD wasn't running at start (guard above) → this instance is ours; quit it,
+        # else the next run's guard refuses (GG38 2026-11-12: orphan sat on the Start tab).
+        try:
+            acad = ifc_mgr._get_acad()
+            while acad.Documents.Count > 0:
+                acad.Documents.Item(0).Close(False)
+            acad.Quit()
+        except Exception:
+            pass
+        return res
 
     # ── Batch Orchestrator ───────────────────────────────────────────────
 
@@ -10255,29 +10464,7 @@ class ApprovedIFCManager(IFCStampMixin):
                       f"跳过(IFC PDF 已存在且为最新)")
                 continue
 
-            # Stale IFC never sent to the client → regenerate at the same rev (backup old first)
-            if dwg_info.get('stale_ifc') and dwg_info.get('existing_ifc_rev') is not None:
-                _old_pdf = dwg_info['stale_ifc'][0]
-                _sent = set(IFCTransmittalManager(self.project_path, dry_run=True)
-                            .get_last_run_state().get('transmitted_files', []))
-                if _old_pdf.name not in _sent:
-                    _old_dwg = dwg_info['folder'] / (_old_pdf.stem + '.dwg')
-                    _tag = f".pre-Rev{dwg_info['latest_ifr_rev']}"
-                    if not self.dry_run:
-                        for _f in (_old_dwg, _old_pdf):
-                            if _f.exists():
-                                _ss = VersionManager._find_ss_folder(_f.parent)  # Native: reuse Superseded
-                                _ss.mkdir(exist_ok=True)
-                                _bk = _ss / (_f.stem + _tag + _f.suffix)
-                                if _bk.exists():
-                                    _bk = _bk.with_name(f"{_bk.stem}.{datetime.now():%Y%m%d%H%M%S}{_bk.suffix}")
-                                if _f.suffix.lower() == '.dwg':
-                                    shutil.move(str(to_long_path(_f)), str(to_long_path(_bk)))
-                                else:
-                                    shutil.copy2(str(to_long_path(_f)), str(to_long_path(_bk)))
-                    dwg_info['existing_ifc_rev'] = (dwg_info['existing_ifc_rev'] - 1
-                                                    if dwg_info['existing_ifc_rev'] > 0 else None)
-                    print(f"    {doc_id}: 未发出过的 IFC → 同版本重出, 旧件备份 SS/*{_tag}.*")
+            self._backup_stale_ifc(dwg_info)
 
             # Cleanup old DWGs
             cleaned = self._cleanup_native_folder(dwg_info)
