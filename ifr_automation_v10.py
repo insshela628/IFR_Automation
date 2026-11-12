@@ -1817,8 +1817,7 @@ class IFRAutomation:
         still in Transmittal 01 → no "RevE approved" record). Delivered → old -Approved kept.
         """
         import filecmp
-        sent = {_doc_key(n) for n in IFCTransmittalManager(project_path, dry_run=True)
-                .get_last_run_state().get('transmitted_files', [])}
+        sent = {_doc_key(n) for n in ifc_delivered_names(project_path)}
         result = {"refreshed": 0, "errors": [], "details": [], "items": []}
         eng = project_path / "Design/Engineering"
         ifr_client_base = eng / "1. Drawings/3. IFR(Client)"
@@ -9391,6 +9390,21 @@ def _ifc_stale_ifr(ifc_pdf: Path, src: Path, rec: Optional[Dict]) -> Optional[st
     return None
 
 
+def ifc_delivered_names(project_path: Path) -> set:
+    """IFC PDF filenames the client already has: the transmittal ledger (ifc_state transmitted_files)
+    PLUS every PDF in 13. Client Sharepoint/2.IFC (client-visible = delivered). The ledger alone
+    missed GG38 TSMT-01 (sent 11-06 from transmittal_gen, not IFCTransmittalManager) → 4 submitted
+    Rev0s were re-plotted in place on 11-12 instead of bumped to Rev1 (PM: 给客户 submit 过就要升版)."""
+    names = set(IFCTransmittalManager(project_path, dry_run=True)
+                .get_last_run_state().get('transmitted_files', []))
+    sp = project_path / "Design/Engineering/13. Client Sharepoint/2.IFC"
+    try:
+        names.update(f.name for f in sp.iterdir() if f.is_file() and f.suffix.lower() == '.pdf')
+    except OSError:
+        pass
+    return names
+
+
 def ifc_freshness_report(project_path: Path) -> Dict:
     """Read-only daily check (no COM): every IFC in 4. IFC(Client) vs its latest IFR source.
     stale[].transmitted=True → already delivered: needs a Rev bump (PM call), not an in-place Rev0 redo."""
@@ -9400,8 +9414,7 @@ def ifc_freshness_report(project_path: Path) -> Dict:
         return out
     latest, sources = _latest_ifr_pdfs(project_path), _ifc_source_load(project_path)
     dwgs = _latest_doc_dwgs(project_path)
-    sent = {_doc_key(n) for n in IFCTransmittalManager(project_path, dry_run=True)
-            .get_last_run_state().get('transmitted_files', [])}
+    sent = {_doc_key(n) for n in ifc_delivered_names(project_path)}
     have = set()
     for f in sorted(ifc_dir.iterdir()):
         if not f.is_file() or f.suffix.lower() != '.pdf' or f.name.startswith('~$'):
@@ -10249,8 +10262,7 @@ class ApprovedIFCManager(IFCStampMixin):
         if not (dwg_info.get('stale_ifc') and dwg_info.get('existing_ifc_rev') is not None):
             return
         _old_pdf = dwg_info['stale_ifc'][0]
-        _sent = set(IFCTransmittalManager(self.project_path, dry_run=True)
-                    .get_last_run_state().get('transmitted_files', []))
+        _sent = ifc_delivered_names(self.project_path)
         if _old_pdf.name in _sent:
             return
         _old_dwg = dwg_info['folder'] / (_old_pdf.stem + '.dwg')
