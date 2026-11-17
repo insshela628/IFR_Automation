@@ -4876,7 +4876,8 @@ class IFCTransmittalManager:
                 self.logger.error(f"Transmittal sync failed to {rel_target}: {e}")
 
     def _sync_ifc_files_to_sharepoint(self):
-        """Sync IFC PDFs from 4. IFC(Client)/ to 13. Client Sharepoint/2.IFC/."""
+        """Sync IFC PDFs from 4. IFC(Client)/ to 13. Client Sharepoint/2.IFC/ — only the ones
+        `ifc_released` lets through (submitted, unchanged since). The rest stay in 4. IFC."""
         if self.dry_run:
             return
         for rel_target in self.sync_targets:
@@ -4892,9 +4893,12 @@ class IFCTransmittalManager:
             synced = 0
             _latest, _srcs = _latest_ifr_pdfs(self.project_path), _ifc_source_load(self.project_path)
             _led = None
+            _rel = ifc_released(self.project_path)['released']     # 13 闸 (PM 11-17), 唯一判据
             for pdf in self.ifc_dir.glob("*.pdf"):
                 if pdf.name.startswith('~$'):
                     continue
+                if pdf.name not in _rel:
+                    continue                    # 没 submit 过这一份 → 留在 4. IFC, 等发客户前 QA + submit
                 why = ifc_stale_reason(self.project_path, pdf, _latest, _srcs)
                 if why:
                     self.logger.error(f"IFC 已过期, 不同步: {pdf.name} ({why})")
@@ -6988,6 +6992,36 @@ class IFCManager(IFCStampMixin):
         print(f"    标题栏: 修订表已满({n_rows}行) → 按日期滚动: "
               + " | ".join(r.get('REV', '') for r in rows))
 
+    def _read_ifc_rows(self, acad, dwg: Path) -> List[Tuple[str, str]]:
+        """Every FOR CONSTRUCTION row (rev, date) in an existing IFC DWG's title block, top→down.
+        Read-only open, never saved. [] = not found / unreadable (caller falls back)."""
+        if not dwg.exists():
+            return []
+        doc = None
+        try:
+            doc = acad.Documents.Open(str(dwg), True)
+            _tb, attrs, _sp = self._find_title_block(doc)
+            rows = []
+            for i in range(1, self.REV_ROWS + 1):
+                if f"{i}REV" not in attrs:
+                    continue
+                desc = self._safe_get_text(attrs.get(f"{i}DESCRIPTION")).strip().upper() \
+                    if f"{i}DESCRIPTION" in attrs else ''
+                rev = self._safe_get_text(attrs[f"{i}REV"]).strip()
+                if rev and 'CONSTRUCTION' in desc:
+                    d = attrs.get(f"{i}DATE")
+                    rows.append((rev, self._safe_get_text(d).strip() if d is not None else ''))
+            return rows
+        except Exception as e:
+            print(f"    读上一版 IFC 修订行失败 {dwg.name}: {e}")
+            return []
+        finally:
+            if doc is not None:
+                try:
+                    doc.Close(False)
+                except Exception:
+                    pass
+
     def _update_title_block(self, attrs: Dict, ifc_rev: int, personnel: Dict, date_str: str):
         """Update title block attributes for IFC conversion.
 
@@ -7478,6 +7512,15 @@ class IFCManager(IFCStampMixin):
             # old IFC DWG doesn't have it. Its earlier IFC rows are re-written (`_prior_ifc_rows`).
             open_path = dwg_path
             self._prior_ifc_rows = dwg_info.get('prior_ifc_rows') if dwg_info.get('bump_from_ifr') else None
+            if self._prior_ifc_rows and ifc_rev > 0:
+                # The client's RevN title block is the truth for the earlier rows (all of them,
+                # with the date printed there) — not the SentOn date (architect 11-17 C5).
+                _rows = self._read_ifc_rows(acad, dwg_info['folder'] / (
+                    self._build_ifc_filename(doc_id, description, ifc_rev - 1) + ".dwg"))
+                if _rows:
+                    self._prior_ifc_rows = _rows
+                else:
+                    print("    ⚠ 上一版 IFC DWG 读不到修订行 → 用台账日期补 (可能与客户手里那版不同)")
             if ifc_rev > 0 and not dwg_info.get('bump_from_ifr'):
                 prev_name = self._build_ifc_filename(doc_id, description, ifc_rev - 1)
                 prev_ifc = dwg_info['folder'] / f"{prev_name}.dwg"
@@ -9475,6 +9518,52 @@ def ifc_submissions(project_path: Path, max_age_h: float = 26, refresh: bool = F
                       'files': {f.lower() for f in s.get('files') or []}} for s in subs]}
 
 
+def ifc_released(project_path: Path) -> Dict:
+    """⭐ 13 闸 — 唯一判据 (PM 2026-11-17「先出到 IFC 不出到 client sharepoint」)。13 = 客户手里那版:
+    4. IFC(Client) 的 PDF 只有在交付台账里列了这个文件 (stem), 且最近一次 SentOn ≥ PDF mtime − 5 分钟
+    (之后又改过 = 客户拿到的不是这份) 才放行进 13。紧急改 (contingency) 也一样: 改完要重发 TSMT,
+    或手动 `--sync-13 --only KEY --execute` 放行。台账读不到 → 一个都不放 (不明 ≠ 已交)。
+    所有写 13 的路 (`_sync_ifc_files_to_sharepoint` / `sharepoint_reconcile` / auto_drain) 只认这一份。
+    → {'released': {pdf name: [ref, 'YYYY-MM-DD HH:MM']}, 'near': [[pdf name, 台账里同号的 stem, ref]],
+       'error': str|None}  near = 同文档号但文件名对不上 (改过名?) —— 报出来, 别静默一直扣着。"""
+    out = {'released': {}, 'near': [], 'error': None}
+    try:
+        led = json.loads((machine_state_dir(project_path) / "submissions.json").read_text(encoding='utf-8'))
+    except Exception as e:
+        out['error'] = f"交付台账读不到 ({type(e).__name__})"
+        return out
+    out['error'] = led.get('error')
+    sent: Dict[str, Tuple[float, str]] = {}
+    for s in led.get('submissions') or []:
+        try:
+            ts = datetime.fromisoformat(s['sent_at']).timestamp()
+        except (KeyError, TypeError, ValueError):
+            continue
+        for f in s.get('files') or []:
+            k = Path(f).stem.lower() if f.lower().endswith('.pdf') else f.lower()
+            if ts > sent.get(k, (0, ''))[0]:
+                sent[k] = (ts, s.get('ref') or '?')
+    by_key: Dict[str, List[str]] = {}
+    for k in sent:
+        by_key.setdefault(_doc_key(k.upper() + '.pdf') or '', []).append(k)
+    ifc = project_path / "Design/Engineering/1. Drawings/4. IFC(Client)"
+    for f in sorted(ifc.glob("*.pdf")) if ifc.is_dir() else []:
+        if f.name.startswith('~$'):
+            continue
+        hit = sent.get(f.stem.lower())
+        if hit:
+            if hit[0] >= f.stat().st_mtime - 300:
+                out['released'][f.name] = [hit[1], datetime.fromtimestamp(hit[0]).strftime('%Y-%m-%d %H:%M')]
+            continue
+        dk = _doc_key(f.name) or ''
+        rev = re.search(r'_Rev([0-9A-Z]+)_IFC$', f.stem, re.I)
+        for k in by_key.get(dk, []) if dk else []:
+            r2 = re.search(r'_Rev([0-9A-Z]+)', k, re.I)
+            if rev and r2 and r2.group(1).upper() == rev.group(1).upper():
+                out['near'].append([f.name, k, sent[k][1]])        # same doc + rev, different name
+    return out
+
+
 def ifc_submit_status(ifc_name: str, change_ts: Optional[float], led: Dict) -> Dict:
     """Verdict for redoing `ifc_name` at the SAME rev: unsubmitted / contingency → in_place_ok;
     bump (change > grace after send) / unknown (ledger error) → not."""
@@ -9596,7 +9685,9 @@ def sharepoint_reconcile(project_path: Path, execute: bool = False, only: Option
     would. A stale IFC is never pushed out. Missing-in-13 is not handled here (mirror = auto_drain).
     Also: a 4. IFC PDF that 13 doesn't have at all → copied into root (= next submission); if it is
     a Rev bump of a submitted doc, the previous submission is archived to `<date> <REF>/` first.
-    → {'overwritten'|'would_overwrite'|'added'|'would_add'|'archived': [..], 'refused': [[name, reason]]}"""
+    13 闸: without `only`, only `ifc_released` files are considered (the rest → 'held');
+    `only` = explicit per-doc release (auto_drain passes released docs; by hand = early release).
+    → {'overwritten'|'would_overwrite'|'added'|'would_add'|'archived'|'held': [..], 'refused': [[name, reason]]}"""
     eng = project_path / "Design/Engineering"
     ifc, mir = eng / "1. Drawings/4. IFC(Client)", eng / "13. Client Sharepoint/2.IFC"
     out = {'overwritten': [], 'would_overwrite': [], 'added': [], 'would_add': [], 'archived': [],
@@ -9604,10 +9695,17 @@ def sharepoint_reconcile(project_path: Path, execute: bool = False, only: Option
     if not ifc.is_dir() or not mir.is_dir():
         return out
     latest, srcs, led = _latest_ifr_pdfs(project_path), _ifc_source_load(project_path), None
+    rel = ifc_released(project_path)['released'] if not only else None
+    out['held'] = []
     for pdf in sorted(ifc.glob("*.pdf")):
         if pdf.name.startswith('~$'):
             continue
-        if only and (_doc_key(pdf.name) or '') not in only:     # gate releases per doc (auto_drain)
+        if only and (_doc_key(pdf.name) or '') not in only:     # explicit per-doc release (--only)
+            continue
+        if rel is not None and pdf.name not in rel:              # 13 闸: no --only → submitted files only
+            if not (dest := sharepoint_locate(mir, pdf.name)) or not filecmp.cmp(
+                    str(to_long_path(pdf)), str(to_long_path(dest)), shallow=False):
+                out['held'].append(pdf.name)
             continue
         dest = sharepoint_locate(mir, pdf.name)
         if dest and filecmp.cmp(str(to_long_path(pdf)), str(to_long_path(dest)), shallow=False):

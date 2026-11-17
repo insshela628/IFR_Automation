@@ -192,7 +192,7 @@ def main(argv):
         except Exception as e:
             _emit("error", stage="sync_13", project=project.project_name, message=str(e))
             return 1
-        for k in ("archived", "added", "would_add", "overwritten", "would_overwrite", "refused"):
+        for k in ("archived", "added", "would_add", "overwritten", "would_overwrite", "held", "refused"):
             for x in r.get(k) or []:
                 print(f"  [{k}] {x}")
         _emit("ok", project=project.project_name, dry_run=not execute, sync_13=r)
