@@ -15,14 +15,15 @@ Usage:
   python run_pipeline_cli.py "<keyword>" --stages deliverable asbuilt_version   # subset
   python run_pipeline_cli.py "<keyword>" --refresh-approved   # ONLY latest-wins Approved to IFC swap (real)
   python run_pipeline_cli.py "<keyword>" --ifc-status [--execute]  # internal DLV ← issued IFC PDFs
-  python run_pipeline_cli.py "<keyword>" --replot-stale [--execute] [--only KEY ...]  # stale IFC → fresh PDF
-  python run_pipeline_cli.py "<keyword>" --sync-13 [--execute]   # QA-gated 13 Client Sharepoint overwrite
+  python run_pipeline_cli.py "<keyword>" --replot-stale [--bump] [--execute] [--only KEY ...]  # stale IFC → 4. IFC only
+  python run_pipeline_cli.py "<keyword>" --sync-13 [--execute] [--only KEY ...]   # QA-gated 13 Client Sharepoint write
 
 --replot-stale: every stale IFC that may be redone at the SAME rev (submissions ledger: never sent,
 or changed within 24h of sending = contingency) is brought back in line: designer-edited IFC DWG →
-re-published as-is; IFR moved → reconverted; then the 13. Client Sharepoint copy is overwritten
-after QA. Later changes → skipped, Rev bump = PM. Old PDF + change map in _state/<project>/replot/.
-Refuses while AutoCAD is open. PM 2026-11-12: always first to fix.
+re-published as-is; IFR moved → reconverted. Later changes = Rev bump: skipped, or with --bump
+RevN+1 is produced (old RevN PDF → 4. IFC/SS). Output goes to 4. IFC(Client) ONLY — 13 is written
+after the pre-client version QA + submission (PM 2026-11-17; auto_drain `_ifc_13_gate`).
+Old PDF + change map in _state/<project>/replot/. Refuses while AutoCAD is open.
 
 --sync-13: 4. IFC(Client) PDFs whose same-name 13. Client Sharepoint copy differs → QA against the
 submissions ledger (never sent / changed within 24h of sending; content QA; same page count) →
@@ -121,6 +122,11 @@ def main(argv):
     refresh_only = "--refresh-approved" in args
     ifc_status = "--ifc-status" in args
     replot = "--replot-stale" in args
+    settle = 0
+    if "--settle" in args:                      # --settle SECONDS (replot-stale: skip just-saved sources)
+        i = args.index("--settle")
+        settle = int(args[i + 1]) if i + 1 < len(args) and args[i + 1].isdigit() else 0
+        args = args[:i] + args[i + 2:]
     only = None
     if "--only" in args:
         i = args.index("--only")
@@ -182,7 +188,7 @@ def main(argv):
     if "--sync-13" in args:
         try:
             from ifr_automation_v10 import sharepoint_reconcile
-            r = sharepoint_reconcile(Path(project.project_path), execute=execute)
+            r = sharepoint_reconcile(Path(project.project_path), execute=execute, only=only)
         except Exception as e:
             _emit("error", stage="sync_13", project=project.project_name, message=str(e))
             return 1
@@ -194,11 +200,12 @@ def main(argv):
     if replot:
         try:
             from ifr_automation_v10 import ApprovedIFCManager
-            r = ApprovedIFCManager(Path(project.project_path), dry_run=not execute).replot_stale(only)
+            r = ApprovedIFCManager(Path(project.project_path), dry_run=not execute).replot_stale(
+                only, bump="--bump" in args, settle=settle)
         except Exception as e:
             _emit("error", stage="replot_stale", project=project.project_name, message=str(e))
             return 1
-        for k in ("replotted", "reconverted", "sharepoint", "skipped", "errors"):
+        for k in ("replotted", "reconverted", "bumped", "held_13", "skipped", "errors"):
             for x in r.get(k) or []:
                 print(f"  [{k}] {x}")
         for d in r.get("diffs") or []:

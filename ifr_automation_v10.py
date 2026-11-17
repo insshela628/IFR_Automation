@@ -6962,9 +6962,10 @@ class IFCManager(IFCStampMixin):
             self._safe_set_text(at, m.group(1) + doc_id + m.group(4))
             print(f"    标题栏: 图号占位符 {old.strip()!r} → {doc_id}")
 
-    def _roll_rev_rows(self, attrs, n_rows, ifc_rev, personnel, date_str, suffixes):
+    def _roll_rev_rows(self, attrs, n_rows, ifc_rev, personnel, date_str, suffixes, prior=()):
         """Full revision table: keep the newest n_rows-1 IFR rows (by DATE, then rev),
-        rewrite them oldest→newest into rows 1..n-1 and put the IFC row in row n."""
+        rewrite them oldest→newest into rows 1..n-1 and put the IFC row in row n.
+        prior = earlier IFC rows [(rev, date)] the source DWG lacks (Rev bump from the IFR DWG)."""
         g = lambda k: self._safe_get_text(attrs[k]).strip() if k in attrs else ''
 
         def _key(r):
@@ -6977,7 +6978,8 @@ class IFCManager(IFCStampMixin):
         rows = sorted((r for r in rows if r.get('REV')), key=_key)
         new = {s: personnel.get(s.lower(), '') for s in self.PERSONNEL_TAGS}
         new.update(REV=str(ifc_rev), DATE=date_str, DESCRIPTION='FOR CONSTRUCTION')
-        rows = (rows + [new])[-n_rows:]
+        old = [dict(new, REV=str(r), DATE=d) for r, d in prior]
+        rows = (rows + old + [new])[-n_rows:]
         for n in range(1, n_rows + 1):
             r = rows[n - 1] if n <= len(rows) else {}
             for s in suffixes:
@@ -7019,17 +7021,34 @@ class IFCManager(IFCStampMixin):
                     existing_ifc_row = max(existing_ifc_row, row_num)
                 else:
                     last_ifr_row = max(last_ifr_row, row_num)
-            # If IFC row already exists, overwrite it; otherwise add after last IFR row
+            # IFC row of THIS rev already there → overwrite (idempotent re-run). A Rev bump
+            # (row holds an earlier IFC rev) APPENDS after it — overwriting erased the Rev0 row
+            # (GG38 2026-11-17: E-BLD-001 / C-PLN-005 bumped after TSMT-01).
+            prior = list(getattr(self, '_prior_ifc_rows', None) or [])
             if existing_ifc_row > 0:
-                target_row = existing_ifc_row
+                same = self._safe_get_text(attrs[f"{existing_ifc_row}REV"]).strip() == str(ifc_rev)
+                target_row = existing_ifc_row if same else existing_ifc_row + 1
+                prior = []
             else:
                 target_row = last_ifr_row + 1
+            # Bump from the IFR DWG: it never held the earlier IFC rows → write them back first.
+            for _r, _d in prior:
+                if f"{target_row}REV" not in attrs:
+                    break                                    # no room → the roll below takes over
+                for _s, _v in (('REV', str(_r)), ('DATE', _d), ('DESCRIPTION', 'FOR CONSTRUCTION')):
+                    if f"{target_row}{_s}" in attrs:
+                        self._safe_set_text(attrs[f"{target_row}{_s}"], _v)
+                for tag in self.PERSONNEL_TAGS:
+                    if f"{target_row}{tag}" in attrs:
+                        self._safe_set_text(attrs[f"{target_row}{tag}"], personnel.get(tag.lower(), ''))
+                target_row += 1
+                prior = prior[1:]
             # Table FULL (frame has fewer rows than REV_ROWS, e.g. GG38 009 = 4): writing
             # row N+1 would silently hit a missing tag. Roll instead: rows by date (designers
             # reuse slots cyclically: D,C,F,E), drop the oldest, IFC row last.
             n_rows = max([int(k[:-3]) for k in attrs if k.endswith('REV') and k[:-3].isdigit()] or [0])
-            if existing_ifc_row == 0 and n_rows and target_row > n_rows:
-                self._roll_rev_rows(attrs, n_rows, ifc_rev, personnel, date_str, all_suffixes)
+            if n_rows and target_row > n_rows:
+                self._roll_rev_rows(attrs, n_rows, ifc_rev, personnel, date_str, all_suffixes, prior)
                 return
         elif ifc_rev == 0:
             # Clear all IFR history rows (Tatua behavior)
@@ -7454,9 +7473,12 @@ class IFCManager(IFCStampMixin):
         try:
             acad = self._get_acad()
 
-            # For rev1+, try to open previous IFC DWG (preserves revision history)
+            # For rev1+, try to open previous IFC DWG (preserves revision history) — unless the
+            # bump exists BECAUSE the IFR DWG moved (`bump_from_ifr`): the change lives there, the
+            # old IFC DWG doesn't have it. Its earlier IFC rows are re-written (`_prior_ifc_rows`).
             open_path = dwg_path
-            if ifc_rev > 0:
+            self._prior_ifc_rows = dwg_info.get('prior_ifc_rows') if dwg_info.get('bump_from_ifr') else None
+            if ifc_rev > 0 and not dwg_info.get('bump_from_ifr'):
                 prev_name = self._build_ifc_filename(doc_id, description, ifc_rev - 1)
                 prev_ifc = dwg_info['folder'] / f"{prev_name}.dwg"
                 if prev_ifc.exists():
@@ -9568,7 +9590,7 @@ def sharepoint_archive_for(mir: Path, pdf: Path, led: Dict, execute: bool) -> Tu
     return None, notes
 
 
-def sharepoint_reconcile(project_path: Path, execute: bool = False) -> Dict:
+def sharepoint_reconcile(project_path: Path, execute: bool = False, only: Optional[set] = None) -> Dict:
     """4. IFC(Client) ⇄ 13. Client Sharepoint/2.IFC, same name, different bytes → QA vs the
     submissions ledger (`sharepoint_overwrite_check`) → overwrite the 13 copy (execute) or say it
     would. A stale IFC is never pushed out. Missing-in-13 is not handled here (mirror = auto_drain).
@@ -9584,6 +9606,8 @@ def sharepoint_reconcile(project_path: Path, execute: bool = False) -> Dict:
     latest, srcs, led = _latest_ifr_pdfs(project_path), _ifc_source_load(project_path), None
     for pdf in sorted(ifc.glob("*.pdf")):
         if pdf.name.startswith('~$'):
+            continue
+        if only and (_doc_key(pdf.name) or '') not in only:     # gate releases per doc (auto_drain)
             continue
         dest = sharepoint_locate(mir, pdf.name)
         if dest and filecmp.cmp(str(to_long_path(pdf)), str(to_long_path(dest)), shallow=False):
@@ -10507,31 +10531,41 @@ class ApprovedIFCManager(IFCStampMixin):
 
     # ── Re-plot stale IFC (PM 2026-11-12: 「这个永远都是优先改的」) ──────────
 
-    def replot_stale(self, keys: Optional[set] = None) -> Dict:
-        """Bring every stale IFC PDF that may be redone at the SAME rev back in line with its source.
+    def replot_stale(self, keys: Optional[set] = None, bump: bool = False, settle: int = 0) -> Dict:
+        """Bring every stale IFC PDF back in line with its source — output to 4. IFC(Client) ONLY.
 
         Two cures, chosen per item from `ifc_freshness_report` (same criteria as the patrol):
           - designer edited the *IFC DWG* itself → publish a fresh PDF from that DWG as-is
             (no reconvert: the IFR DWG doesn't hold their edit);
           - IFR side moved (new letter / same letter re-saved) → reconvert from the IFR DWG.
-        Same rev only when the submissions ledger (refreshed from Sent Items first) says never
-        sent, or changed within SUBMIT_GRACE_H of sending (contingency); bump / unknown → skipped,
-        Rev bump = PM call. After a QA pass (`sharepoint_overwrite_check`) the 13. Client
-        Sharepoint copy is overwritten too, old one backed up locally. Every replaced PDF is
-        diffed against the old one → `_state/<project>/replot/*.png` (who changed what).
+        Same rev when the submissions ledger (refreshed from Sent Items first) says never sent, or
+        changed within SUBMIT_GRACE_H of sending (contingency). Sent + changed later = Rev bump:
+        skipped unless `bump` (PM 2026-11-17「先出到 IFC 不出到 client sharepoint … 也是一样」):
+        then RevN+1 — designer-edited IFC DWG → convert FROM that DWG (its IFC row kept, new row
+        appended); IFR moved → reconvert from the IFR DWG with the earlier IFC row written back
+        (`prior_ifc_rows`). Old RevN PDF → 4. IFC(Client)/SS. Ledger unknown → never.
+        13. Client Sharepoint is NOT touched here any more: it holds what the client has; a
+        re-issue reaches it only after the pre-client version QA + submission (auto_drain
+        `_ifc_13_gate`, or by hand `--sync-13 --only KEY --execute`). Every replaced PDF is diffed
+        against the old one → `_state/<project>/replot/*.png` (who changed what).
         Refuses to run while acad.exe is up — the engine would attach to the PM's session."""
-        res = {'replotted': [], 'reconverted': [], 'skipped': [], 'errors': [], 'diffs': [],
-               'sharepoint': []}
+        res = {'replotted': [], 'reconverted': [], 'bumped': [], 'skipped': [], 'errors': [],
+               'diffs': [], 'held_13': []}
         led = ifc_submissions(self.project_path, max_age_h=1, refresh=True)   # QA vs truth, as of now
         fr = ifc_freshness_report(self.project_path)
         want = [s for s in fr.get('stale') or [] if not keys or s['doc_key'] in keys]
+        if settle:   # designer may still be editing: a DWG/IFR saved < settle s ago waits (auto runs)
+            young = [s for s in want if ((s.get('submit') or {}).get('change_ts') or 0) > time.time() - settle]
+            res['skipped'] += [f"{s['doc_key']}: 源文件刚改 (<{settle // 3600}h), 等设计师改完再出" for s in young]
+            want = [s for s in want if s not in young]
         for s in want:
             st = s.get('submit') or {}
-            if not st.get('in_place_ok'):
+            if not st.get('in_place_ok') and not (bump and st.get('verdict') == 'bump'):
                 res['skipped'].append(f"{s['doc_key']}: {s['why']} —— " + (
                     f"交付状态不明 → 不动 ({st.get('note')})" if st.get('verdict') == 'unknown' else
-                    f"{st.get('ref')} {st.get('sent_at')} 已交客户, 改动超 {SUBMIT_GRACE_H}h contingency → 要升版, PM 定"))
-        want = [s for s in want if (s.get('submit') or {}).get('in_place_ok')]
+                    f"{st.get('ref')} {st.get('sent_at')} 已交客户, 改动超 {SUBMIT_GRACE_H}h contingency → 要升版 (--bump)"))
+        want = [s for s in want if (s.get('submit') or {}).get('in_place_ok')
+                or (bump and (s.get('submit') or {}).get('verdict') == 'bump')]
         if not want:
             return res
         ifc_dir = self.project_path / "Design/Engineering/1. Drawings/4. IFC(Client)"
@@ -10541,8 +10575,13 @@ class ApprovedIFCManager(IFCStampMixin):
             pdf = ifc_dir / s['file']
             dw = dwgs.get(s['doc_key'])
             mode = 'replot' if _ifc_dwg_edited(self.project_path, pdf, s['why'], dwgs) else 'reconvert'
+            if not s['submit'].get('in_place_ok'):
+                mode = 'bump_ifc' if mode == 'replot' else 'bump_ifr'
             plan.append((s, pdf, dw, mode))
-            print(f"    {s['doc_key']}: {s['why']} → {'原样重出 ' + dw.name if mode == 'replot' else '从 IFR DWG 重转'}")
+            print(f"    {s['doc_key']}: {s['why']} → " + {
+                'replot': f"原样重出 {dw.name if dw else '?'}", 'reconvert': '从 IFR DWG 重转',
+                'bump_ifc': f"升版: 从改过的 {dw.name if dw else 'IFC DWG'} 出下一版",
+                'bump_ifr': '升版: 从 IFR DWG 出下一版 (补回上一版 IFC 行)'}[mode])
         if self.dry_run:
             res['plan'] = [(s['doc_key'], m, s['why'], s['submit']['verdict']) for s, _, _, m in plan]
             return res
@@ -10571,6 +10610,47 @@ class ApprovedIFCManager(IFCStampMixin):
                         res['errors'].append(f"{key}: {tn}")
                     ifc_source_mark_dwg(self.project_path, key, dw, note=f"replot {ts}")
                     res['replotted'].append(key)
+                elif mode.startswith('bump'):
+                    doc_id = _extract_doc_id_standalone(pdf.name) or key
+                    folder = self._find_native_folder(doc_id)
+                    info = self._scan_native_dwgs(folder, doc_id) if folder else None
+                    m_rev = re.search(r'_Rev(\d+)_IFC$', pdf.stem, re.I)
+                    if not info or not m_rev:
+                        res['errors'].append(f"{key}: 升版没做 —— " + (
+                            "找不到 Native DWG" if not info else f"认不出 IFC 版本号 `{pdf.name}`"))
+                        continue
+                    n = int(m_rev.group(1))
+                    info['existing_ifc_rev'] = n
+                    if mode == 'bump_ifc':
+                        # convert_to_ifc opens `_build_ifc_filename(.., n)` for rev n+1 — it must be
+                        # the very DWG the designer edited, else their edit is silently lost.
+                        want_dwg = f"{ifc_mgr._build_ifc_filename(doc_id, info['description'], n)}.dwg"
+                        if not dw or dw.name.lower() != want_dwg.lower():
+                            res['errors'].append(f"{key}: 升版没做 —— 改过的 DWG `{dw.name if dw else '?'}` "
+                                                 f"≠ 引擎会打开的 `{want_dwg}`")
+                            continue
+                    else:
+                        sent = (s['submit'].get('sent_at') or '')[:10]
+                        d0 = (datetime.fromisoformat(sent) if sent else datetime.fromtimestamp(
+                            Path(to_long_path(pdf)).stat().st_mtime)).strftime('%d/%m/%y')
+                        info['bump_from_ifr'] = True
+                        info['prior_ifc_rows'] = [(n, d0)]
+                    r = ifc_mgr.convert_to_ifc(info)
+                    if not r.get('success') or not r.get('pdf_path'):
+                        res['errors'].append(f"{key}: 升版失败 {'; '.join(r.get('errors') or ['转换失败'])}")
+                        continue
+                    res['errors'].extend(f"{key}: {e}" for e in r.get('errors') or [])
+                    new_pdf = Path(r['pdf_path'])
+                    lost = ifc_content_check(self.project_path, new_pdf)
+                    if lost:
+                        res['errors'].append(f"{key}: 内容QA IFC 比 IFR 少内容 {lost}")
+                    ss = VersionManager._find_ss_folder(pdf.parent)
+                    ss.mkdir(exist_ok=True)
+                    shutil.move(str(to_long_path(pdf)), str(to_long_path(ss / pdf.name)))
+                    res['bumped'].append(f"{key}: Rev{n} → Rev{r.get('ifc_rev')} `{new_pdf.name}` (Rev{n} PDF → SS)")
+                    res['diffs'].append(_pdf_change_map(old, new_pdf, bk_dir / f"{new_pdf.stem}.{ts}"))
+                    res['held_13'].append(f"{key}: `{new_pdf.name}` 只出到 4. IFC(Client), 13 等发客户前 QA")
+                    continue
                 else:
                     doc_id = _extract_doc_id_standalone(pdf.name) or key
                     folder = self._find_native_folder(doc_id)
@@ -10594,12 +10674,7 @@ class ApprovedIFCManager(IFCStampMixin):
                 if lost:
                     res['errors'].append(f"{key}: 内容QA IFC 比 IFR 少内容 {lost}")
                 res['diffs'].append(_pdf_change_map(old, pdf, bk_dir / f"{pdf.stem}.{ts}"))
-                dest = self.project_path / "Design/Engineering/13. Client Sharepoint/2.IFC" / pdf.name
-                if Path(to_long_path(dest)).exists() and not lost:
-                    no = sharepoint_overwrite(self.project_path, pdf, dest, led,
-                                              change_ts=s['submit'].get('change_ts'))
-                    res['sharepoint' if not no else 'errors'].append(
-                        f"{key}: 13 已覆盖 ({s['submit']['verdict']})" if not no else f"{key}: 13 没覆盖 — {no}")
+                res['held_13'].append(f"{key}: `{pdf.name}` 只出到 4. IFC(Client), 13 等发客户前 QA")
             except Exception as e:
                 res['errors'].append(f"{key}: {e}")
         # AutoCAD wasn't running at start (guard above) → this instance is ours; quit it,
