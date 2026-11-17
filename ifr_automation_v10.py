@@ -9518,15 +9518,17 @@ def ifc_submissions(project_path: Path, max_age_h: float = 26, refresh: bool = F
                       'files': {f.lower() for f in s.get('files') or []}} for s in subs]}
 
 
-def ifc_released(project_path: Path) -> Dict:
+def ifc_released(project_path: Path, exts: Tuple[str, ...] = ('.pdf',)) -> Dict:
     """⭐ 13 闸 — 唯一判据 (PM 2026-11-17「先出到 IFC 不出到 client sharepoint」)。13 = 客户手里那版:
     4. IFC(Client) 的 PDF 只有在交付台账里列了这个文件 (stem), 且最近一次 SentOn ≥ PDF mtime − 5 分钟
     (之后又改过 = 客户拿到的不是这份) 才放行进 13。紧急改 (contingency) 也一样: 改完要重发 TSMT,
     或手动 `--sync-13 --only KEY --execute` 放行。台账读不到 → 一个都不放 (不明 ≠ 已交)。
     所有写 13 的路 (`_sync_ifc_files_to_sharepoint` / `sharepoint_reconcile` / auto_drain) 只认这一份。
     → {'released': {pdf name: [ref, 'YYYY-MM-DD HH:MM']}, 'near': [[pdf name, 台账里同号的 stem, ref]],
-       'error': str|None}  near = 同文档号但文件名对不上 (改过名?) —— 报出来, 别静默一直扣着。"""
-    out = {'released': {}, 'near': [], 'error': None}
+       'error': str|None, 'sent': {stem 小写: [ref, 'YYYY-MM-DD HH:MM', ts]}, 'last': [ref, 'YYYY-MM-DD HH:MM']|None}
+    near = 同文档号但文件名对不上 (改过名?) —— 报出来, 别静默一直扣着。
+    exts: 默认只看 PDF (13 只收 PDF); transmittal 要连 xlsx 一起对 (`transmittal_gen.ifc_delta`)。"""
+    out = {'released': {}, 'near': [], 'error': None, 'sent': {}, 'last': None}
     try:
         led = json.loads((machine_state_dir(project_path) / "submissions.json").read_text(encoding='utf-8'))
     except Exception as e:
@@ -9539,16 +9541,19 @@ def ifc_released(project_path: Path) -> Dict:
             ts = datetime.fromisoformat(s['sent_at']).timestamp()
         except (KeyError, TypeError, ValueError):
             continue
+        if not out['last'] or ts > datetime.fromisoformat(out['last'][1]).timestamp():
+            out['last'] = [s.get('ref') or '?', datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M')]
         for f in s.get('files') or []:
-            k = Path(f).stem.lower() if f.lower().endswith('.pdf') else f.lower()
+            k = Path(f).stem.lower() if Path(f).suffix.lower() in ('.pdf', '.xlsx', '.xls') else f.lower()
             if ts > sent.get(k, (0, ''))[0]:
                 sent[k] = (ts, s.get('ref') or '?')
+    out['sent'] = {k: [r, datetime.fromtimestamp(t).strftime('%Y-%m-%d %H:%M'), t] for k, (t, r) in sent.items()}
     by_key: Dict[str, List[str]] = {}
     for k in sent:
         by_key.setdefault(_doc_key(k.upper() + '.pdf') or '', []).append(k)
     ifc = project_path / "Design/Engineering/1. Drawings/4. IFC(Client)"
-    for f in sorted(ifc.glob("*.pdf")) if ifc.is_dir() else []:
-        if f.name.startswith('~$'):
+    for f in sorted(ifc.iterdir()) if ifc.is_dir() else []:
+        if f.name.startswith('~$') or not f.is_file() or f.suffix.lower() not in exts:
             continue
         hit = sent.get(f.stem.lower())
         if hit:
